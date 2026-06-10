@@ -7,10 +7,12 @@ everything else is derived at read time, and nothing is ever deleted — so an i
 wrong *view* over correct immutable facts, never lost data. See `RECORDER-HANDOFF.md` for the full
 design rationale.
 
-> **v1 scope.** Records Claude Code sessions via hooks, plus a CLI and a minimal web timeline.
-> Destructive-git-op capture (a `git` shim/tripwire), cross-machine sync, and graded commit↔session
-> links are planned for v2. Only Claude Code is implemented, but the agent-extension seam
-> (`internal/agent`) is in place so adding another agent is "implement the interface + register".
+> **Scope.** Records Claude Code sessions via hooks **and destructive git operations via a `git`
+> shim** (`reset --hard`, `checkout -- <path>`, `clean`, `stash drop`, `rebase`, …) — snapshotting
+> the dirty worktree *before* git destroys it, which no git hook can do. Still pending: the tripwire
+> hook (detect shim bypass), `refs/stash` archival, cross-machine sync, and graded commit↔session
+> links. Only Claude Code is implemented, but the agent seam (`internal/agent`) makes adding an
+> agent "implement the interface + register".
 
 ## How it works
 
@@ -43,7 +45,13 @@ go build -o twip ./cmd/twip      # build (put it on your PATH)
 twip init                        # install Claude Code hooks into ./.claude/settings.json
                                  #   (preserves any hooks twip doesn't own)
 
+twip shim install                # optional: install a `git` wrapper that records destructive
+                                 #   git ops; then put the printed dir on the FRONT of your PATH.
+                                 #   Records only in repos where you ran `twip init`; falls back
+                                 #   to real git if twip is unavailable, so it can't break git.
+
 # ...run Claude Code sessions as usual; turns are recorded automatically...
+# ...destructive git ops (reset --hard, checkout --, clean, rebase, …) are recorded too...
 
 twip log                         # list recorded sessions and turns
 twip show <session-id> <seq>     # inspect one event: prompt, transcript, changed files
@@ -61,6 +69,8 @@ surfaces any data-quality flags.
 cmd/twip/                CLI (cobra): init, hook, audit, log, show, serve
 internal/agent/          agent-extension seam: lean Agent interface + registry + normalized Event
 internal/agent/claudecode/  Claude Code: hook parse/install, transcript flush + delta + sidechains
+cmd/twip/gitshim.go      the `git` shim capture path (pre-destruction snapshot, recursion guard)
+cmd/twip/shim.go         `twip shim install/uninstall` (writes the git wrapper + PATH guidance)
 internal/snapshot/       temp-index git write-tree worktree capture
 internal/store/          append-only journal: one per-clone ref, CAS-append, schema, flock, read helpers
 internal/audit/          integrity audit

@@ -18,21 +18,53 @@ import (
 // different machines never write the same ref — there is nothing to merge on
 // sync. The id lives under the git common dir (shared across the clone's linked
 // worktrees, never part of any tree, so it is not synced as content).
-func (r *Recorder) CloneID(ctx context.Context) (string, error) {
+func (r *Recorder) cloneIDPath(ctx context.Context) (string, error) {
 	commonDir, err := gitutil.CommonDir(ctx, r.RepoRoot)
 	if err != nil {
 		return "", fmt.Errorf("locate git common dir: %w", err)
 	}
-	dir := filepath.Join(commonDir, "twip")
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return "", fmt.Errorf("create twip dir: %w", err)
-	}
-	path := filepath.Join(dir, "clone-id")
+	return filepath.Join(commonDir, "twip", "clone-id"), nil
+}
 
-	if b, err := os.ReadFile(path); err == nil {
-		if id := strings.TrimSpace(string(b)); id != "" {
-			return id, nil
-		}
+// Enabled reports whether twip recording is active in this repo, i.e. the
+// clone-id marker exists (created by `twip init`). The git shim gates on this so
+// it stays a no-op in repos the user has not opted into.
+func (r *Recorder) Enabled(ctx context.Context) (bool, error) {
+	path, err := r.cloneIDPath(ctx)
+	if err != nil {
+		return false, err
+	}
+	_, err = os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (r *Recorder) CloneID(ctx context.Context) (string, error) {
+	path, err := r.cloneIDPath(ctx)
+	if err != nil {
+		return "", err
+	}
+	// Fast path: an existing, fully-written id needs no lock.
+	if id := readCloneID(path); id != "" {
+		return id, nil
+	}
+
+	// Slow path: serialize creation so concurrent first-users converge on ONE id
+	// (a bare O_EXCL race let a reader observe the freshly-created-but-empty file
+	// and return ""). The lock also covers cross-process first-use.
+	release, err := r.Lock(ctx, "clone-id")
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
+	if id := readCloneID(path); id != "" {
+		return id, nil // another writer created it while we waited
 	}
 
 	buf := make([]byte, 8)
@@ -41,21 +73,34 @@ func (r *Recorder) CloneID(ctx context.Context) (string, error) {
 	}
 	id := hex.EncodeToString(buf)
 
-	// O_EXCL so a concurrent first-use can't produce two ids; loser re-reads.
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	// Write atomically (temp + rename) so even unlocked fast-path readers in other
+	// processes never see a half-written file.
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return "", fmt.Errorf("create twip dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "clone-id-*")
 	if err != nil {
-		if os.IsExist(err) {
-			b, rerr := os.ReadFile(path)
-			if rerr != nil {
-				return "", rerr
-			}
-			return strings.TrimSpace(string(b)), nil
-		}
 		return "", err
 	}
-	defer f.Close()
-	if _, err := f.WriteString(id); err != nil {
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.WriteString(id); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
 		return "", err
 	}
 	return id, nil
+}
+
+func readCloneID(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }

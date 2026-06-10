@@ -51,6 +51,18 @@ type SidechainMeta struct {
 	Quality string `json:"quality"`
 }
 
+// GitOpMeta records a git operation captured by the shim (a session-independent
+// event). Dirty reports whether the worktree was dirty at capture, in which case
+// a worktree/ snapshot of the pre-operation state is attached.
+type GitOpMeta struct {
+	Op         string   `json:"op"`
+	Argv       []string `json:"argv"`
+	BeforeHead string   `json:"before_head,omitempty"`
+	AfterHead  string   `json:"after_head,omitempty"`
+	ExitCode   int      `json:"exit_code"`
+	Dirty      bool     `json:"dirty"`
+}
+
 // Record is the meta/event.json payload. Attribution (kind, session_id,
 // worktree_id, head, branch) is carried as fields so the journal can hold both
 // session events and (later) session-independent ones.
@@ -69,6 +81,7 @@ type Record struct {
 	Transcript   *DeltaMeta      `json:"transcript,omitempty"`
 	Sidechains   []SidechainMeta `json:"sidechains,omitempty"`
 	Cursor       *agent.Cursor   `json:"cursor,omitempty"` // session transcript cursor after this event
+	GitOp        *GitOpMeta      `json:"gitop,omitempty"`  // set for session-independent git-op events
 }
 
 // SessionState is a session's derived position in the journal: the cursor to read
@@ -126,7 +139,6 @@ func (r *Recorder) Append(ctx context.Context, ev *agent.Event, snap snapshot.Sn
 	if err != nil {
 		return Record{}, err
 	}
-	ref := journalRef(cloneID)
 
 	rec := Record{
 		Schema:       SchemaVersion,
@@ -149,36 +161,94 @@ func (r *Recorder) Append(ctx context.Context, ev *agent.Event, snap snapshot.Sn
 	if err != nil {
 		return Record{}, err
 	}
+	msg := fmt.Sprintf("twip %s seq=%d session=%s", rec.Kind, rec.Seq, ev.SessionID)
+	if _, err := r.commitAndAdvance(ctx, cloneID, topTree, msg); err != nil {
+		return Record{}, err
+	}
+	return rec, nil
+}
 
-	// Serialize appends within this clone with a short flock around the CAS — the
-	// expensive work (flush wait, snapshot, tree build) already happened above,
-	// outside the lock. With it held, our own writers don't race; CAS below stays
-	// as the backstop for any external writer touching the ref.
-	release, err := lockKey(ctx, r.RepoRoot, "journal-"+cloneID)
+// AppendGitOp records a session-independent git operation. snap.Tree is empty for
+// a clean operation (nothing dirty to preserve), in which case no worktree/
+// subtree is attached and only the event metadata is recorded.
+func (r *Recorder) AppendGitOp(ctx context.Context, op GitOpMeta, snap snapshot.Snapshot, worktreeID string, now time.Time) (Record, error) {
+	cloneID, err := r.CloneID(ctx)
 	if err != nil {
 		return Record{}, err
 	}
+	rec := Record{
+		Schema:       SchemaVersion,
+		Kind:         "gitop",
+		TS:           now.UTC().Format(time.RFC3339Nano),
+		WorktreeID:   worktreeID,
+		Head:         snap.Head,
+		Branch:       snap.Branch,
+		WorktreeTree: snap.Tree,
+		GitOp:        &op,
+	}
+	recJSON, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return Record{}, err
+	}
+	recSHA, err := gitutil.HashObject(ctx, r.RepoRoot, recJSON)
+	if err != nil {
+		return Record{}, err
+	}
+	metaTree, err := gitutil.MkTree(ctx, r.RepoRoot, []gitutil.TreeEntry{
+		{Mode: "100644", Type: "blob", SHA: recSHA, Name: "event.json"},
+	})
+	if err != nil {
+		return Record{}, err
+	}
+	topTree, err := r.topTree(ctx, metaTree, snap.Tree)
+	if err != nil {
+		return Record{}, err
+	}
+	msg := fmt.Sprintf("twip gitop %s", op.Op)
+	if _, err := r.commitAndAdvance(ctx, cloneID, topTree, msg); err != nil {
+		return Record{}, err
+	}
+	return rec, nil
+}
+
+// topTree assembles the event commit's top tree from the meta subtree and an
+// optional worktree snapshot subtree.
+func (r *Recorder) topTree(ctx context.Context, metaTree, worktreeTree string) (string, error) {
+	entries := []gitutil.TreeEntry{{Mode: "040000", Type: "tree", SHA: metaTree, Name: "meta"}}
+	if worktreeTree != "" {
+		entries = append(entries, gitutil.TreeEntry{Mode: "040000", Type: "tree", SHA: worktreeTree, Name: "worktree"})
+	}
+	return gitutil.MkTree(ctx, r.RepoRoot, entries)
+}
+
+// commitAndAdvance appends a built top tree to this clone's journal, serializing
+// writers with a short flock around a CAS loop. A lost CAS race re-parents the
+// same childless commit onto the new tip — never a merge.
+func (r *Recorder) commitAndAdvance(ctx context.Context, cloneID, topTree, msg string) (string, error) {
+	ref := journalRef(cloneID)
+	release, err := lockKey(ctx, r.RepoRoot, "journal-"+cloneID)
+	if err != nil {
+		return "", err
+	}
 	defer release()
 
-	msg := fmt.Sprintf("twip %s seq=%d session=%s", rec.Kind, rec.Seq, ev.SessionID)
 	for attempt := 0; attempt < casRetries; attempt++ {
 		tip, err := gitutil.ResolveRef(ctx, r.RepoRoot, ref)
 		if err != nil {
-			return Record{}, err
+			return "", err
 		}
 		commit, err := gitutil.CommitTree(ctx, r.RepoRoot, topTree, tip, msg)
 		if err != nil {
-			return Record{}, err
+			return "", err
 		}
 		if err := gitutil.UpdateRef(ctx, r.RepoRoot, ref, commit, tip); err == nil {
-			return rec, nil
+			return commit, nil
 		}
-		// Ref moved under us (or git's ref lock was briefly held): loop re-reads
-		// the new tip and re-parents this same commit onto it. No merge — the tree
-		// is unchanged, only the parent. Light backoff to avoid thrashing.
+		// Ref moved (or git's ref lock was briefly held): re-read tip and re-parent
+		// this same commit onto it. Light backoff to avoid thrashing.
 		time.Sleep(time.Duration(attempt+1) * 3 * time.Millisecond)
 	}
-	return Record{}, fmt.Errorf("journal append: too many CAS retries on %s", ref)
+	return "", fmt.Errorf("journal append: too many CAS retries on %s", ref)
 }
 
 // buildEventTree creates the meta/ (event.json + transcript + sidechains) and

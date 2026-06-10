@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/codespeak/twip/internal/agent"
+	"github.com/codespeak/twip/internal/store"
 	"github.com/spf13/cobra"
 )
 
@@ -28,8 +29,14 @@ func newInitCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Create the clone-id eagerly: it's the marker the git shim gates on,
+			// so destructive git ops are recorded only in repos that opted in here.
+			cloneID, err := store.New(root).CloneID(ctx)
+			if err != nil {
+				return err
+			}
 			cmd.Printf("Installed %d %s hook(s) in %s/.claude/settings.json\n", n, agentName, root)
-			cmd.Printf("Events will be recorded to %s<clone-id> in this repo.\n", "refs/twip/journal/")
+			cmd.Printf("Events will be recorded to refs/twip/journal/%s in this repo.\n", cloneID)
 			return nil
 		},
 	}
