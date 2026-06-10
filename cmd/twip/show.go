@@ -2,110 +2,74 @@ package main
 
 import (
 	"fmt"
-	"strconv"
+	"strings"
 
-	"github.com/codespeak/twip/internal/gitutil"
-	"github.com/codespeak/twip/internal/store"
+	"github.com/codespeak/twip/internal/readmodel"
 	"github.com/spf13/cobra"
 )
 
 func newShowCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "show <session-id> <seq>",
-		Short: "Show a single recorded event",
-		Args:  cobra.ExactArgs(2),
+		Use:   "show <event-id>",
+		Short: "Show a recorded event by its id (commit sha or unambiguous prefix)",
+		Long:  "Event ids come from `twip log` (the commit column / link). Works for agent turns and git ops alike.",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			root, err := repoRoot(ctx)
 			if err != nil {
 				return err
 			}
-			seq, err := strconv.Atoi(args[1])
-			if err != nil {
-				return fmt.Errorf("seq must be a number: %w", err)
-			}
-			rec := store.New(root)
-			events, err := rec.LoadSessionEvents(ctx, args[0])
+			d, err := readmodel.Event(ctx, root, args[0])
 			if err != nil {
 				return err
 			}
+			if d == nil {
+				return fmt.Errorf("no recorded event matching %q", args[0])
+			}
 
-			var cur, prev *store.EventCommit
-			for i := range events {
-				if events[i].Record.Seq == seq {
-					cur = &events[i]
-					if i > 0 {
-						prev = &events[i-1]
+			cmd.Printf("event    %s\n", d.Commit)
+			cmd.Printf("kind     %s\n", d.Kind)
+			cmd.Printf("time     %s\n", d.TS)
+			if d.Session != "" {
+				cmd.Printf("session  %s  (seq %d)\n", d.Session, d.Seq)
+			}
+			if d.Worktree != "" {
+				cmd.Printf("worktree %s\n", d.Worktree)
+			}
+			cmd.Printf("head     %s  [%s]\n", d.Head, d.Branch)
+			if d.Model != "" {
+				cmd.Printf("model    %s\n", d.Model)
+			}
+			if d.Quality != "" {
+				cmd.Printf("quality  %s\n", d.Quality)
+			}
+			if d.Prompt != "" {
+				cmd.Printf("prompt   %s\n", oneLine(d.Prompt, 200))
+			}
+			if d.GitOp != nil {
+				cmd.Printf("git op   %s\n", strings.Join(d.GitOp.Argv, " "))
+				cmd.Printf("         %s..%s  exit=%d  dirty=%v\n", short(d.GitOp.BeforeHead), short(d.GitOp.AfterHead), d.GitOp.ExitCode, d.GitOp.Dirty)
+			}
+			if d.Transcript != "" {
+				cmd.Printf("transcript lines %d..%d\n", d.TranscriptFrom, d.TranscriptTo)
+			}
+
+			if len(d.Changed) > 0 {
+				cmd.Println("changed files vs previous snapshot:")
+				for _, c := range d.Changed {
+					mark := "·"
+					if c.InHead {
+						mark = "✓ in HEAD"
 					}
-					break
+					cmd.Printf("  %s\t%s\t%s\n", c.Status, c.Path, mark)
 				}
 			}
-			if cur == nil {
-				return fmt.Errorf("no event with seq %d in session %s", seq, args[0])
-			}
-
-			r := cur.Record
-			cmd.Printf("commit   %s\n", cur.Commit)
-			cmd.Printf("session  %s\n", r.SessionID)
-			cmd.Printf("seq      %d\n", r.Seq)
-			cmd.Printf("kind     %s\n", r.Kind)
-			cmd.Printf("time     %s\n", r.TS)
-			cmd.Printf("head     %s  [%s]\n", r.Head, r.Branch)
-			if r.Model != "" {
-				cmd.Printf("model    %s\n", r.Model)
-			}
-			if r.Prompt != "" {
-				cmd.Printf("prompt   %s\n", oneLine(r.Prompt, 200))
-			}
-			if r.Transcript != nil {
-				cmd.Printf("transcript lines %d..%d (%s)\n", r.Transcript.From, r.Transcript.To, r.Transcript.Quality)
-			}
-
-			// Files this turn changed, by diffing its worktree snapshot against the
-			// previous event's snapshot.
-			if r.WorktreeTree != "" {
-				// Diff against the previous turn's snapshot, or the empty tree for
-				// the first event (everything shows as added).
-				base := gitutil.EmptyTree
-				if prev != nil && prev.Record.WorktreeTree != "" {
-					base = prev.Record.WorktreeTree
-				}
-				out, err := gitutil.Out(ctx, root,
-					"diff-tree", "-r", "--name-status", "--no-commit-id", base, r.WorktreeTree)
-				if err == nil && out != "" {
-					cmd.Println("changed files vs previous turn:")
-					cmd.Println(indent(out))
-				}
-			}
-
-			if tr, _ := rec.Transcript(ctx, cur.Commit); len(tr) > 0 {
+			if d.Transcript != "" {
 				cmd.Println("--- transcript delta ---")
-				cmd.Print(string(tr))
+				cmd.Print(d.Transcript)
 			}
 			return nil
 		},
 	}
-}
-
-func indent(s string) string {
-	out := ""
-	for _, line := range splitLines(s) {
-		out += "  " + line + "\n"
-	}
-	return out[:max(0, len(out)-1)]
-}
-
-func splitLines(s string) []string {
-	var lines []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			lines = append(lines, s[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		lines = append(lines, s[start:])
-	}
-	return lines
 }

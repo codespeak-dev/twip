@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/codespeak/twip/internal/readmodel"
@@ -42,7 +41,7 @@ func Serve(ctx context.Context, repoRoot, addr string) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
-	mux.HandleFunc("/turn/", s.handleTurn)
+	mux.HandleFunc("/event/", s.handleEvent)
 	mux.HandleFunc("/api/timeline.json", s.handleTimelineJSON)
 
 	srv := &http.Server{Addr: addr, Handler: mux}
@@ -70,19 +69,13 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "index.html", map[string]any{"Entries": entries})
 }
 
-func (s *server) handleTurn(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, "/turn/")
-	parts := strings.Split(rest, "/")
-	if len(parts) != 2 {
-		http.Error(w, "expected /turn/<session>/<seq>", http.StatusBadRequest)
+func (s *server) handleEvent(w http.ResponseWriter, r *http.Request) {
+	commit := strings.TrimPrefix(r.URL.Path, "/event/")
+	if commit == "" {
+		http.Error(w, "expected /event/<commit>", http.StatusBadRequest)
 		return
 	}
-	seq, err := strconv.Atoi(parts[1])
-	if err != nil {
-		http.Error(w, "seq must be a number", http.StatusBadRequest)
-		return
-	}
-	detail, err := readmodel.Turn(r.Context(), s.repoRoot, parts[0], seq)
+	detail, err := readmodel.Event(r.Context(), s.repoRoot, commit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -91,7 +84,7 @@ func (s *server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.render(w, "turn.html", map[string]any{"T": detail})
+	s.render(w, "event.html", map[string]any{"T": detail})
 }
 
 func (s *server) handleTimelineJSON(w http.ResponseWriter, r *http.Request) {

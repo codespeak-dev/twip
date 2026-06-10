@@ -1,10 +1,12 @@
 // Package readmodel derives browsable views over the append-only log. It is pure
 // read-side: it never writes, and everything it produces is recomputable from the
-// immutable events, so callers may cache freely.
+// immutable events, so callers may cache freely. Events are addressed by their
+// commit id; session is only an attribution field, never the addressing key.
 package readmodel
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -14,7 +16,7 @@ import (
 
 // Entry is one event in the merged, time-ordered timeline.
 type Entry struct {
-	Session  string
+	Session  string // attribution only ("" for session-independent events)
 	Commit   string
 	Seq      int
 	Kind     string
@@ -26,6 +28,21 @@ type Entry struct {
 	Quality  string // non-empty only when a data-quality flag was recorded
 }
 
+func entryFor(ec store.EventCommit) Entry {
+	r := ec.Record
+	e := Entry{
+		Session: r.SessionID, Commit: ec.Commit, Seq: r.Seq, Kind: r.Kind,
+		TS: r.TS, Branch: r.Branch, Worktree: r.WorktreeID, Prompt: r.Prompt, Detail: r.Prompt,
+	}
+	if r.GitOp != nil {
+		e.Detail = strings.Join(r.GitOp.Argv, " ")
+	}
+	if r.Transcript != nil && r.Transcript.Quality != "ok" {
+		e.Quality = r.Transcript.Quality
+	}
+	return e
+}
+
 // Timeline returns every recorded event across all journals, newest first.
 func Timeline(ctx context.Context, repoRoot string) ([]Entry, error) {
 	rec := store.New(repoRoot)
@@ -35,22 +52,13 @@ func Timeline(ctx context.Context, repoRoot string) ([]Entry, error) {
 	}
 	entries := make([]Entry, 0, len(events))
 	for _, ec := range events {
-		r := ec.Record
-		e := Entry{Session: r.SessionID, Commit: ec.Commit, Seq: r.Seq, Kind: r.Kind,
-			TS: r.TS, Branch: r.Branch, Worktree: r.WorktreeID, Prompt: r.Prompt, Detail: r.Prompt}
-		if r.GitOp != nil {
-			e.Detail = strings.Join(r.GitOp.Argv, " ")
-		}
-		if r.Transcript != nil && r.Transcript.Quality != "ok" {
-			e.Quality = r.Transcript.Quality
-		}
-		entries = append(entries, e)
+		entries = append(entries, entryFor(ec))
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].TS > entries[j].TS })
 	return entries, nil
 }
 
-// FileChange is a path this turn changed relative to the previous turn, plus
+// FileChange is a path this event changed relative to the previous snapshot, plus
 // whether that exact content is present at the repo's current HEAD (a verified,
 // content-based link rather than a write-time hint).
 type FileChange struct {
@@ -59,8 +67,8 @@ type FileChange struct {
 	InHead bool
 }
 
-// TurnDetail is the full view of a single event.
-type TurnDetail struct {
+// EventDetail is the full view of a single recorded event.
+type EventDetail struct {
 	Entry
 	Head           string
 	Model          string
@@ -70,43 +78,45 @@ type TurnDetail struct {
 	Changed        []FileChange
 	Files          []string // file list of the worktree snapshot
 	WorktreeTree   string
+	GitOp          *store.GitOpMeta // set for session-independent git-op events
 }
 
-// Turn builds the detailed view of one event by seq within a session.
-func Turn(ctx context.Context, repoRoot, sessionID string, seq int) (*TurnDetail, error) {
+// Event builds the detailed view of one event, addressed by its commit id (full
+// sha or an unambiguous prefix). The "changed files" base is the previous
+// recorded snapshot of the SAME worktree in time order — independent of session,
+// so it works uniformly for agent turns and git ops.
+func Event(ctx context.Context, repoRoot, commitRef string) (*EventDetail, error) {
 	rec := store.New(repoRoot)
-	events, err := rec.LoadSessionEvents(ctx, sessionID)
+	events, err := rec.LoadAllEvents(ctx)
 	if err != nil {
 		return nil, err
 	}
-	// events are ordered by per-session seq, so the prior entry is this session's
-	// previous turn — the right base for "changed files vs previous turn".
-	var cur, prev *store.EventCommit
+	sort.Slice(events, func(i, j int) bool { return events[i].Record.TS < events[j].Record.TS })
+
+	idx, matches := -1, 0
 	for i := range events {
-		if events[i].Record.Seq == seq {
-			cur = &events[i]
-			if i > 0 {
-				prev = &events[i-1]
-			}
-			break
+		if events[i].Commit == commitRef || (len(commitRef) >= 4 && strings.HasPrefix(events[i].Commit, commitRef)) {
+			idx, matches = i, matches+1
 		}
 	}
-	if cur == nil {
+	if matches == 0 {
 		return nil, nil
 	}
+	if matches > 1 {
+		return nil, fmt.Errorf("ambiguous event id %q (%d matches)", commitRef, matches)
+	}
+
+	cur := events[idx]
 	r := cur.Record
-	d := &TurnDetail{
-		Entry: Entry{Session: sessionID, Commit: cur.Commit, Seq: r.Seq, Kind: r.Kind,
-			TS: r.TS, Branch: r.Branch, Worktree: r.WorktreeID, Prompt: r.Prompt},
+	d := &EventDetail{
+		Entry:        entryFor(cur),
 		Head:         r.Head,
 		Model:        r.Model,
 		WorktreeTree: r.WorktreeTree,
+		GitOp:        r.GitOp,
 	}
 	if r.Transcript != nil {
 		d.TranscriptFrom, d.TranscriptTo = r.Transcript.From, r.Transcript.To
-		if r.Transcript.Quality != "ok" {
-			d.Quality = r.Transcript.Quality
-		}
 		if b, _ := rec.Transcript(ctx, cur.Commit); len(b) > 0 {
 			d.Transcript = string(b)
 		}
@@ -114,8 +124,12 @@ func Turn(ctx context.Context, repoRoot, sessionID string, seq int) (*TurnDetail
 	if r.WorktreeTree != "" {
 		d.Files = lsTree(ctx, repoRoot, r.WorktreeTree)
 		base := gitutil.EmptyTree
-		if prev != nil && prev.Record.WorktreeTree != "" {
-			base = prev.Record.WorktreeTree
+		for i := idx - 1; i >= 0; i-- {
+			p := events[i].Record
+			if p.WorktreeID == r.WorktreeID && p.WorktreeTree != "" {
+				base = p.WorktreeTree
+				break
+			}
 		}
 		d.Changed = changedFiles(ctx, repoRoot, base, r.WorktreeTree)
 	}
@@ -132,7 +146,7 @@ func lsTree(ctx context.Context, repoRoot, tree string) []string {
 
 // changedFiles diffs two worktree snapshots and, for each changed path, checks
 // whether the snapshot's content for that path matches current HEAD — the basic
-// verified-link view ("did this turn's edit reach HEAD?").
+// verified-link view ("did this edit reach HEAD?").
 func changedFiles(ctx context.Context, repoRoot, base, tree string) []FileChange {
 	out, err := gitutil.Out(ctx, repoRoot, "diff-tree", "-r", "--name-status", "--no-commit-id", base, tree)
 	if err != nil || out == "" {
@@ -148,7 +162,7 @@ func changedFiles(ctx context.Context, repoRoot, base, tree string) []FileChange
 		fc := FileChange{Status: status, Path: path}
 		switch status {
 		case "D":
-			fc.InHead = !objectAtPathExists(ctx, repoRoot, "HEAD", path) // deleted here, also gone at HEAD
+			fc.InHead = !objectAtPathExists(ctx, repoRoot, "HEAD", path)
 		default:
 			snap := blobAt(ctx, repoRoot, tree, path)
 			fc.InHead = snap != "" && snap == blobAt(ctx, repoRoot, "HEAD", path)

@@ -1,8 +1,8 @@
-{{define "turn.html"}}<!doctype html>
+{{define "event.html"}}<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>twip · {{.T.Kind}} seq {{.T.Seq}}</title>
+  <title>twip · {{.T.Kind}}</title>
   <style>
     body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem auto; max-width: 60rem; color: #1b1b1b; }
     a { color: #0a58ca; text-decoration: none; } a:hover { text-decoration: underline; }
@@ -19,20 +19,31 @@
 </head>
 <body>
   <p><a href="/">← timeline</a></p>
-  <h1>{{.T.Kind}} · seq {{.T.Seq}}{{if .T.Quality}} <span class="flag">!{{.T.Quality}}</span>{{end}}</h1>
+  <h1>{{.T.Kind}}{{if .T.Quality}} <span class="flag">!{{.T.Quality}}</span>{{end}}</h1>
   <table class="meta">
-    <tr><td>session</td><td>{{.T.Session}}</td></tr>
+    <tr><td>event</td><td>{{.T.Commit}}</td></tr>
     <tr><td>time</td><td>{{.T.TS}}</td></tr>
-    <tr><td>commit</td><td>{{.T.Commit}}</td></tr>
+    {{if .T.Session}}<tr><td>session</td><td>{{.T.Session}} (seq {{.T.Seq}})</td></tr>{{end}}
+    {{if .T.Worktree}}<tr><td>worktree</td><td>{{.T.Worktree}}</td></tr>{{end}}
     <tr><td>head</td><td>{{.T.Head}} {{if .T.Branch}}[{{.T.Branch}}]{{end}}</td></tr>
     {{if .T.Model}}<tr><td>model</td><td>{{.T.Model}}</td></tr>{{end}}
-    {{if .T.WorktreeTree}}<tr><td>worktree</td><td>{{.T.WorktreeTree}}</td></tr>{{end}}
+    {{if .T.WorktreeTree}}<tr><td>worktree tree</td><td>{{.T.WorktreeTree}}</td></tr>{{end}}
   </table>
+
+  {{with .T.GitOp}}
+  <h2>git operation</h2>
+  <table class="meta">
+    <tr><td>argv</td><td>git {{range .Argv}}{{.}} {{end}}</td></tr>
+    <tr><td>head</td><td>{{.BeforeHead}} → {{.AfterHead}}</td></tr>
+    <tr><td>exit</td><td>{{.ExitCode}}</td></tr>
+    <tr><td>worktree dirty</td><td>{{.Dirty}}</td></tr>
+  </table>
+  {{end}}
 
   {{if .T.Prompt}}<h2>prompt</h2><pre>{{.T.Prompt}}</pre>{{end}}
 
   {{if .T.Changed}}
-  <h2>changed files vs previous turn</h2>
+  <h2>changed files vs previous snapshot</h2>
   <ul>
     {{range .T.Changed}}
     <li>

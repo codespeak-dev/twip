@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+
 	"github.com/codespeak/twip/internal/web"
 	"github.com/spf13/cobra"
 )
@@ -12,6 +14,10 @@ func newRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	// cobra's cmd.Print* default to stderr (OutOrStderr); send command output to
+	// stdout so `twip log`/`show`/`audit` can be piped and captured.
+	root.SetOut(os.Stdout)
+	root.SetErr(os.Stderr)
 
 	root.AddCommand(
 		newInitCmd(),

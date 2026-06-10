@@ -33,7 +33,8 @@ func newLogCmd() *cobra.Command {
 				if e.Session != "" {
 					origin = short(e.Session)
 				}
-				line := fmt.Sprintf("%s  %-18s  %-8s  %-6s", e.TS, e.Kind, origin, e.Worktree)
+				// Leading short commit is the event id to pass to `twip show`.
+				line := fmt.Sprintf("%s  %s  %-18s  %-8s  %-6s", short(e.Commit), e.TS, e.Kind, origin, e.Worktree)
 				if e.Branch != "" {
 					line += "  [" + e.Branch + "]"
 				}

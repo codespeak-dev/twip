@@ -71,25 +71,6 @@ func (r *Recorder) LoadSessionEvents(ctx context.Context, sessionID string) ([]E
 	return out, nil
 }
 
-// ListSessions returns the distinct session ids present in the journals.
-func (r *Recorder) ListSessions(ctx context.Context) ([]string, error) {
-	all, err := r.LoadAllEvents(ctx)
-	if err != nil {
-		return nil, err
-	}
-	seen := map[string]bool{}
-	var ids []string
-	for _, ec := range all {
-		id := ec.Record.SessionID
-		if id != "" && !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
-		}
-	}
-	sort.Strings(ids)
-	return ids, nil
-}
-
 // Transcript returns the stored transcript delta bytes for an event commit, or
 // nil if that event recorded none.
 func (r *Recorder) Transcript(ctx context.Context, commit string) ([]byte, error) {
