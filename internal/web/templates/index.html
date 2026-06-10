@@ -1,0 +1,43 @@
+{{define "index.html"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>twip timeline</title>
+  <style>
+    body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem auto; max-width: 60rem; color: #1b1b1b; }
+    h1 { font-size: 1.2rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #eee; vertical-align: top; }
+    th { color: #888; font-weight: 600; }
+    a { color: #0a58ca; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .kind { font-weight: 600; }
+    .session { color: #888; }
+    .flag { color: #b00; font-weight: 600; }
+    .prompt { color: #444; }
+    .empty { color: #888; margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <h1>twip timeline</h1>
+  {{if .Entries}}
+  <table>
+    <thead><tr><th>time</th><th>session</th><th>seq</th><th>event</th><th>branch</th><th>detail</th></tr></thead>
+    <tbody>
+    {{range .Entries}}
+      <tr>
+        <td>{{.TS}}</td>
+        <td class="session">{{short .Session}}</td>
+        <td><a href="/turn/{{.Session}}/{{.Seq}}">{{.Seq}}</a></td>
+        <td class="kind">{{.Kind}}{{if .Quality}} <span class="flag">!{{.Quality}}</span>{{end}}</td>
+        <td>{{.Branch}}</td>
+        <td class="prompt">{{.Prompt}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">No recorded sessions yet. Run <code>twip init</code> in a repo and start a Claude Code session.</p>
+  {{end}}
+</body>
+</html>{{end}}
