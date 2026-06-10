@@ -1,8 +1,12 @@
 // Package audit verifies the recorded log over its immutable facts: every event
-// resolves to a present worktree tree, seq numbers are contiguous, transcript
-// offsets join end-to-end, and data-quality flags are surfaced. It is the
-// concrete answer to "silent loss is unacceptable": a structural divergence is an
-// error (non-zero exit); a quality flag is a surfaced warning, not a failure.
+// resolves to a present worktree tree, each session's per-session seq is
+// contiguous, its transcript offsets join end-to-end, and data-quality flags are
+// surfaced. It is the concrete answer to "silent loss is unacceptable": a
+// structural divergence is an error (non-zero exit); a quality flag is a surfaced
+// warning, not a failure.
+//
+// The journal commit chain itself is contiguous by construction (git parent
+// links), so the audit checks the per-session invariants layered on top.
 package audit
 
 import (
@@ -34,7 +38,6 @@ type Report struct {
 }
 
 // OK reports whether the log is structurally sound (no error-severity findings).
-// Warnings (quality flags) do not make it false.
 func (r *Report) OK() bool {
 	for _, f := range r.Findings {
 		if f.Severity == SeverityError {
@@ -44,78 +47,89 @@ func (r *Report) OK() bool {
 	return true
 }
 
-// Run audits every recorded session in the repo.
+// per-session running state while walking events in chain order.
+type sessionCursor struct {
+	seq       int
+	mainTo    int
+	sidechain map[string]int
+}
+
+// Run audits every recorded event in the repo's journals.
 func Run(ctx context.Context, repoRoot string) (*Report, error) {
 	rec := store.New(repoRoot)
-	sessions, err := rec.ListSessions(ctx)
+	events, err := rec.LoadAllEvents(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rep := &Report{Sessions: len(sessions)}
-	for _, sid := range sessions {
-		events, err := rec.LoadEvents(ctx, sid)
-		if err != nil {
-			rep.Findings = append(rep.Findings, Finding{Session: sid, Severity: SeverityError, Message: "cannot load events: " + err.Error()})
-			continue
-		}
-		rep.Events += len(events)
-		auditSession(ctx, repoRoot, sid, events, rep)
-	}
-	return rep, nil
-}
-
-func auditSession(ctx context.Context, repoRoot, sid string, events []store.EventCommit, rep *Report) {
-	add := func(seq int, sev, msg string) {
+	rep := &Report{Events: len(events)}
+	sessions := map[string]*sessionCursor{}
+	add := func(sid string, seq int, sev, msg string) {
 		rep.Findings = append(rep.Findings, Finding{Session: sid, Seq: seq, Severity: sev, Message: msg})
 	}
 
-	runningMain := 0
-	runningSide := map[string]int{}
-
-	for i, ec := range events {
+	for _, ec := range events {
 		r := ec.Record
 
-		// 1. seq is contiguous and 1-based.
-		if r.Seq != i+1 {
-			add(r.Seq, SeverityError, fmt.Sprintf("seq gap: event at position %d has seq=%d", i+1, r.Seq))
-		}
-
-		// 2. the worktree snapshot is present and matches the recorded sha.
+		// Worktree snapshot present and matching the recorded sha (any event kind).
 		if r.WorktreeTree != "" {
 			if !gitutil.ObjectExists(ctx, repoRoot, r.WorktreeTree) {
-				add(r.Seq, SeverityError, "worktree tree object missing: "+r.WorktreeTree)
+				add(r.SessionID, r.Seq, SeverityError, "worktree tree object missing: "+r.WorktreeTree)
 			}
 			if got, err := gitutil.Out(ctx, repoRoot, "rev-parse", ec.Commit+":worktree"); err != nil || got != r.WorktreeTree {
-				add(r.Seq, SeverityError, fmt.Sprintf("worktree/ subtree (%s) does not match recorded tree (%s)", got, r.WorktreeTree))
+				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("worktree/ subtree (%s) does not match recorded tree (%s)", got, r.WorktreeTree))
 			}
 		}
 
-		// 3. main-transcript offsets join end-to-end and the cursor is monotonic.
-		if r.Cursor.Main < runningMain {
-			add(r.Seq, SeverityError, fmt.Sprintf("main cursor went backwards: %d < %d", r.Cursor.Main, runningMain))
+		if r.SessionID == "" {
+			continue // session-independent event: no per-session invariants
 		}
+		sc := sessions[r.SessionID]
+		if sc == nil {
+			sc = &sessionCursor{sidechain: map[string]int{}}
+			sessions[r.SessionID] = sc
+		}
+
+		// Per-session seq is contiguous and 1-based.
+		if r.Seq != sc.seq+1 {
+			add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("session seq gap: expected %d, got %d", sc.seq+1, r.Seq))
+		}
+		sc.seq = r.Seq
+
+		// Transcript offsets join end-to-end against the running main cursor.
+		// session-start may baseline that cursor above 0 (to skip resumed
+		// history), so the first delta's From is not necessarily 0.
 		if r.Transcript != nil {
-			if r.Transcript.From != runningMain {
-				add(r.Seq, SeverityError, fmt.Sprintf("transcript discontinuity: from=%d, expected %d", r.Transcript.From, runningMain))
+			if r.Transcript.From != sc.mainTo {
+				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("transcript discontinuity: from=%d, expected %d", r.Transcript.From, sc.mainTo))
 			}
-			if r.Transcript.To != r.Cursor.Main {
-				add(r.Seq, SeverityError, fmt.Sprintf("transcript to=%d disagrees with cursor.main=%d", r.Transcript.To, r.Cursor.Main))
+			if r.Cursor != nil && r.Transcript.To != r.Cursor.Main {
+				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("transcript to=%d disagrees with cursor.main=%d", r.Transcript.To, r.Cursor.Main))
 			}
 			if r.Transcript.Quality != "ok" {
-				add(r.Seq, SeverityWarn, "transcript quality: "+r.Transcript.Quality)
+				add(r.SessionID, r.Seq, SeverityWarn, "transcript quality: "+r.Transcript.Quality)
 			}
 		}
-		runningMain = r.Cursor.Main
+		// Advance the running main cursor (monotonic) from cursor.Main — which is
+		// set even on events with no transcript delta (session-start baselines it).
+		if r.Cursor != nil {
+			if r.Cursor.Main < sc.mainTo {
+				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("main cursor went backwards: %d < %d", r.Cursor.Main, sc.mainTo))
+			}
+			sc.mainTo = r.Cursor.Main
+		}
 
-		// 4. sidechain offsets join end-to-end per subagent.
-		for _, sc := range r.Sidechains {
-			if sc.From != runningSide[sc.ID] {
-				add(r.Seq, SeverityError, fmt.Sprintf("sidechain %s discontinuity: from=%d, expected %d", sc.ID, sc.From, runningSide[sc.ID]))
+		// Sidechain offsets join end-to-end per subagent.
+		for _, side := range r.Sidechains {
+			if side.From != sc.sidechain[side.ID] {
+				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("sidechain %s discontinuity: from=%d, expected %d", side.ID, side.From, sc.sidechain[side.ID]))
 			}
-			if sc.Quality != "ok" {
-				add(r.Seq, SeverityWarn, fmt.Sprintf("sidechain %s quality: %s", sc.ID, sc.Quality))
+			if side.Quality != "ok" {
+				add(r.SessionID, r.Seq, SeverityWarn, fmt.Sprintf("sidechain %s quality: %s", side.ID, side.Quality))
 			}
-			runningSide[sc.ID] = sc.To
+			sc.sidechain[side.ID] = side.To
 		}
 	}
+
+	rep.Sessions = len(sessions)
+	return rep, nil
 }

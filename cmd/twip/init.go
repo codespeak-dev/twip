@@ -29,7 +29,7 @@ func newInitCmd() *cobra.Command {
 				return err
 			}
 			cmd.Printf("Installed %d %s hook(s) in %s/.claude/settings.json\n", n, agentName, root)
-			cmd.Printf("Sessions will be recorded to %s* in this repo.\n", "refs/twip/sessions/")
+			cmd.Printf("Events will be recorded to %s<clone-id> in this repo.\n", "refs/twip/journal/")
 			return nil
 		},
 	}

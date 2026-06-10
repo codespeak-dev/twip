@@ -28,7 +28,7 @@ func newLogCmd() *cobra.Command {
 				return nil
 			}
 			for _, sid := range sessions {
-				events, err := rec.LoadEvents(ctx, sid)
+				events, err := rec.LoadSessionEvents(ctx, sid)
 				if err != nil {
 					cmd.Printf("session %s: error: %v\n", short(sid), err)
 					continue

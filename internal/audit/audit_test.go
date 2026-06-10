@@ -40,8 +40,8 @@ func initRepo(t *testing.T) string {
 }
 
 // recordTwoGoodEvents appends a session-start and a stop event and returns the
-// repo + session id + the tip after them.
-func recordTwoGoodEvents(t *testing.T, repo, sid string) store.Tip {
+// journal tip commit after them (the parent for any forged follow-on event).
+func recordTwoGoodEvents(t *testing.T, repo, sid string) string {
 	t.Helper()
 	ctx := context.Background()
 	rec := store.New(repo)
@@ -49,21 +49,25 @@ func recordTwoGoodEvents(t *testing.T, repo, sid string) store.Tip {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tip, _ := rec.LoadTip(ctx, sid)
-	if _, err := rec.Append(ctx, sid, tip,
+	prior, _ := rec.PriorSessionState(ctx, sid)
+	if _, err := rec.Append(ctx,
 		&agent.Event{SessionID: sid, Kind: agent.KindSessionStart, Cursor: agent.Cursor{Main: 0}},
-		snap, time.Unix(1, 0)); err != nil {
+		snap, "main", prior.Seq, time.Unix(1, 0)); err != nil {
 		t.Fatal(err)
 	}
-	tip, _ = rec.LoadTip(ctx, sid)
-	if _, err := rec.Append(ctx, sid, tip,
+	prior, _ = rec.PriorSessionState(ctx, sid)
+	if _, err := rec.Append(ctx,
 		&agent.Event{SessionID: sid, Kind: agent.KindStop,
 			Transcript: agent.Delta{Bytes: []byte("a\n"), From: 0, To: 1, Quality: agent.QualityOK},
 			Cursor:     agent.Cursor{Main: 1}},
-		snap, time.Unix(2, 0)); err != nil {
+		snap, "main", prior.Seq, time.Unix(2, 0)); err != nil {
 		t.Fatal(err)
 	}
-	tip, _ = rec.LoadTip(ctx, sid)
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tip, _ := gitutil.ResolveRef(ctx, repo, store.JournalRefPrefix+cloneID)
 	return tip
 }
 
@@ -80,6 +84,40 @@ func TestAudit_CleanPasses(t *testing.T) {
 	}
 	if rep.Events != 2 {
 		t.Errorf("events = %d, want 2", rep.Events)
+	}
+}
+
+// TestAudit_BaselinedCursorPasses guards the regression where session-start
+// baselines the cursor above 0 (skipping resumed history), so the first stop
+// delta legitimately starts at From>0. The audit must not flag that.
+func TestAudit_BaselinedCursorPasses(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := store.New(repo)
+	snap, _ := snapshot.Capture(ctx, repo)
+	sid := "baseline-sess"
+
+	prior, _ := rec.PriorSessionState(ctx, sid)
+	if _, err := rec.Append(ctx,
+		&agent.Event{SessionID: sid, Kind: agent.KindSessionStart, Cursor: agent.Cursor{Main: 3}},
+		snap, "main", prior.Seq, time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	prior, _ = rec.PriorSessionState(ctx, sid)
+	if _, err := rec.Append(ctx,
+		&agent.Event{SessionID: sid, Kind: agent.KindStop,
+			Transcript: agent.Delta{Bytes: []byte("x\n"), From: 3, To: 4, Quality: agent.QualityOK},
+			Cursor:     agent.Cursor{Main: 4}},
+		snap, "main", prior.Seq, time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := Run(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK() {
+		t.Errorf("baselined-cursor session should pass; findings: %+v", rep.Findings)
 	}
 }
 
@@ -111,7 +149,11 @@ func forgeEvent(t *testing.T, repo, sid string, rec store.Record, parent string,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gitutil.UpdateRef(ctx, repo, store.RefPrefix+sid, commit, parent); err != nil {
+	cloneID, err := store.New(repo).CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gitutil.UpdateRef(ctx, repo, store.JournalRefPrefix+cloneID, commit, parent); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -122,8 +164,8 @@ func TestAudit_SeqGapFails(t *testing.T) {
 	// Forge a third event with seq 5 (gap).
 	forgeEvent(t, repo, "s1", store.Record{
 		Schema: 1, SessionID: "s1", Seq: 5, Kind: "stop",
-		Cursor: agent.Cursor{Main: 1},
-	}, tip.Commit, false)
+		Cursor: &agent.Cursor{Main: 1},
+	}, tip, false)
 
 	rep, _ := Run(context.Background(), repo)
 	if rep.OK() {
@@ -142,8 +184,8 @@ func TestAudit_MissingWorktreeFails(t *testing.T) {
 	forgeEvent(t, repo, "s1", store.Record{
 		Schema: 1, SessionID: "s1", Seq: 3, Kind: "stop",
 		WorktreeTree: "0000000000000000000000000000000000000000",
-		Cursor:       agent.Cursor{Main: 1},
-	}, tip.Commit, false)
+		Cursor:       &agent.Cursor{Main: 1},
+	}, tip, false)
 
 	rep, _ := Run(context.Background(), repo)
 	if rep.OK() {

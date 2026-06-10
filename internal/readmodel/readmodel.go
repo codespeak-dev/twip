@@ -14,37 +14,33 @@ import (
 
 // Entry is one event in the merged, time-ordered timeline.
 type Entry struct {
-	Session string
-	Commit  string
-	Seq     int
-	Kind    string
-	TS      string
-	Branch  string
-	Prompt  string
-	Quality string // non-empty only when a data-quality flag was recorded
+	Session  string
+	Commit   string
+	Seq      int
+	Kind     string
+	TS       string
+	Branch   string
+	Worktree string
+	Prompt   string
+	Quality  string // non-empty only when a data-quality flag was recorded
 }
 
-// Timeline returns every recorded event across all sessions, newest first.
+// Timeline returns every recorded event across all journals, newest first.
 func Timeline(ctx context.Context, repoRoot string) ([]Entry, error) {
 	rec := store.New(repoRoot)
-	sessions, err := rec.ListSessions(ctx)
+	events, err := rec.LoadAllEvents(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var entries []Entry
-	for _, sid := range sessions {
-		events, err := rec.LoadEvents(ctx, sid)
-		if err != nil {
-			continue // a broken session shouldn't blank the whole timeline
+	entries := make([]Entry, 0, len(events))
+	for _, ec := range events {
+		r := ec.Record
+		e := Entry{Session: r.SessionID, Commit: ec.Commit, Seq: r.Seq, Kind: r.Kind,
+			TS: r.TS, Branch: r.Branch, Worktree: r.WorktreeID, Prompt: r.Prompt}
+		if r.Transcript != nil && r.Transcript.Quality != "ok" {
+			e.Quality = r.Transcript.Quality
 		}
-		for _, ec := range events {
-			r := ec.Record
-			e := Entry{Session: sid, Commit: ec.Commit, Seq: r.Seq, Kind: r.Kind, TS: r.TS, Branch: r.Branch, Prompt: r.Prompt}
-			if r.Transcript != nil && r.Transcript.Quality != "ok" {
-				e.Quality = r.Transcript.Quality
-			}
-			entries = append(entries, e)
-		}
+		entries = append(entries, e)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].TS > entries[j].TS })
 	return entries, nil
@@ -75,10 +71,12 @@ type TurnDetail struct {
 // Turn builds the detailed view of one event by seq within a session.
 func Turn(ctx context.Context, repoRoot, sessionID string, seq int) (*TurnDetail, error) {
 	rec := store.New(repoRoot)
-	events, err := rec.LoadEvents(ctx, sessionID)
+	events, err := rec.LoadSessionEvents(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
+	// events are ordered by per-session seq, so the prior entry is this session's
+	// previous turn — the right base for "changed files vs previous turn".
 	var cur, prev *store.EventCommit
 	for i := range events {
 		if events[i].Record.Seq == seq {
@@ -95,7 +93,7 @@ func Turn(ctx context.Context, repoRoot, sessionID string, seq int) (*TurnDetail
 	r := cur.Record
 	d := &TurnDetail{
 		Entry: Entry{Session: sessionID, Commit: cur.Commit, Seq: r.Seq, Kind: r.Kind,
-			TS: r.TS, Branch: r.Branch, Prompt: r.Prompt},
+			TS: r.TS, Branch: r.Branch, Worktree: r.WorktreeID, Prompt: r.Prompt},
 		Head:         r.Head,
 		Model:        r.Model,
 		WorktreeTree: r.WorktreeTree,

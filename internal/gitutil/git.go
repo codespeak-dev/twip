@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -60,6 +61,20 @@ func GitDir(ctx context.Context, repoRoot string) (string, error) {
 	return Out(ctx, repoRoot, "rev-parse", "--path-format=absolute", "--git-dir")
 }
 
+// WorktreeName identifies which worktree repoRoot is: "main" for the primary
+// worktree, or the linked-worktree name (the directory under .git/worktrees/).
+// Used as the worktree_id attribution field on recorded events.
+func WorktreeName(ctx context.Context, repoRoot string) string {
+	gitDir, err := GitDir(ctx, repoRoot)
+	if err != nil {
+		return "main"
+	}
+	if filepath.Base(filepath.Dir(gitDir)) == "worktrees" {
+		return filepath.Base(gitDir)
+	}
+	return "main"
+}
+
 // Head returns the current commit sha (empty if the repo has no commits yet) and
 // the current branch (empty when detached).
 func Head(ctx context.Context, repoRoot string) (sha, branch string) {
@@ -103,15 +118,19 @@ func CommitTree(ctx context.Context, repoRoot, tree, parent, message string) (st
 	return strings.TrimSpace(string(b)), err
 }
 
-// UpdateRef points ref at newValue. If oldValue is non-empty it is used as a
-// compare-and-swap guard (fails if the ref moved); empty oldValue creates/moves
-// unconditionally (callers hold the session lock).
+// zeroOID is git's null object id; as an update-ref old-value it asserts the ref
+// does not yet exist (create-only compare-and-swap).
+const zeroOID = "0000000000000000000000000000000000000000"
+
+// UpdateRef points ref at newValue under a compare-and-swap guard: the update
+// fails unless the ref currently equals oldValue. An empty oldValue means "the
+// ref must not exist yet" — so even ref creation is a CAS and concurrent
+// first-writers can't clobber each other.
 func UpdateRef(ctx context.Context, repoRoot, ref, newValue, oldValue string) error {
-	args := []string{"update-ref", ref, newValue}
-	if oldValue != "" {
-		args = append(args, oldValue)
+	if oldValue == "" {
+		oldValue = zeroOID
 	}
-	_, err := Run(ctx, repoRoot, nil, nil, args...)
+	_, err := Run(ctx, repoRoot, nil, nil, "update-ref", ref, newValue, oldValue)
 	return err
 }
 

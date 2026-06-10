@@ -32,9 +32,8 @@ func newHookCmd() *cobra.Command {
 	}
 }
 
-// runHook is the capture pipeline: resolve repo + agent, read the payload, lock
-// the session, load the prior cursor, parse the event (reading transcript
-// deltas), snapshot the worktree, and append one event to the log.
+// runHook resolves the repo from the cwd and reads the payload, then hands off to
+// recordHook. Returns nil (no-op) when not inside a git repo.
 func runHook(ctx context.Context, agentName, event string, stdin io.Reader) error {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -44,13 +43,21 @@ func runHook(ctx context.Context, agentName, event string, stdin io.Reader) erro
 	if err != nil {
 		return nil // not in a git repo: nothing to record, not an error
 	}
-	ag, err := agent.Get(agentName)
-	if err != nil {
-		return err
-	}
 	payload, err := io.ReadAll(stdin)
 	if err != nil {
 		return fmt.Errorf("read hook payload: %w", err)
+	}
+	return recordHook(ctx, repoRoot, agentName, event, payload, time.Now())
+}
+
+// recordHook is the capture pipeline: resolve the agent, peek the session id,
+// lock the session, load the prior cursor, parse the event (reading transcript
+// deltas), snapshot the worktree, and append one event to the journal. It takes
+// repoRoot/payload/now explicitly so tests can drive it as a series of hook calls.
+func recordHook(ctx context.Context, repoRoot, agentName, event string, payload []byte, now time.Time) error {
+	ag, err := agent.Get(agentName)
+	if err != nil {
+		return err
 	}
 	sessionID, err := ag.SessionID(payload)
 	if err != nil {
@@ -67,11 +74,11 @@ func runHook(ctx context.Context, agentName, event string, stdin io.Reader) erro
 	}
 	defer release()
 
-	tip, err := rec.LoadTip(ctx, sessionID)
+	prior, err := rec.PriorSessionState(ctx, sessionID)
 	if err != nil {
 		return err
 	}
-	ev, err := ag.ParseHookEvent(ctx, event, bytes.NewReader(payload), tip.Cursor)
+	ev, err := ag.ParseHookEvent(ctx, event, bytes.NewReader(payload), prior.Cursor)
 	if err != nil {
 		return err
 	}
@@ -85,6 +92,7 @@ func runHook(ctx context.Context, agentName, event string, stdin io.Reader) erro
 	if err != nil {
 		return err
 	}
-	_, err = rec.Append(ctx, sessionID, tip, ev, snap, time.Now())
+	worktreeID := gitutil.WorktreeName(ctx, repoRoot)
+	_, err = rec.Append(ctx, ev, snap, worktreeID, prior.Seq, now)
 	return err
 }

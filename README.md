@@ -14,9 +14,20 @@ design rationale.
 
 ## How it works
 
-Each agent session is an append-only commit chain on `refs/twip/sessions/<session-id>`: one commit
-per hook firing, parented to the previous event. Every event commit's tree holds two things, so both
-stay reachable by real git edges (GC-safe) rather than via a sha buried in JSON:
+Each clone has one **journal** — an append-only commit chain on `refs/twip/journal/<clone-id>` —
+and every recorded event is one commit appended to it. Attribution (`kind`, `session_id`,
+`worktree_id`, `head`, `branch`) lives in the event record as *fields*, not in the ref name, so the
+journal holds every kind of event — including session-independent ones (the v2 git-op capture). This
+also means:
+
+- **No merges.** Different clones write different refs (nothing to reconcile on sync); within a
+  clone, concurrent writers append via compare-and-swap, and since each event is one childless
+  commit, a lost race just re-parents it onto the new tip — never a content merge.
+- **No ref explosion.** Refs scale with clones, not sessions.
+- The canonical order is each event's timestamp; the read side unions all journals and sorts by it.
+
+Every event commit's tree holds two things, so both stay reachable by real git edges (GC-safe)
+rather than via a sha buried in JSON:
 
 - `worktree/` — a full snapshot of the working tree at that moment (captured with a throwaway index
   + `git write-tree`, so it's the literal on-disk state with no side effects on HEAD/index/worktree,
@@ -51,7 +62,7 @@ cmd/twip/                CLI (cobra): init, hook, audit, log, show, serve
 internal/agent/          agent-extension seam: lean Agent interface + registry + normalized Event
 internal/agent/claudecode/  Claude Code: hook parse/install, transcript flush + delta + sidechains
 internal/snapshot/       temp-index git write-tree worktree capture
-internal/store/          append-only event log on per-session refs (schema, flock, read helpers)
+internal/store/          append-only journal: one per-clone ref, CAS-append, schema, flock, read helpers
 internal/audit/          integrity audit
 internal/readmodel/      derived timeline + verified-link views
 internal/web/            server-rendered timeline UI (go:embed)

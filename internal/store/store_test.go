@@ -54,21 +54,27 @@ func TestAppend_ChainsAndIsReadable(t *testing.T) {
 	rec := New(repo)
 	sid := "11111111-2222-3333-4444-555555555555"
 
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jref := JournalRefPrefix + cloneID
+
 	// Event 1: session-start, no transcript.
 	rel, err := rec.Lock(ctx, sid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tip, _ := rec.LoadTip(ctx, sid)
-	if tip.Commit != "" || tip.Seq != 0 {
-		t.Fatalf("fresh tip should be empty, got %+v", tip)
+	prior, _ := rec.PriorSessionState(ctx, sid)
+	if prior.Seq != 0 {
+		t.Fatalf("fresh prior should be zero, got %+v", prior)
 	}
 	snap1, err := snapshot.Capture(ctx, repo)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ev1 := &agent.Event{SessionID: sid, Kind: agent.KindSessionStart, Cursor: agent.Cursor{Main: 0}}
-	r1, err := rec.Append(ctx, sid, tip, ev1, snap1, time.Unix(1000, 0))
+	r1, err := rec.Append(ctx, ev1, snap1, "main", prior.Seq, time.Unix(1000, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,12 +91,12 @@ func TestAppend_ChainsAndIsReadable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tip, err = rec.LoadTip(ctx, sid)
+	prior, err = rec.PriorSessionState(ctx, sid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tip.Seq != 1 {
-		t.Fatalf("tip seq after first append = %d, want 1", tip.Seq)
+	if prior.Seq != 1 {
+		t.Fatalf("prior seq after first append = %d, want 1", prior.Seq)
 	}
 	snap2, err := snapshot.Capture(ctx, repo)
 	if err != nil {
@@ -102,7 +108,7 @@ func TestAppend_ChainsAndIsReadable(t *testing.T) {
 		Transcript: agent.Delta{Bytes: []byte("{\"x\":1}\n"), From: 0, To: 1, Quality: agent.QualityOK},
 		Cursor:     agent.Cursor{Main: 1},
 	}
-	r2, err := rec.Append(ctx, sid, tip, ev2, snap2, time.Unix(2000, 0))
+	r2, err := rec.Append(ctx, ev2, snap2, "main", prior.Seq, time.Unix(2000, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,12 +117,12 @@ func TestAppend_ChainsAndIsReadable(t *testing.T) {
 		t.Errorf("seq = %d, want 2", r2.Seq)
 	}
 
-	// Two events on the chain.
-	if out, _ := gitutil.Out(ctx, repo, "rev-list", "--count", ref(sid)); out != "2" {
+	// Two events on the single journal chain.
+	if out, _ := gitutil.Out(ctx, repo, "rev-list", "--count", jref); out != "2" {
 		t.Errorf("rev-list count = %q, want 2", out)
 	}
 
-	tipCommit, _ := gitutil.ResolveRef(ctx, repo, ref(sid))
+	tipCommit, _ := gitutil.ResolveRef(ctx, repo, jref)
 
 	// Worktree snapshot at event 2 contains the new file's content.
 	got, err := gitutil.CatFile(ctx, repo, tipCommit+":worktree/src/new.go")
@@ -136,10 +142,19 @@ func TestAppend_ChainsAndIsReadable(t *testing.T) {
 		t.Errorf("transcript blob = %q", tr)
 	}
 
-	// Cursor round-trips through the log.
-	tip2, _ := rec.LoadTip(ctx, sid)
-	if tip2.Cursor.Main != 1 {
-		t.Errorf("round-tripped cursor.Main = %d, want 1", tip2.Cursor.Main)
+	// Attribution is recorded as fields, not in the ref name.
+	rec2, err := rec.readRecord(ctx, tipCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec2.SessionID != sid || rec2.WorktreeID != "main" {
+		t.Errorf("attribution fields = session %q worktree %q", rec2.SessionID, rec2.WorktreeID)
+	}
+
+	// Cursor round-trips through the log via back-scan.
+	prior2, _ := rec.PriorSessionState(ctx, sid)
+	if prior2.Cursor.Main != 1 || prior2.Seq != 2 {
+		t.Errorf("round-tripped prior = %+v, want cursor.Main=1 seq=2", prior2)
 	}
 }
 

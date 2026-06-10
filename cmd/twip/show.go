@@ -25,7 +25,7 @@ func newShowCmd() *cobra.Command {
 				return fmt.Errorf("seq must be a number: %w", err)
 			}
 			rec := store.New(root)
-			events, err := rec.LoadEvents(ctx, args[0])
+			events, err := rec.LoadSessionEvents(ctx, args[0])
 			if err != nil {
 				return err
 			}
