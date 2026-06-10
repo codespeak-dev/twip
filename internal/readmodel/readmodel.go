@@ -22,6 +22,7 @@ type Entry struct {
 	Branch   string
 	Worktree string
 	Prompt   string
+	Detail   string // human summary: the prompt, or a git-op's argv
 	Quality  string // non-empty only when a data-quality flag was recorded
 }
 
@@ -36,7 +37,10 @@ func Timeline(ctx context.Context, repoRoot string) ([]Entry, error) {
 	for _, ec := range events {
 		r := ec.Record
 		e := Entry{Session: r.SessionID, Commit: ec.Commit, Seq: r.Seq, Kind: r.Kind,
-			TS: r.TS, Branch: r.Branch, Worktree: r.WorktreeID, Prompt: r.Prompt}
+			TS: r.TS, Branch: r.Branch, Worktree: r.WorktreeID, Prompt: r.Prompt, Detail: r.Prompt}
+		if r.GitOp != nil {
+			e.Detail = strings.Join(r.GitOp.Argv, " ")
+		}
 		if r.Transcript != nil && r.Transcript.Quality != "ok" {
 			e.Quality = r.Transcript.Quality
 		}

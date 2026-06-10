@@ -1,53 +1,49 @@
 package main
 
 import (
-	"strconv"
+	"fmt"
 	"strings"
 
-	"github.com/codespeak/twip/internal/store"
+	"github.com/codespeak/twip/internal/readmodel"
 	"github.com/spf13/cobra"
 )
 
 func newLogCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "log",
-		Short: "List recorded sessions and turns",
+		Short: "Show the recorded event timeline, newest first",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 			root, err := repoRoot(ctx)
 			if err != nil {
 				return err
 			}
-			rec := store.New(root)
-			sessions, err := rec.ListSessions(ctx)
+			// The journal is the timeline: every event (agent turns and git ops)
+			// merged by time, not grouped by session.
+			entries, err := readmodel.Timeline(ctx, root)
 			if err != nil {
 				return err
 			}
-			if len(sessions) == 0 {
-				cmd.Println("no recorded sessions")
+			if len(entries) == 0 {
+				cmd.Println("no recorded events")
 				return nil
 			}
-			for _, sid := range sessions {
-				events, err := rec.LoadSessionEvents(ctx, sid)
-				if err != nil {
-					cmd.Printf("session %s: error: %v\n", short(sid), err)
-					continue
+			for _, e := range entries {
+				origin := "-"
+				if e.Session != "" {
+					origin = short(e.Session)
 				}
-				cmd.Printf("session %s  (%d events)\n", sid, len(events))
-				for _, ec := range events {
-					r := ec.Record
-					line := "  " + r.TS + "  seq " + strconv.Itoa(r.Seq) + "  " + r.Kind
-					if r.Branch != "" {
-						line += "  [" + r.Branch + "]"
-					}
-					if r.Prompt != "" {
-						line += "  " + oneLine(r.Prompt, 60)
-					}
-					if r.Transcript != nil && r.Transcript.Quality != "ok" {
-						line += "  !" + r.Transcript.Quality
-					}
-					cmd.Println(line)
+				line := fmt.Sprintf("%s  %-18s  %-8s  %-6s", e.TS, e.Kind, origin, e.Worktree)
+				if e.Branch != "" {
+					line += "  [" + e.Branch + "]"
 				}
+				if e.Detail != "" {
+					line += "  " + oneLine(e.Detail, 70)
+				}
+				if e.Quality != "" {
+					line += "  !" + e.Quality
+				}
+				cmd.Println(line)
 			}
 			return nil
 		},
