@@ -157,3 +157,14 @@ func ObjectExists(ctx context.Context, repoRoot, spec string) bool {
 	_, err := Run(ctx, repoRoot, nil, nil, "cat-file", "-e", spec)
 	return err == nil
 }
+
+// StashEntries returns the commit shas of the current stash stack (newest first),
+// or nil if there is no stash. Each is a self-contained commit whose tree is the
+// stashed worktree state.
+func StashEntries(ctx context.Context, repoRoot string) []string {
+	out, err := Run(ctx, repoRoot, nil, nil, "stash", "list", "--format=%H")
+	if err != nil {
+		return nil
+	}
+	return strings.Fields(string(out))
+}

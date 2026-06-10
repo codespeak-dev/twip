@@ -114,6 +114,60 @@ func TestGitShim_BenignOpAndNonEnabledRepoAreNoops(t *testing.T) {
 	}
 }
 
+// TestGitShim_ArchivesStashBeforeDrop proves the stash-specific gap is covered: a
+// stash entry lives in refs/stash (not the worktree), so dropping it would orphan
+// the commit — the shim pins it first.
+func TestGitShim_ArchivesStashBeforeDrop(t *testing.T) {
+	ctx := context.Background()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	twip := buildTwip(t)
+	repo := e2eInitRepo(t) // commits README.md = "hello\n"
+	if _, err := store.New(repo).CloneID(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a stash (real git), capture its commit sha.
+	e2eWrite(t, repo, "README.md", "stashed change\n")
+	gitInRepo(t, repo, "stash")
+	stashSha, err := gitutil.Out(ctx, repo, "rev-parse", "refs/stash")
+	if err != nil {
+		t.Fatalf("no stash created: %v", err)
+	}
+
+	// Drop the stash THROUGH the shim — git orphans it from refs/stash.
+	runShim(t, twip, realGit, repo, "stash", "drop")
+
+	// The stash commit survives, pinned under refs/twip/stash/<sha>...
+	got, _ := gitutil.ResolveRef(ctx, repo, store.StashRefPrefix+stashSha)
+	if got != stashSha {
+		t.Errorf("stash not archived: ref=%q want %q", got, stashSha)
+	}
+	// ...and its content (the stashed change git discarded) is recoverable.
+	content, err := gitutil.CatFile(ctx, repo, stashSha+":README.md")
+	if err != nil || string(content) != "stashed change\n" {
+		t.Errorf("archived stash content = %q (err %v), want %q", content, err, "stashed change\n")
+	}
+
+	// The gitop event records what it pinned.
+	events, _ := store.New(repo).LoadAllEvents(ctx)
+	var recorded bool
+	for _, ec := range events {
+		if ec.Record.GitOp != nil {
+			for _, s := range ec.Record.GitOp.Stashed {
+				if s == stashSha {
+					recorded = true
+				}
+			}
+		}
+	}
+	if !recorded {
+		t.Error("gitop event did not record the archived stash sha")
+	}
+}
+
 // --- helpers ---
 
 func buildTwip(t *testing.T) string {

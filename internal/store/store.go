@@ -61,6 +61,30 @@ type GitOpMeta struct {
 	AfterHead  string   `json:"after_head,omitempty"`
 	ExitCode   int      `json:"exit_code"`
 	Dirty      bool     `json:"dirty"`
+	Stashed    []string `json:"stashed,omitempty"` // stash commits pinned before a stash op
+}
+
+// StashRefPrefix pins stash commits that a `stash drop`/`pop`/`clear` would
+// otherwise orphan. These are object-preservation refs (not the journal): a
+// stash entry is a separate commit reachable only via refs/stash, so the
+// worktree snapshot can't capture it — we keep-ref the commit itself instead.
+const StashRefPrefix = "refs/twip/stash/"
+
+// ArchiveStash pins each stash commit under refs/twip/stash/<sha> so it survives
+// a later drop/clear. Idempotent and best-effort; returns the shas now pinned.
+func (r *Recorder) ArchiveStash(ctx context.Context, shas []string) []string {
+	var pinned []string
+	for _, sha := range shas {
+		ref := StashRefPrefix + sha
+		if cur, _ := gitutil.ResolveRef(ctx, r.RepoRoot, ref); cur == sha {
+			pinned = append(pinned, sha) // already archived
+			continue
+		}
+		if err := gitutil.UpdateRef(ctx, r.RepoRoot, ref, sha, ""); err == nil {
+			pinned = append(pinned, sha)
+		}
+	}
+	return pinned
 }
 
 // Record is the meta/event.json payload. Attribution (kind, session_id,

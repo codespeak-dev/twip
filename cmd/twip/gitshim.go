@@ -118,12 +118,20 @@ func capture(ctx context.Context, rec *store.Recorder, repoRoot, op string, args
 		}
 	}
 
+	// A stash entry lives in refs/stash, not the worktree, so the snapshot above
+	// can't preserve it. Pin the current stack BEFORE the op so a drop/pop/clear
+	// can't orphan it.
+	var stashed []string
+	if op == "stash" {
+		stashed = rec.ArchiveStash(ctx, gitutil.StashEntries(ctx, repoRoot))
+	}
+
 	exitCode := runReal(ctx, os.Getenv(envRealGit), args)
 
 	afterHead, _ := gitutil.Head(ctx, repoRoot)
 	op2 := store.GitOpMeta{
 		Op: op, Argv: args, BeforeHead: beforeHead, AfterHead: afterHead,
-		ExitCode: exitCode, Dirty: dirty,
+		ExitCode: exitCode, Dirty: dirty, Stashed: stashed,
 	}
 	if _, err := rec.AppendGitOp(ctx, op2, snap, gitutil.WorktreeName(ctx, repoRoot), time.Now()); err != nil {
 		fmt.Fprintln(os.Stderr, "twip git-shim: record failed:", err)

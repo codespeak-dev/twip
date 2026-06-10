@@ -80,6 +80,15 @@ func Run(ctx context.Context, repoRoot string) (*Report, error) {
 			}
 		}
 
+		// Archived stash commits must still be present (the keep-refs hold them).
+		if r.GitOp != nil {
+			for _, sha := range r.GitOp.Stashed {
+				if !gitutil.ObjectExists(ctx, repoRoot, sha) {
+					add(r.SessionID, r.Seq, SeverityError, "archived stash object missing: "+sha)
+				}
+			}
+		}
+
 		if r.SessionID == "" {
 			continue // session-independent event: no per-session invariants
 		}
