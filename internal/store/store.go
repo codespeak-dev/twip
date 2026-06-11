@@ -70,6 +70,23 @@ type GitOpMeta struct {
 // worktree snapshot can't capture it — we keep-ref the commit itself instead.
 const StashRefPrefix = "refs/twip/stash/"
 
+// PinRefPrefix pins commits a history-rewriting op (amend/rebase/reset) would
+// otherwise orphan, so the pre-rewrite state survives GC. Recording the sha on
+// the event isn't enough — a sha in JSON is not a reachability edge.
+const PinRefPrefix = "refs/twip/pin/"
+
+// PinCommit keep-refs a commit under refs/twip/pin/<sha>. Idempotent, best-effort.
+func (r *Recorder) PinCommit(ctx context.Context, sha string) {
+	if sha == "" {
+		return
+	}
+	ref := PinRefPrefix + sha
+	if cur, _ := gitutil.ResolveRef(ctx, r.RepoRoot, ref); cur == sha {
+		return
+	}
+	_ = gitutil.UpdateRef(ctx, r.RepoRoot, ref, sha, "")
+}
+
 // ArchiveStash pins each stash commit under refs/twip/stash/<sha> so it survives
 // a later drop/clear. Idempotent and best-effort; returns the shas now pinned.
 func (r *Recorder) ArchiveStash(ctx context.Context, shas []string) []string {

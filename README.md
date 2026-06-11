@@ -7,13 +7,15 @@ everything else is derived at read time, and nothing is ever deleted — so an i
 wrong *view* over correct immutable facts, never lost data. See `RECORDER-HANDOFF.md` for the full
 design rationale.
 
-> **Scope.** Records Claude Code sessions via hooks **and destructive git operations via a `git`
-> shim** (`reset --hard`, `checkout -- <path>`, `clean`, `stash drop`, `rebase`, …) — snapshotting
-> the dirty worktree *before* git destroys it, which no git hook can do. Stash entries (which live
-> in `refs/stash`, outside the worktree) are pinned before a `stash drop`/`clear` can orphan them.
-> Still pending: the tripwire hook (detect shim bypass), cross-machine sync, and graded
-> commit↔session links. Only Claude Code is implemented, but the agent seam (`internal/agent`)
-> makes adding an agent "implement the interface + register".
+> **Scope.** Records Claude Code sessions via hooks **and git operations via a `git` shim**. Every
+> mutating git op is recorded as an event (read-only ops like `status`/`log`/`diff` are skipped);
+> destructive ones (`reset --hard`, `checkout`, `clean`, `rebase`, …) also snapshot the dirty
+> worktree *before* git touches it (which no git hook can do); history-rewriting ones
+> (`commit --amend`, `rebase`, `reset`) pin the orphaned pre-rewrite commit; and stash entries
+> (which live in `refs/stash`, outside the worktree) are pinned before a `stash drop`/`clear`. Still
+> pending: the tripwire hook (detect shim bypass), cross-machine sync, graded commit↔session links.
+> Only Claude Code is implemented, but the agent seam (`internal/agent`) makes adding an agent
+> "implement the interface + register".
 
 ## How it works
 

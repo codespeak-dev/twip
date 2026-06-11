@@ -80,12 +80,16 @@ func Run(ctx context.Context, repoRoot string) (*Report, error) {
 			}
 		}
 
-		// Archived stash commits must still be present (the keep-refs hold them).
+		// Archived stash commits, and the pre-rewrite HEAD of a history-rewriting
+		// op, must still be present (the keep-refs hold them).
 		if r.GitOp != nil {
 			for _, sha := range r.GitOp.Stashed {
 				if !gitutil.ObjectExists(ctx, repoRoot, sha) {
 					add(r.SessionID, r.Seq, SeverityError, "archived stash object missing: "+sha)
 				}
+			}
+			if bh := r.GitOp.BeforeHead; bh != "" && bh != r.GitOp.AfterHead && !gitutil.ObjectExists(ctx, repoRoot, bh) {
+				add(r.SessionID, r.Seq, SeverityError, "pre-op HEAD orphaned (not pinned): "+bh)
 			}
 		}
 

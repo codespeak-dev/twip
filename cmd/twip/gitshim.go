@@ -21,15 +21,27 @@ const (
 	envRealGit    = "TWIP_REAL_GIT"    // absolute path to the real git binary
 )
 
-// trackedOps are git subcommands that can modify the worktree or move refs in
-// ways the agent hooks don't capture. For these the shim records an event and, if
-// the worktree is dirty, snapshots it BEFORE running git (the pre-destruction
-// snapshot a post-op hook could never take). Everything else passes straight
-// through, unrecorded.
-var trackedOps = map[string]bool{
+// skipOps are read-only / noisy git subcommands the shim does NOT record (editors
+// and tooling run these constantly). Everything else is recorded as an event —
+// so commit, amend, branch, tag, merge, push, fetch, etc. are all captured, and
+// new mutating subcommands are captured by default.
+var skipOps = map[string]bool{
+	"": true, "status": true, "log": true, "diff": true, "show": true,
+	"rev-parse": true, "cat-file": true, "ls-files": true, "ls-tree": true,
+	"ls-remote": true, "for-each-ref": true, "symbolic-ref": true, "describe": true,
+	"blame": true, "grep": true, "shortlog": true, "reflog": true, "config": true,
+	"help": true, "version": true, "var": true, "check-ignore": true,
+	"check-attr": true, "name-rev": true, "merge-base": true, "rev-list": true,
+	"count-objects": true, "fsck": true, "whatchanged": true, "annotate": true,
+}
+
+// destructiveOps can clobber dirty worktree state, so the shim snapshots the
+// worktree BEFORE running them (the pre-destruction snapshot no git hook can
+// take). Other recorded ops get the event only.
+var destructiveOps = map[string]bool{
 	"checkout": true, "switch": true, "reset": true, "restore": true,
 	"clean": true, "stash": true, "rebase": true, "merge": true,
-	"cherry-pick": true, "revert": true,
+	"cherry-pick": true, "revert": true, "pull": true, "am": true, "apply": true,
 }
 
 func newGitShimCmd() *cobra.Command {
@@ -92,11 +104,11 @@ func gitShim(ctx context.Context, realGit string, args []string) error {
 	if enabled, _ := rec.Enabled(ctx); !enabled {
 		return execReal(realGit, args) // repo not twip-enabled: stay invisible
 	}
-	if !trackedOps[gitSubcommand(args)] {
-		return execReal(realGit, args) // benign op: pass through, no record
+	if skipOps[gitSubcommand(args)] {
+		return execReal(realGit, args) // read-only/noisy op: pass through, no record
 	}
 
-	// Tracked op: capture the pre-op state, run git, record the result. Capture is
+	// Recorded op: capture the pre-op state, run git, record the result. Capture is
 	// always best-effort — a failure here must never change git's behavior.
 	capture(ctx, rec, repoRoot, gitSubcommand(args), args)
 	return nil // capture() exits the process with git's own exit code
@@ -109,7 +121,7 @@ func capture(ctx context.Context, rec *store.Recorder, repoRoot, op string, args
 	dirty := worktreeDirty(ctx, repoRoot)
 
 	snap := snapshot.Snapshot{Head: beforeHead, Branch: branch}
-	if dirty {
+	if destructiveOps[op] && dirty {
 		// Snapshot the pre-destruction worktree. Objects persist after the op runs.
 		if s, err := snapshot.Capture(ctx, repoRoot); err == nil {
 			snap = s
@@ -129,6 +141,11 @@ func capture(ctx context.Context, rec *store.Recorder, repoRoot, op string, args
 	exitCode := runReal(ctx, os.Getenv(envRealGit), args)
 
 	afterHead, _ := gitutil.Head(ctx, repoRoot)
+	// A history-rewriting op (amend/rebase/reset/…) orphans the previous HEAD.
+	// Recording the sha isn't enough — pin the commit so GC can't reclaim it.
+	if beforeHead != "" && beforeHead != afterHead {
+		rec.PinCommit(ctx, beforeHead)
+	}
 	op2 := store.GitOpMeta{
 		Op: op, Argv: args, BeforeHead: beforeHead, AfterHead: afterHead,
 		ExitCode: exitCode, Dirty: dirty, Stashed: stashed,

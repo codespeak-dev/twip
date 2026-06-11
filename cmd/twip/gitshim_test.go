@@ -168,6 +168,51 @@ func TestGitShim_ArchivesStashBeforeDrop(t *testing.T) {
 	}
 }
 
+// TestGitShim_AmendRecordedAndPreHeadPinned covers the reported gap: `commit
+// --amend` is now recorded (commit was previously unrecorded), and the orphaned
+// pre-amend commit is pinned so it survives GC.
+func TestGitShim_AmendRecordedAndPreHeadPinned(t *testing.T) {
+	ctx := context.Background()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	twip := buildTwip(t)
+	repo := e2eInitRepo(t)
+	if _, err := store.New(repo).CloneID(ctx); err != nil {
+		t.Fatal(err)
+	}
+	preAmend, _ := gitutil.Out(ctx, repo, "rev-parse", "HEAD")
+
+	// Amend through the shim (rewrites HEAD, orphaning preAmend).
+	runShim(t, twip, realGit, repo, "commit", "--amend", "-m", "amended")
+
+	postAmend, _ := gitutil.Out(ctx, repo, "rev-parse", "HEAD")
+	if postAmend == preAmend {
+		t.Fatal("amend did not rewrite HEAD")
+	}
+
+	// The pre-amend commit is pinned (survives GC) ...
+	pin, _ := gitutil.ResolveRef(ctx, repo, store.PinRefPrefix+preAmend)
+	if pin != preAmend {
+		t.Errorf("pre-amend commit not pinned: ref=%q want %q", pin, preAmend)
+	}
+	// ... and the event was recorded with before/after HEAD.
+	events, _ := store.New(repo).LoadAllEvents(ctx)
+	var amend *store.GitOpMeta
+	for _, ec := range events {
+		if g := ec.Record.GitOp; g != nil && g.Op == "commit" {
+			amend = g
+		}
+	}
+	if amend == nil {
+		t.Fatal("commit --amend was not recorded")
+	}
+	if amend.BeforeHead != preAmend || amend.AfterHead != postAmend {
+		t.Errorf("amend heads = %s..%s, want %s..%s", amend.BeforeHead, amend.AfterHead, preAmend, postAmend)
+	}
+}
+
 // --- helpers ---
 
 func buildTwip(t *testing.T) string {
