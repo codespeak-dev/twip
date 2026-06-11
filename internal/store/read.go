@@ -24,21 +24,80 @@ type EventCommit struct {
 	Record Record
 }
 
-// JournalRefs lists every clone's journal ref present in this repo (local refs
-// only for now; remote-tracking journals would be added here when sync lands).
+// cloneIDFromRef extracts the clone-id (the trailing path segment) from a local
+// journal ref (refs/twip/journal/<id>) or a fetched mirror ref
+// (refs/twip/remotes/<remote>/journal/<id>). ok is false for anything else.
+func cloneIDFromRef(ref string) (id string, ok bool) {
+	if s := strings.TrimPrefix(ref, JournalRefPrefix); s != ref {
+		if s != "" && !strings.Contains(s, "/") {
+			return s, true
+		}
+		return "", false
+	}
+	if strings.HasPrefix(ref, MirrorRefPrefix) {
+		rest := ref[len(MirrorRefPrefix):] // <remote>/journal/<id>
+		if i := strings.Index(rest, "/journal/"); i >= 0 {
+			if cand := rest[i+len("/journal/"):]; cand != "" && !strings.Contains(cand, "/") {
+				return cand, true
+			}
+		}
+	}
+	return "", false
+}
+
+// JournalRefs lists one ref per clone whose journal is present in this repo —
+// the local journals this clone wrote plus the mirrors of other clones' journals
+// fetched via sync. When a clone-id appears both locally and as a mirror (true
+// for this clone's own journal after a fetch), the local ref wins: it's the
+// authoritative, possibly-ahead-of-remote copy.
 func (r *Recorder) JournalRefs(ctx context.Context) ([]string, error) {
 	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil,
-		"for-each-ref", "--format=%(refname)", JournalRefPrefix)
+		"for-each-ref", "--format=%(refname)", JournalRefPrefix, MirrorRefPrefix)
 	if err != nil {
 		return nil, err
 	}
-	var refs []string
+	byClone := map[string]string{}
+	isLocal := map[string]bool{}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line != "" {
-			refs = append(refs, line)
+		ref := strings.TrimSpace(line)
+		if ref == "" {
+			continue
+		}
+		id, ok := cloneIDFromRef(ref)
+		if !ok {
+			continue
+		}
+		local := strings.HasPrefix(ref, JournalRefPrefix)
+		if local {
+			byClone[id] = ref // local is authoritative; always wins
+			isLocal[id] = true
+		} else if !isLocal[id] {
+			if _, seen := byClone[id]; !seen {
+				byClone[id] = ref
+			}
 		}
 	}
+	refs := make([]string, 0, len(byClone))
+	for _, ref := range byClone {
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
 	return refs, nil
+}
+
+// refForClone resolves a clone-id to the ref JournalRefs would read for it
+// (local preferred over mirror), or "" if no journal for that clone is present.
+func (r *Recorder) refForClone(ctx context.Context, clone string) string {
+	refs, err := r.JournalRefs(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, ref := range refs {
+		if id, ok := cloneIDFromRef(ref); ok && id == clone {
+			return ref
+		}
+	}
+	return ""
 }
 
 // LoadAllEvents returns every event across all journals, in each journal's
@@ -107,7 +166,7 @@ func (r *Recorder) eventsForRef(ctx context.Context, ref string, reverse bool) (
 	if err != nil {
 		return nil, nil //nolint:nilerr // missing ref => no events yet
 	}
-	clone := strings.TrimPrefix(ref, JournalRefPrefix)
+	clone, _ := cloneIDFromRef(ref)
 	var events []EventCommit
 	for _, commit := range strings.Fields(string(out)) {
 		rec, err := r.readRecord(ctx, commit)
@@ -126,7 +185,11 @@ func (r *Recorder) CloneAuthor(ctx context.Context, clone string) string {
 	if clone == "" {
 		return ""
 	}
-	name, err := gitutil.Out(ctx, r.RepoRoot, "log", "-1", "--format=%an", JournalRefPrefix+clone)
+	ref := r.refForClone(ctx, clone)
+	if ref == "" {
+		return ""
+	}
+	name, err := gitutil.Out(ctx, r.RepoRoot, "log", "-1", "--format=%an", ref)
 	if err != nil {
 		return ""
 	}

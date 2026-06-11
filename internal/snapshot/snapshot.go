@@ -42,10 +42,17 @@ func worktreeTree(ctx context.Context, repoRoot string) (string, error) {
 	defer os.Remove(tmpPath)
 
 	// Seed the temp index from the real one so `git add -A` re-stats only files
-	// whose mtime/size changed (the standard index fast-path). Best-effort: an
-	// absent or unreadable index just means a full stat pass.
+	// whose mtime/size changed (the standard index fast-path). Best-effort.
+	seeded := false
 	if gitDir, err := gitutil.GitDir(ctx, repoRoot); err == nil {
-		_ = copyFile(gitDir+"/index", tmpPath)
+		seeded = copyFile(gitDir+"/index", tmpPath) == nil
+	}
+	if !seeded {
+		// No index to seed from (e.g. a repo with no commits yet). The leftover
+		// 0-byte temp file is NOT a valid empty index — git rejects it ("index
+		// file smaller than expected") — so remove it and let git create a fresh
+		// empty index, which just means a full stat pass.
+		_ = os.Remove(tmpPath)
 	}
 
 	env := []string{"GIT_INDEX_FILE=" + tmpPath}

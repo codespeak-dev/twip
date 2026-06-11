@@ -31,8 +31,16 @@ import (
 const SchemaVersion = 1
 
 // JournalRefPrefix namespaces the per-clone journal refs. Refs here are reachable
-// and thus GC-protected.
+// and thus GC-protected. A clone only ever writes its OWN journal under this
+// prefix; other clones' journals fetched via sync land under MirrorRefPrefix.
 const JournalRefPrefix = "refs/twip/journal/"
+
+// MirrorRefPrefix namespaces remote-tracking copies of other clones' journals,
+// fetched via the sync refspec (refs/twip/journal/* on the remote -> here). A
+// mirror ref is refs/twip/remotes/<remote>/journal/<clone-id>; the clone-id is
+// the trailing path segment, exactly as for a local journal. Keeping these out
+// of JournalRefPrefix means a fetch can never move this clone's own writer ref.
+const MirrorRefPrefix = "refs/twip/remotes/"
 
 const casRetries = 20
 

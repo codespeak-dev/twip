@@ -1,0 +1,219 @@
+package store
+
+import (
+	"context"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/codespeak-dev/twip/internal/agent"
+	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/snapshot"
+)
+
+func TestCloneIDFromRef(t *testing.T) {
+	cases := []struct {
+		ref, id string
+		ok      bool
+	}{
+		{"refs/twip/journal/abc-123", "abc-123", true},
+		{"refs/twip/remotes/origin/journal/xy-9", "xy-9", true},
+		{"refs/twip/remotes/upstream/journal/zz", "zz", true},
+		{"refs/twip/pin/deadbeef", "", false},
+		{"refs/heads/main", "", false},
+		{"refs/twip/journal/", "", false},
+		{"refs/twip/remotes/origin/journal/", "", false},
+		{"refs/twip/remotes/origin/notjournal/x", "", false},
+		{"refs/twip/remotes/origin/journal/a/b", "", false},
+	}
+	for _, c := range cases {
+		id, ok := cloneIDFromRef(c.ref)
+		if id != c.id || ok != c.ok {
+			t.Errorf("cloneIDFromRef(%q) = (%q,%v), want (%q,%v)", c.ref, id, ok, c.id, c.ok)
+		}
+	}
+}
+
+// TestJournalRefs_DedupPrefersLocal fabricates a clone-id present both locally
+// and as a (stale) mirror, plus a second clone present only as a mirror, and
+// asserts JournalRefs returns one ref per clone, preferring the local copy.
+func TestJournalRefs_DedupPrefersLocal(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+
+	tree, err := gitutil.Out(ctx, repo, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := func(parents ...string) string {
+		args := []string{"commit-tree", tree, "-m", "e"}
+		for _, p := range parents {
+			args = append(args, "-p", p)
+		}
+		c, err := gitutil.Out(ctx, repo, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	setRef := func(ref, sha string) {
+		if err := gitutil.UpdateRef(ctx, repo, ref, sha, ""); err != nil {
+			t.Fatalf("update-ref %s: %v", ref, err)
+		}
+	}
+
+	localOld := commit()
+	localNew := commit(localOld) // local journal is ahead of the mirror
+	setRef("refs/twip/journal/cloneX", localNew)
+	setRef("refs/twip/remotes/origin/journal/cloneX", localOld) // stale mirror of myself
+	other := commit()
+	setRef("refs/twip/remotes/origin/journal/cloneY", other)
+
+	refs, err := rec.JournalRefs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("JournalRefs = %v, want 2 (one per clone)", refs)
+	}
+	byClone := map[string]string{}
+	for _, ref := range refs {
+		id, _ := cloneIDFromRef(ref)
+		byClone[id] = ref
+	}
+	if got := byClone["cloneX"]; got != "refs/twip/journal/cloneX" {
+		t.Errorf("cloneX ref = %q, want the local journal ref", got)
+	}
+	if got := byClone["cloneY"]; got != "refs/twip/remotes/origin/journal/cloneY" {
+		t.Errorf("cloneY ref = %q, want the mirror ref", got)
+	}
+}
+
+// TestSync_TwoClonesShareTimeline is the end-to-end proof: two clones with
+// distinct identities each record + push; the pre-push hook mirrors their
+// journals to the shared origin, and a normal fetch (via the installed refspec)
+// brings the teammate's journal into the read model — author-attributed, with
+// the local clone's own journal preferred over its mirror.
+func TestSync_TwoClonesShareTimeline(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	origin := filepath.Join(base, "origin.git")
+	git(t, base, "init", "-q", "--bare", "-b", "master", origin)
+
+	// Dmitry: clone, record an event, push (hook mirrors the journal to origin).
+	dmitry := setupClone(t, base, origin, "dmitry", "Dmitry", "dmitry@codespeak.dev")
+	recD := New(dmitry)
+	appendEvent(t, recD, dmitry, "sid-d", 1000)
+	commitAndPush(t, dmitry, "d.txt")
+
+	// Alex: clones after Dmitry's push, records, pushes (FF; hook mirrors Alex's).
+	alex := setupClone(t, base, origin, "alex", "Alex", "alex@codespeak.dev")
+	recA := New(alex)
+	appendEvent(t, recA, alex, "sid-a", 2000)
+	commitAndPush(t, alex, "a.txt")
+
+	cloneD, _ := recD.CloneID(ctx)
+	cloneA, _ := recA.CloneID(ctx)
+	if cloneD == cloneA {
+		t.Fatal("clones must mint distinct clone-ids")
+	}
+
+	// Dmitry records another event AFTER pushing, so his local journal is ahead
+	// of origin's mirror — the dedup must then prefer local.
+	appendEvent(t, recD, dmitry, "sid-d", 1500)
+
+	// A normal fetch carries the twip refs via the refspec InstallSync configured.
+	git(t, dmitry, "fetch", "-q", "origin")
+
+	refs, err := recD.JournalRefs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("after fetch, JournalRefs = %v, want 2 clones", refs)
+	}
+	byClone := map[string]string{}
+	for _, ref := range refs {
+		id, _ := cloneIDFromRef(ref)
+		byClone[id] = ref
+	}
+	if got := byClone[cloneD]; !strings.HasPrefix(got, JournalRefPrefix) {
+		t.Errorf("own clone ref = %q, want the local journal (ahead of mirror)", got)
+	}
+	if got := byClone[cloneA]; !strings.HasPrefix(got, MirrorRefPrefix) {
+		t.Errorf("teammate ref = %q, want the fetched mirror", got)
+	}
+
+	// The teammate's events are now visible and author-attributed.
+	all, err := recD.LoadAllEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	perClone := map[string]int{}
+	for _, ec := range all {
+		perClone[ec.Clone]++
+	}
+	if perClone[cloneD] != 2 {
+		t.Errorf("own events = %d, want 2 (local copy, ahead of origin)", perClone[cloneD])
+	}
+	if perClone[cloneA] != 1 {
+		t.Errorf("teammate events = %d, want 1", perClone[cloneA])
+	}
+	if a := recD.CloneAuthor(ctx, cloneA); a != "Alex" {
+		t.Errorf("teammate author = %q, want Alex", a)
+	}
+	if a := recD.CloneAuthor(ctx, cloneD); a != "Dmitry" {
+		t.Errorf("own author = %q, want Dmitry", a)
+	}
+}
+
+// --- helpers ---
+
+func git(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	if out, err := gitutil.Run(context.Background(), dir, nil, nil, args...); err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+}
+
+func setupClone(t *testing.T, base, origin, dir, name, email string) string {
+	t.Helper()
+	dest := filepath.Join(base, dir)
+	git(t, base, "clone", "-q", origin, dest)
+	git(t, dest, "config", "user.name", name)
+	git(t, dest, "config", "user.email", email)
+	git(t, dest, "config", "commit.gpgsign", "false")
+	if _, err := New(dest).InstallSync(context.Background()); err != nil {
+		t.Fatalf("InstallSync(%s): %v", dir, err)
+	}
+	return dest
+}
+
+func appendEvent(t *testing.T, rec *Recorder, repo, sid string, ts int64) {
+	t.Helper()
+	ctx := context.Background()
+	rel, err := rec.Lock(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rel()
+	prior, _ := rec.PriorSessionState(ctx, sid)
+	snap, err := snapshot.Capture(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := &agent.Event{SessionID: sid, Kind: agent.KindSessionStart, Cursor: agent.Cursor{Main: 0}}
+	if _, err := rec.Append(ctx, ev, snap, "main", prior.Seq, time.Unix(ts, 0)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func commitAndPush(t *testing.T, repo, file string) {
+	t.Helper()
+	writeFile(t, repo, file, "x\n")
+	git(t, repo, "add", file)
+	git(t, repo, "commit", "-q", "-m", "add "+file)
+	git(t, repo, "push", "-q", "origin", "master") // fires the pre-push hook
+}

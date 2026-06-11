@@ -19,6 +19,7 @@ import (
 const (
 	envShimActive = "TWIP_SHIM_ACTIVE" // set => a shim is already capturing; pass through
 	envRealGit    = "TWIP_REAL_GIT"    // absolute path to the real git binary
+	envSyncPush   = "TWIP_SYNC_PUSH"   // set => inside the sync pre-push hook; pass through
 )
 
 // skipOps are read-only / noisy git subcommands the shim does NOT record (editors
@@ -84,8 +85,9 @@ func gitShim(ctx context.Context, realGit string, args []string) error {
 	}
 
 	// Recursion guard: any git invoked by our own capture code re-enters here with
-	// the flag set, and must pass straight through to the real git.
-	if os.Getenv(envShimActive) == "1" {
+	// the flag set, and must pass straight through to the real git. The sync
+	// pre-push hook's own `git push` is likewise pass-through (don't record it).
+	if os.Getenv(envShimActive) == "1" || os.Getenv(envSyncPush) == "1" {
 		return execReal(realGit, args)
 	}
 	// From here on, our nested git calls inherit these and short-circuit above.

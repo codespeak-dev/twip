@@ -29,18 +29,47 @@ func newInitCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			rec := store.New(root)
 			// Create the clone-id eagerly: it's the marker the git shim gates on,
 			// so destructive git ops are recorded only in repos that opted in here.
-			cloneID, err := store.New(root).CloneID(ctx)
+			cloneID, err := rec.CloneID(ctx)
 			if err != nil {
 				return err
 			}
 			cmd.Printf("Installed %d %s hook(s) in %s/.claude/settings.json\n", n, agentName, root)
 			cmd.Printf("Events will be recorded to refs/twip/journal/%s in this repo.\n", cloneID)
+
+			// Wire up sync (push via pre-push hook, fetch via refspec). Best-effort:
+			// a failure here shouldn't fail recording setup.
+			if sync, err := rec.InstallSync(ctx); err != nil {
+				cmd.PrintErrf("twip: sync setup skipped: %v\n", err)
+			} else {
+				reportSync(cmd, sync)
+			}
 			return nil
 		},
 	}
 	cmd.Flags().String("agent", "claude-code", "agent whose hooks to install")
 	cmd.Flags().Bool("force", false, "reinstall hooks, replacing any twip-owned entries")
 	return cmd
+}
+
+// reportSync prints what InstallSync did, including any manual step the operator
+// must take (a pre-existing non-twip pre-push hook, or a missing remote).
+func reportSync(cmd *cobra.Command, s store.SyncSetup) {
+	switch s.HookStatus {
+	case "installed", "updated":
+		cmd.Println("Installed git pre-push hook: your journal mirrors to the remote when you push.")
+	case "foreign":
+		cmd.Printf("A pre-push hook already exists (%s); left it untouched.\n", s.HookPath)
+		cmd.Println("  To share on push, add this to it:")
+		cmd.Println("    TWIP_SYNC_PUSH=1 git push --quiet \"$1\" 'refs/twip/journal/*:refs/twip/journal/*' \\")
+		cmd.Println("      'refs/twip/pin/*:refs/twip/pin/*' 'refs/twip/stash/*:refs/twip/stash/*' >/dev/null 2>&1 || true")
+	}
+	switch {
+	case s.Remote == "":
+		cmd.Println("No remote yet — add an 'origin' and re-run `twip init` to fetch teammates' journals.")
+	case len(s.AddedRefspecs) > 0:
+		cmd.Printf("Configured '%s' to fetch teammates' journals on `git fetch`/`pull`.\n", s.Remote)
+	}
 }

@@ -54,10 +54,16 @@ resolves, seq numbers are contiguous, transcript offsets join end-to-end, and su
 data-quality flags — non-zero exit on any divergence. The shim falls back to real git if twip is
 unavailable, so it can never break git.
 
-*Pending:* tripwire hook (detect shim bypass), cross-machine sync (push/fetch `refs/twip/*` to
-share timelines — the per-clone-id model is built for it), graded commit↔session links. Only Claude
-Code is implemented, but the agent seam (`internal/agent`) makes adding one "implement the
-interface + register".
+**Sharing across the team.** Sync rides on normal git, so there's nothing extra to run. `twip init`
+installs a `pre-push` hook that mirrors your journal to the remote you push to, and adds a
+`remote.origin.fetch` refspec so a plain `git fetch`/`pull` brings teammates' journals down (into
+`refs/twip/remotes/<remote>/journal/*`). It's conflict-free by construction: each clone is the sole
+writer of its own `refs/twip/journal/<clone-id>`, so every push is a fast-forward and there is never
+a merge. The browser then lanes the whole team's timeline, each clone labeled by its author.
+
+*Pending:* tripwire hook (detect shim bypass), graded commit↔session links. Only Claude Code is
+implemented, but the agent seam (`internal/agent`) makes adding one "implement the interface +
+register".
 
 ## Layout
 
