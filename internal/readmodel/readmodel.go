@@ -10,8 +10,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/codespeak/twip/internal/gitutil"
-	"github.com/codespeak/twip/internal/store"
+	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/store"
 )
 
 // Entry is one event in the merged, time-ordered timeline. Clone + Worktree form

@@ -19,8 +19,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/codespeak/twip/internal/gitutil"
-	"github.com/codespeak/twip/internal/readmodel"
+	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/readmodel"
 )
 
 //go:embed templates/index.html static/*

@@ -10,7 +10,7 @@ import (
 	"syscall"
 
 	// Register supported agents.
-	_ "github.com/codespeak/twip/internal/agent/claudecode"
+	_ "github.com/codespeak-dev/twip/internal/agent/claudecode"
 )
 
 func main() {

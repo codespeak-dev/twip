@@ -11,7 +11,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/codespeak/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/gitutil"
 )
 
 // Snapshot is one captured worktree state plus the repo's HEAD at capture time.

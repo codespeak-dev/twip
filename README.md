@@ -1,51 +1,25 @@
 # twip — agent/git history collector
 
-twip gives you a **browsable, append-only timeline of your repo as coding agents develop it**.
-Every Claude Code turn is linked to the exact working-tree snapshot at that moment, and every
-mutating git op is recorded too — destructive ones (`reset --hard`, `checkout`, `rebase`, …)
-snapshot the dirty worktree *before* git touches it. Nothing is ever deleted, so you can scroll
-back through how a change actually came to be — prompts, transcripts, diffs, and the git moves in
-between — long after the fact. Browse it all at `twip serve`.
-
-It's an **event log**: capture happens unconditionally at event time, everything else is derived at
-read time. An inference bug yields a wrong *view* over correct immutable facts, never lost data —
-that's the whole reason it's built this way (see `RECORDER-HANDOFF.md` for the design rationale).
+A browsable, append-only timeline of your repo as coding agents develop it. Every Claude Code turn
+and every mutating git op is linked to the exact worktree snapshot at that moment; nothing is ever
+deleted. Browse it at `twip serve`.
 
 ## Installation
 
-Each developer records their own sessions + git-ops into their own clone — no server, no sync.
-One-time per machine, then per-repo opt-in.
-
-**1. Install (each dev).** Clone this repo and run the installer:
-
 ```sh
-git clone <twip-repo-url> && cd twip && ./scripts/install.sh
+go install github.com/codespeak-dev/twip/cmd/twip@latest   # per machine
+twip shim install                                          # git shim; prints PATH + JetBrains setup
 ```
 
-It builds `twip` into `~/go/bin`, installs a `git` shim into `~/.twip/bin`, and prints the rest:
-add both to your PATH (**shim first**, so it shadows git), and point JetBrains' *Path to Git
-executable* at the shim (JetBrains bypasses PATH). `twip version` confirms the build you're on.
-
-**2. Enable a repo (once, committed).** In each repo you want recorded:
+Then in each repo you want recorded:
 
 ```sh
-twip init                                                # writes .claude/settings.json hooks
-git add .claude/settings.json && git commit -m "twip: record agent sessions"
+twip init && git add .claude/settings.json && git commit -m "twip: record agent sessions"
 ```
 
-Committing the hooks is safe: they're guarded by `command -v twip || exit 0`, a no-op for anyone
-without twip installed. Everyone who *does* have twip then records automatically; the git shim
-records destructive ops in any repo that's been `twip init`-ed. All data lives in that repo's
-`.git` under `refs/twip/*` — nothing leaves the machine.
-
-Then just work as usual:
-
-```sh
-twip log                         # the event timeline, newest first (first column = event id)
-twip show <event-id>             # inspect one event: prompt, transcript, diffs
-twip audit                       # verify the log has no silent loss (non-zero exit on divergence)
-twip serve                       # browse the timeline at http://localhost:7777
-```
+Committed hooks are a no-op for anyone without twip. Everyday commands: `twip log` /
+`show <event-id>` / `audit` / `serve`. (From a clone, `./scripts/install.sh` does the per-machine
+steps in one shot.)
 
 ## How it works
 

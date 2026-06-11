@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/codespeak/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/gitutil"
 )
 
 // repoRoot resolves the worktree root of the current directory.

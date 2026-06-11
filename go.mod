@@ -1,4 +1,4 @@
-module github.com/codespeak/twip
+module github.com/codespeak-dev/twip
 
 go 1.25.0
 

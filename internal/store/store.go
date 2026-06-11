@@ -22,9 +22,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/codespeak/twip/internal/agent"
-	"github.com/codespeak/twip/internal/gitutil"
-	"github.com/codespeak/twip/internal/snapshot"
+	"github.com/codespeak-dev/twip/internal/agent"
+	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/snapshot"
 )
 
 // SchemaVersion is the event.json schema version. Bump on incompatible changes.

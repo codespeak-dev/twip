@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/codespeak/twip/internal/agent"
+	"github.com/codespeak-dev/twip/internal/agent"
 )
 
 // Claude Code writes the transcript asynchronously, so when the Stop hook fires

@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/codespeak/twip/internal/audit"
-	"github.com/codespeak/twip/internal/gitutil"
-	"github.com/codespeak/twip/internal/store"
+	"github.com/codespeak-dev/twip/internal/audit"
+	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/store"
 )
 
 // TestGitShim_PreservesDirtyStateBeforeDestructiveOp is the headline git-op test:

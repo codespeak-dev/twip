@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codespeak/twip/internal/agent"
+	"github.com/codespeak-dev/twip/internal/agent"
 )
 
 func TestDeltaFrom(t *testing.T) {

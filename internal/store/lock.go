@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/codespeak/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/gitutil"
 )
 
 // lockKey takes an exclusive cross-process lock for a key (a session id), so a

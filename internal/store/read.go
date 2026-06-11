@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/codespeak/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/gitutil"
 )
 
 // keySafe constrains lock keys / ids that become ref or file path components.

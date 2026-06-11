@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/codespeak/twip/internal/agent"
-	"github.com/codespeak/twip/internal/store"
+	"github.com/codespeak-dev/twip/internal/agent"
+	"github.com/codespeak-dev/twip/internal/store"
 	"github.com/spf13/cobra"
 )
 

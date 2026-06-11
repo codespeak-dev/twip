@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/codespeak/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/gitutil"
 )
 
 // CloneID returns this clone's stable journal id, generating it on first use.

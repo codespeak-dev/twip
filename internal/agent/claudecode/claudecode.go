@@ -17,7 +17,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/codespeak/twip/internal/agent"
+	"github.com/codespeak-dev/twip/internal/agent"
 )
 
 // Name is the registry key and hook namespace.

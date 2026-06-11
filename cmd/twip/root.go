@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/codespeak/twip/internal/web"
+	"github.com/codespeak-dev/twip/internal/web"
 	"github.com/spf13/cobra"
 )
 

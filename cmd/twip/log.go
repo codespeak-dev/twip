@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/codespeak/twip/internal/readmodel"
+	"github.com/codespeak-dev/twip/internal/readmodel"
 	"github.com/spf13/cobra"
 )
 

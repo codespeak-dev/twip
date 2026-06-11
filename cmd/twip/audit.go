@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/codespeak/twip/internal/audit"
+	"github.com/codespeak-dev/twip/internal/audit"
 	"github.com/spf13/cobra"
 )
 

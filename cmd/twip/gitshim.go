@@ -9,9 +9,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/codespeak/twip/internal/gitutil"
-	"github.com/codespeak/twip/internal/snapshot"
-	"github.com/codespeak/twip/internal/store"
+	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/snapshot"
+	"github.com/codespeak-dev/twip/internal/store"
 	"github.com/spf13/cobra"
 )
 

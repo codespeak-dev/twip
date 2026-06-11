@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codespeak/twip/internal/audit"
-	"github.com/codespeak/twip/internal/gitutil"
-	"github.com/codespeak/twip/internal/store"
+	"github.com/codespeak-dev/twip/internal/audit"
+	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/store"
 )
 
 // TestE2E_RealisticHookSequence drives the actual capture entrypoint (recordHook)

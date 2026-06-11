@@ -13,8 +13,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/codespeak/twip/internal/gitutil"
-	"github.com/codespeak/twip/internal/store"
+	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/store"
 )
 
 const (
