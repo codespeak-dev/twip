@@ -73,7 +73,8 @@ body { font: 13.5px/1.55 var(--sans); color: var(--ink); background: var(--bg); 
 .node:hover { background: var(--faint); }
 .node.selected { background: var(--sel); border-left-color: var(--accent); }
 
-.gittext { flex: none; width: 12rem; min-width: 0; overflow: hidden; padding: .5rem .4rem .5rem .3rem; }
+/* width is set by JS to the widest git description (snug + uniform); capped here */
+.gittext { flex: none; max-width: 22rem; min-width: 0; overflow: hidden; padding: .5rem .5rem .5rem .3rem; }
 .sesstext { flex: 1; min-width: 0; padding: .5rem 0; }
 .rowtime { flex: none; align-self: flex-start; padding: .5rem 0 0 .6rem; color: var(--muted); font-size: .78em; font-family: var(--mono); white-space: nowrap; }
 
