@@ -16,16 +16,16 @@ import (
 
 // Entry is one event in the merged, time-ordered timeline.
 type Entry struct {
-	Session  string // attribution only ("" for session-independent events)
-	Commit   string
-	Seq      int
-	Kind     string
-	TS       string
-	Branch   string
-	Worktree string
-	Prompt   string
-	Detail   string // human summary: the prompt, or a git-op's argv
-	Quality  string // non-empty only when a data-quality flag was recorded
+	Session  string `json:"session"` // attribution only ("" for session-independent events)
+	Commit   string `json:"commit"`
+	Seq      int    `json:"seq"`
+	Kind     string `json:"kind"`
+	TS       string `json:"ts"`
+	Branch   string `json:"branch"`
+	Worktree string `json:"worktree"`
+	Prompt   string `json:"prompt"`
+	Detail   string `json:"detail"` // human summary: the prompt, or a git-op's argv
+	Quality  string `json:"quality"`
 }
 
 func entryFor(ec store.EventCommit) Entry {
@@ -62,23 +62,23 @@ func Timeline(ctx context.Context, repoRoot string) ([]Entry, error) {
 // whether that exact content is present at the repo's current HEAD (a verified,
 // content-based link rather than a write-time hint).
 type FileChange struct {
-	Status string // A, M, D
-	Path   string
-	InHead bool
+	Status string `json:"status"` // A, M, D
+	Path   string `json:"path"`
+	InHead bool   `json:"inHead"`
 }
 
 // EventDetail is the full view of a single recorded event.
 type EventDetail struct {
 	Entry
-	Head           string
-	Model          string
-	Transcript     string
-	TranscriptFrom int
-	TranscriptTo   int
-	Changed        []FileChange
-	Files          []string // file list of the worktree snapshot
-	WorktreeTree   string
-	GitOp          *store.GitOpMeta // set for session-independent git-op events
+	Head           string           `json:"head"`
+	Model          string           `json:"model"`
+	Transcript     string           `json:"transcript"`
+	TranscriptFrom int              `json:"transcriptFrom"`
+	TranscriptTo   int              `json:"transcriptTo"`
+	Changed        []FileChange     `json:"changed"`
+	Files          []string         `json:"files"` // file list of the worktree snapshot
+	WorktreeTree   string           `json:"worktreeTree"`
+	GitOp          *store.GitOpMeta `json:"gitop"` // set for session-independent git-op events
 }
 
 // Event builds the detailed view of one event, addressed by its commit id (full

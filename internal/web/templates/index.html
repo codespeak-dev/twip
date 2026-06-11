@@ -1,43 +1,26 @@
-{{define "index.html"}}<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>twip timeline</title>
-  <style>
-    body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem auto; max-width: 60rem; color: #1b1b1b; }
-    h1 { font-size: 1.2rem; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #eee; vertical-align: top; }
-    th { color: #888; font-weight: 600; }
-    a { color: #0a58ca; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .kind { font-weight: 600; }
-    .session { color: #888; }
-    .flag { color: #b00; font-weight: 600; }
-    .prompt { color: #444; }
-    .empty { color: #888; margin-top: 2rem; }
-  </style>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>twip</title>
+  <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <h1>twip timeline</h1>
-  {{if .Entries}}
-  <table>
-    <thead><tr><th>time</th><th>event</th><th>session</th><th>worktree</th><th>branch</th><th>detail</th></tr></thead>
-    <tbody>
-    {{range .Entries}}
-      <tr>
-        <td>{{.TS}}</td>
-        <td class="kind"><a href="/event/{{.Commit}}">{{.Kind}}</a>{{if .Quality}} <span class="flag">!{{.Quality}}</span>{{end}}</td>
-        <td class="session">{{if .Session}}{{short .Session}}{{else}}—{{end}}</td>
-        <td>{{.Worktree}}</td>
-        <td>{{.Branch}}</td>
-        <td class="prompt">{{.Detail}}</td>
-      </tr>
-    {{end}}
-    </tbody>
-  </table>
-  {{else}}
-  <p class="empty">No recorded events yet. Run <code>twip init</code> in a repo, then start a Claude Code session or make git changes.</p>
-  {{end}}
+  <header class="topbar">
+    <span class="logo">twip</span>
+    <span class="subtitle">repository timeline</span>
+  </header>
+  <main class="app">
+    <section class="timeline" aria-label="timeline">
+      <div id="timeline" class="list"></div>
+    </section>
+    <section class="detail" aria-label="event detail">
+      <div id="detail" class="detail-inner">
+        <p class="placeholder">Select an event on the left.</p>
+      </div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
 </body>
-</html>{{end}}
+</html>
