@@ -92,10 +92,13 @@ body { font: 13.5px/1.55 var(--sans); color: var(--ink); background: var(--bg); 
 .node[data-kind="stop"] .lane.session .dot { background: var(--c-stop); }
 .node[data-kind="session-end"] .lane.session .dot { background: var(--c-end); }
 
+/* colored outline chip: text + border color set inline to the branch's color */
 .branch-chip {
-  font-size: .68em; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
-  background: var(--faint); border-radius: 1em; padding: .05em .5em; margin-left: .4rem;
+  font-size: .68em; text-transform: uppercase; letter-spacing: .05em;
+  border: 1px solid currentColor; background: transparent;
+  border-radius: 1em; padding: .02em .45em; margin-left: .4rem;
 }
+.lane-legend .swatch { border-radius: 1px; }
 
 .node .body { min-width: 0; flex: 1; }
 .row1 { display: flex; align-items: baseline; gap: .5rem; }
