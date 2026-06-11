@@ -62,19 +62,23 @@ body { font: 13.5px/1.55 var(--sans); color: var(--ink); background: var(--bg); 
 .legend-ws { display: flex; flex-wrap: wrap; gap: .2rem .9rem; margin-top: .35rem; }
 .legend-ws .ws { color: var(--ink); }
 
+/* Row layout: git connector | git text | session connector | session text | time.
+   Connector cells carry no vertical padding (so the rail spans the full row and
+   segments meet across rows); the text cells carry it. */
 .node {
-  position: relative; display: flex; gap: .6rem; cursor: pointer;
+  position: relative; display: flex; cursor: pointer;
   border-left: 3px solid transparent; padding: 0 1rem 0 .4rem; min-height: 2.4rem;
 }
-/* Vertical padding lives on .body, not .node, so the rail (align-self: stretch)
-   spans the FULL row height and connector segments meet across rows. */
-.node .body { padding: .5rem 0; }
 .node.alt { background: color-mix(in srgb, var(--faint) 55%, transparent); }
 .node:hover { background: var(--faint); }
 .node.selected { background: var(--sel); border-left-color: var(--accent); }
 
+.gittext { flex: none; width: 12rem; min-width: 0; overflow: hidden; padding: .5rem .4rem .5rem .3rem; }
+.sesstext { flex: 1; min-width: 0; padding: .5rem 0; }
+.rowtime { flex: none; align-self: flex-start; padding: .5rem 0 0 .6rem; color: var(--muted); font-size: .78em; font-family: var(--mono); white-space: nowrap; }
+
 .rail { position: relative; flex: none; align-self: stretch; } /* width set inline (per column count) */
-.lane { position: absolute; top: 0; bottom: 0; width: 1.3rem; } /* left set inline (per column) */
+.lane { position: absolute; top: 0; bottom: 0; width: 1.4rem; } /* left set inline (per column) */
 .seg { position: absolute; left: 50%; width: 2px; transform: translateX(-50%); }
 .seg.top { top: 0; height: 50%; }
 .seg.bottom { top: 50%; bottom: 0; }
@@ -100,11 +104,9 @@ body { font: 13.5px/1.55 var(--sans); color: var(--ink); background: var(--bg); 
 }
 .lane-legend .swatch { border-radius: 1px; }
 
-.node .body { min-width: 0; flex: 1; }
 .row1 { display: flex; align-items: baseline; gap: .5rem; }
 .kind { font-weight: 600; font-size: .92em; }
 .node[data-family="gitop"] .kind { color: var(--c-gitop); }
-.time { margin-left: auto; color: var(--muted); font-size: .78em; font-family: var(--mono); white-space: nowrap; }
 .flag { color: var(--c-flag); font-weight: 700; font-size: .78em; }
 .annot { color: var(--muted); font-size: .9em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .annot.code { font-family: var(--mono); }
