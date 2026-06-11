@@ -28,6 +28,13 @@ async function boot() {
 
 /* ---------- timeline ---------- */
 
+// Two independent lanes:
+//   branch  — a continuous spine; breaks only when the branch switches. Git ops
+//             (session-independent events) are nodes on this lane.
+//   session — present only across a session's span (its newest..oldest event);
+//             can gap over git-ops that happen mid-session; breaks at session end.
+//             Session turns are nodes on this lane.
+// items are newest-first (index 0 = newest); "above" a row = newer = i-1.
 function renderTimeline(items) {
   const list = document.getElementById("timeline");
   list.innerHTML = "";
@@ -35,37 +42,73 @@ function renderTimeline(items) {
     list.appendChild(el("div", "empty", "No recorded events yet. Run `twip init`, then start a session or make git changes."));
     return;
   }
-  let lastGroup = null;
+  list.appendChild(laneLegend());
+
+  const n = items.length;
+  const branchOf = (i) => items[i].branch || "";
+
+  // A session is "active" from its newest event (smallest i) to its oldest
+  // (largest i); rows in between (incl. git-ops) keep the session line alive.
+  const firstI = {}, lastI = {};
   items.forEach((e, i) => {
-    const gk = e.session ? `s:${e.session}|${e.branch}` : `g|${e.branch}`;
-    if (gk !== lastGroup) {
-      lastGroup = gk;
-      const label = e.session
-        ? `session ${short(e.session)} · ${e.branch || "—"}`
-        : `git ops · ${e.branch || "—"}`;
-      list.appendChild(groupHeader(label, e.session ? "session" : "gitop"));
-    }
-    list.appendChild(node(e, i));
+    if (!e.session) return;
+    if (!(e.session in firstI)) firstI[e.session] = i;
+    lastI[e.session] = i;
+  });
+  const spanAt = new Array(n).fill(null);
+  for (const s in firstI) for (let i = firstI[s]; i <= lastI[s]; i++) spanAt[i] = s;
+
+  items.forEach((e, i) => {
+    const up = i - 1, down = i + 1; // up = newer (above), down = older (below)
+    const sameBranchUp = up >= 0 && branchOf(up) === branchOf(i);
+    const sameBranchDown = down < n && branchOf(down) === branchOf(i);
+    const sActive = spanAt[i] !== null;
+    const sameSessUp = up >= 0 && spanAt[up] === spanAt[i] && sActive;
+    const sameSessDown = down < n && spanAt[down] === spanAt[i] && sActive;
+    list.appendChild(node(e, i, {
+      brTop: sameBranchUp, brBot: sameBranchDown, brDot: !e.session,
+      seTop: sameSessUp, seBot: sameSessDown, seDot: !!e.session, sActive,
+      branchChanged: !sameBranchUp, // first row of a branch run (reading top-down)
+    }));
   });
 }
 
-function groupHeader(text, fam) {
-  const h = el("div", "group " + fam);
-  h.appendChild(el("span", "group-dot"));
-  h.appendChild(el("span", "group-label", text));
-  return h;
+function laneLegend() {
+  const lg = el("div", "lane-legend");
+  const mk = (cls, text) => {
+    const k = el("span", "k " + cls);
+    k.appendChild(el("span", "swatch"));
+    k.appendChild(el("span", null, text));
+    return k;
+  };
+  lg.appendChild(mk("branch", "branch / git"));
+  lg.appendChild(mk("session", "session"));
+  return lg;
 }
 
-function node(e, i) {
+function lane(kind, top, bottom, dot) {
+  const l = el("div", "lane " + kind);
+  if (top) l.appendChild(el("span", "seg top"));
+  if (bottom) l.appendChild(el("span", "seg bottom"));
+  if (dot) l.appendChild(el("span", "dot"));
+  return l;
+}
+
+function node(e, i, r) {
   const n = el("div", "node" + (i % 2 ? " alt" : ""));
   n.dataset.commit = e.commit;
   n.dataset.kind = e.kind;
   n.dataset.family = family(e.kind);
-  n.appendChild(el("span", "dot"));
+
+  const rail = el("div", "rail");
+  rail.appendChild(lane("branch", r.brTop, r.brBot, r.brDot));
+  rail.appendChild(lane("session", r.seTop, r.seBot, r.seDot));
+  n.appendChild(rail);
 
   const body = el("div", "body");
   const row1 = el("div", "row1");
   row1.appendChild(el("span", "kind", e.kind));
+  if (r.branchChanged && e.branch) row1.appendChild(el("span", "branch-chip", e.branch));
   if (e.quality) row1.appendChild(el("span", "flag", "!" + e.quality));
   row1.appendChild(el("span", "time", shortTime(e.ts)));
   body.appendChild(row1);

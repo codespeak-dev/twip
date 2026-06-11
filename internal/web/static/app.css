@@ -18,6 +18,7 @@
   --c-end: #8a8f99;
   --c-gitop: #e08a1e;
   --c-flag: #d64545;
+  --c-session: #6f8bd6; /* the session lane line */
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -47,43 +48,50 @@ body { font: 13.5px/1.55 var(--sans); color: var(--ink); background: var(--bg); 
   .timeline { width: 100%; border-right: none; border-bottom: 1px solid var(--line); }
 }
 
-/* ---- timeline list ---- */
+/* ---- timeline: two-lane graph (branch | session) ---- */
 .list { position: relative; }
-
-.group {
-  display: flex; align-items: center; gap: .5rem;
-  padding: .9rem 1rem .3rem 1rem; margin-top: .2rem;
-  font-size: .72em; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+.lane-legend {
+  display: flex; gap: 1rem; padding: .5rem 1rem; font-size: .72em; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid var(--line);
 }
-.group::after { content: ""; flex: 1; height: 1px; background: var(--line); }
-.group-dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--rail); flex: none; }
-.group.gitop .group-dot { background: var(--c-gitop); }
-.group.session .group-dot { background: var(--c-start); }
+.lane-legend .k { display: inline-flex; align-items: center; gap: .35rem; }
+.lane-legend .swatch { width: .8rem; height: 2px; display: inline-block; }
+.lane-legend .branch .swatch { background: var(--rail); }
+.lane-legend .session .swatch { background: var(--c-session); }
 
 .node {
-  position: relative; display: flex; gap: .7rem; cursor: pointer;
-  padding: .5rem 1rem .5rem 2.4rem; border-left: 3px solid transparent;
+  position: relative; display: flex; gap: .6rem; cursor: pointer;
+  border-left: 3px solid transparent; padding: .5rem 1rem .5rem .4rem; min-height: 2.4rem;
 }
 .node.alt { background: color-mix(in srgb, var(--faint) 55%, transparent); }
 .node:hover { background: var(--faint); }
 .node.selected { background: var(--sel); border-left-color: var(--accent); }
 
-/* rail: a vertical line through the dots, plus each node's dot */
-.node::before {
-  content: ""; position: absolute; left: 1.15rem; top: 0; bottom: 0;
-  width: 2px; background: var(--rail);
-}
-.node:first-of-type::before { top: .8rem; }
-.dot {
-  position: absolute; left: .82rem; top: .72rem; width: .7rem; height: .7rem;
-  border-radius: 50%; background: var(--rail);
+.rail { position: relative; flex: none; width: 2.6rem; align-self: stretch; }
+.lane { position: absolute; top: 0; bottom: 0; width: 1.3rem; }
+.lane.branch { left: 0; }
+.lane.session { left: 1.3rem; }
+.seg { position: absolute; left: 50%; width: 2px; transform: translateX(-50%); }
+.seg.top { top: 0; height: 50%; }
+.seg.bottom { top: 50%; bottom: 0; }
+.lane.branch .seg { background: var(--rail); }
+.lane.session .seg { background: var(--c-session); }
+.lane .dot {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: .72rem; height: .72rem; border-radius: 50%; background: var(--rail);
   box-shadow: 0 0 0 3px var(--bg); z-index: 1;
 }
-.node[data-kind="session-start"] .dot { background: var(--c-start); }
-.node[data-kind="user-prompt-submit"] .dot { background: var(--c-prompt); }
-.node[data-kind="stop"] .dot { background: var(--c-stop); }
-.node[data-kind="session-end"] .dot { background: var(--c-end); }
-.node[data-family="gitop"] .dot { background: var(--c-gitop); }
+.node[data-family="branch"] .lane.branch .dot { background: var(--c-gitop); }
+.node[data-kind="session-start"] .lane.session .dot { background: var(--c-start); }
+.node[data-kind="user-prompt-submit"] .lane.session .dot { background: var(--c-prompt); }
+.node[data-kind="post-task"] .lane.session .dot { background: var(--c-prompt); }
+.node[data-kind="stop"] .lane.session .dot { background: var(--c-stop); }
+.node[data-kind="session-end"] .lane.session .dot { background: var(--c-end); }
+
+.branch-chip {
+  font-size: .68em; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
+  background: var(--faint); border-radius: 1em; padding: .05em .5em; margin-left: .4rem;
+}
 
 .node .body { min-width: 0; flex: 1; }
 .row1 { display: flex; align-items: baseline; gap: .5rem; }
