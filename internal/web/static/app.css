@@ -51,13 +51,16 @@ body { font: 13.5px/1.55 var(--sans); color: var(--ink); background: var(--bg); 
 /* ---- timeline: two-lane graph (branch | session) ---- */
 .list { position: relative; }
 .lane-legend {
-  display: flex; gap: 1rem; padding: .5rem 1rem; font-size: .72em; color: var(--muted);
-  text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid var(--line);
+  padding: .5rem 1rem; font-size: .72em; color: var(--muted);
+  border-bottom: 1px solid var(--line);
 }
+.legend-lines { display: flex; gap: 1rem; text-transform: uppercase; letter-spacing: .05em; }
 .lane-legend .k { display: inline-flex; align-items: center; gap: .35rem; }
 .lane-legend .swatch { width: .8rem; height: 2px; display: inline-block; }
 .lane-legend .branch .swatch { background: var(--rail); }
 .lane-legend .session .swatch { background: var(--c-session); }
+.legend-ws { display: flex; flex-wrap: wrap; gap: .2rem .9rem; margin-top: .35rem; }
+.legend-ws .ws { color: var(--ink); }
 
 .node {
   position: relative; display: flex; gap: .6rem; cursor: pointer;
@@ -67,10 +70,8 @@ body { font: 13.5px/1.55 var(--sans); color: var(--ink); background: var(--bg); 
 .node:hover { background: var(--faint); }
 .node.selected { background: var(--sel); border-left-color: var(--accent); }
 
-.rail { position: relative; flex: none; width: 2.6rem; align-self: stretch; }
-.lane { position: absolute; top: 0; bottom: 0; width: 1.3rem; }
-.lane.branch { left: 0; }
-.lane.session { left: 1.3rem; }
+.rail { position: relative; flex: none; align-self: stretch; } /* width set inline (per column count) */
+.lane { position: absolute; top: 0; bottom: 0; width: 1.3rem; } /* left set inline (per column) */
 .seg { position: absolute; left: 50%; width: 2px; transform: translateX(-50%); }
 .seg.top { top: 0; height: 50%; }
 .seg.bottom { top: 50%; bottom: 0; }

@@ -37,18 +37,22 @@ Two-pane master-detail:
 
 ## Timeline (left pane)
 
-A two-lane vertical graph (à la a git-history viewer), newest at top.
+A multi-lane vertical graph (à la a git-history viewer), newest at top.
 
-1. **Two independent lanes.** There are two semantic lines, and every event
-   belongs to exactly one:
-   - **Branch lane** — a continuous spine: every event happens on some branch, so
-     the line is unbroken *except* where the branch switches (the interrupt).
-     Git ops (session-independent events) are the nodes on this lane.
-   - **Session lane** — present only across a session's span (its newest to its
-     oldest event). Session turns are the nodes on this lane. The line may have
-     **big gaps** — it stays alive across git-ops that happen mid-session — and
-     **interrupts at session end** (and between back-to-back different sessions).
-2. **Per-node legibility.** Zebra banding / subtle per-row background, with
+1. **Lanes are workspaces.** One column per **(clone, worktree)** — the real unit
+   of concurrency. A single workspace is one column (the common case); concurrent
+   workspaces fan into parallel columns so their work never collides. The outer
+   key is the **clone** (the journal ref's id), since a `worktree_id` like `main`
+   is unique only within a clone; clones are labeled by their journal's **commit
+   author** (falling back to the short clone-id, then `local`).
+2. **Two sub-lines within a column.** Each workspace column carries the two
+   semantic lines, each event belonging to exactly one:
+   - **Branch** — a continuous spine; unbroken except where that workspace's
+     branch switches. Git ops are the nodes here.
+   - **Session** — present only across a session's span; may have **big gaps**
+     (stays alive across mid-session git-ops) and **interrupts at session end**.
+     Session turns are the nodes here.
+3. **Per-node legibility.** Zebra banding / subtle per-row background, with
    distinct hover and selected (accent) states.
 3. **Short annotation.** Each node shows kind, timestamp, and a one-line
    annotation (prompt for turns; argv for git-ops), truncated with ellipsis.
@@ -108,8 +112,9 @@ A right-hand slide-over, opened from a clickable SHA or file, dismissed with
 
 - Search / filter (by session, worktree, kind, branch, time range).
 - Pagination / windowing (currently loads the full timeline per request).
-- Lane-separating **concurrently overlapping** sessions (the session lane assumes
-  roughly sequential sessions; heavy overlap isn't split into multiple columns).
+- Two sessions running **concurrently in the same worktree** share a column (not
+  a real scenario — concurrency happens across worktrees, which already lane).
+  Cross-clone lanes require the other clone's journal to be fetched (see sync).
 - Browsable snapshot *tree* navigation (today: a flat file list, click to view).
 - Auto-refresh / live updates.
 - Cross-clone timelines once sync lands (will union `refs/twip/journal/*`).

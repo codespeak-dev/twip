@@ -14,25 +14,30 @@ import (
 	"github.com/codespeak/twip/internal/store"
 )
 
-// Entry is one event in the merged, time-ordered timeline.
+// Entry is one event in the merged, time-ordered timeline. Clone + Worktree form
+// the workspace lane; CloneLabel is the human-friendly clone name (its journal's
+// commit author). All of these may be empty — the renderer falls back.
 type Entry struct {
-	Session  string `json:"session"` // attribution only ("" for session-independent events)
-	Commit   string `json:"commit"`
-	Seq      int    `json:"seq"`
-	Kind     string `json:"kind"`
-	TS       string `json:"ts"`
-	Branch   string `json:"branch"`
-	Worktree string `json:"worktree"`
-	Prompt   string `json:"prompt"`
-	Detail   string `json:"detail"` // human summary: the prompt, or a git-op's argv
-	Quality  string `json:"quality"`
+	Session    string `json:"session"` // attribution only ("" for session-independent events)
+	Commit     string `json:"commit"`
+	Seq        int    `json:"seq"`
+	Kind       string `json:"kind"`
+	TS         string `json:"ts"`
+	Branch     string `json:"branch"`
+	Worktree   string `json:"worktree"`
+	Clone      string `json:"clone"`      // clone-id of the source journal (outer lane key)
+	CloneLabel string `json:"cloneLabel"` // commit author of that clone's journal
+	Prompt     string `json:"prompt"`
+	Detail     string `json:"detail"` // human summary: the prompt, or a git-op's argv
+	Quality    string `json:"quality"`
 }
 
 func entryFor(ec store.EventCommit) Entry {
 	r := ec.Record
 	e := Entry{
 		Session: r.SessionID, Commit: ec.Commit, Seq: r.Seq, Kind: r.Kind,
-		TS: r.TS, Branch: r.Branch, Worktree: r.WorktreeID, Prompt: r.Prompt, Detail: r.Prompt,
+		TS: r.TS, Branch: r.Branch, Worktree: r.WorktreeID, Clone: ec.Clone,
+		Prompt: r.Prompt, Detail: r.Prompt,
 	}
 	if r.GitOp != nil {
 		e.Detail = strings.Join(r.GitOp.Argv, " ")
@@ -53,6 +58,18 @@ func Timeline(ctx context.Context, repoRoot string) ([]Entry, error) {
 	entries := make([]Entry, 0, len(events))
 	for _, ec := range events {
 		entries = append(entries, entryFor(ec))
+	}
+	// Label each clone once by its journal's commit author (cached per clone).
+	labels := map[string]string{}
+	for i := range entries {
+		c := entries[i].Clone
+		if c == "" {
+			continue
+		}
+		if _, ok := labels[c]; !ok {
+			labels[c] = rec.CloneAuthor(ctx, c)
+		}
+		entries[i].CloneLabel = labels[c]
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].TS > entries[j].TS })
 	return entries, nil

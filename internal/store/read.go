@@ -14,9 +14,13 @@ import (
 // keySafe constrains lock keys / ids that become ref or file path components.
 var keySafe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
-// EventCommit pairs a recorded event with the commit that carries it.
+// EventCommit pairs a recorded event with the commit that carries it, plus the
+// clone-id of the journal it came from (the ref namespace). clone-id is only
+// known from the ref, not the record, and is the outer key for workspace
+// separation: a worktree_id like "main" is unique only within a clone.
 type EventCommit struct {
 	Commit string
+	Clone  string
 	Record Record
 }
 
@@ -103,15 +107,30 @@ func (r *Recorder) eventsForRef(ctx context.Context, ref string, reverse bool) (
 	if err != nil {
 		return nil, nil //nolint:nilerr // missing ref => no events yet
 	}
+	clone := strings.TrimPrefix(ref, JournalRefPrefix)
 	var events []EventCommit
 	for _, commit := range strings.Fields(string(out)) {
 		rec, err := r.readRecord(ctx, commit)
 		if err != nil {
 			return nil, err
 		}
-		events = append(events, EventCommit{Commit: commit, Record: rec})
+		events = append(events, EventCommit{Commit: commit, Clone: clone, Record: rec})
 	}
 	return events, nil
+}
+
+// CloneAuthor returns the commit author of a clone's journal tip — a
+// human-friendly label for the clone (its journal commits are stamped with that
+// developer's git identity). Empty if unknown.
+func (r *Recorder) CloneAuthor(ctx context.Context, clone string) string {
+	if clone == "" {
+		return ""
+	}
+	name, err := gitutil.Out(ctx, r.RepoRoot, "log", "-1", "--format=%an", JournalRefPrefix+clone)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(name)
 }
 
 func (r *Recorder) readRecord(ctx context.Context, commit string) (Record, error) {
