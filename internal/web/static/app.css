@@ -118,3 +118,38 @@ ul.changed li { font-family: var(--mono); font-size: .9em; display: flex; gap: .
 details.files { margin-top: .4rem; }
 details.files summary { cursor: pointer; color: var(--muted); }
 ul.files { columns: 2; list-style: none; padding: .4rem 0 0; margin: 0; font-family: var(--mono); font-size: .85em; color: var(--muted); }
+
+/* clickable affordances */
+.sha { color: var(--accent); cursor: pointer; border-bottom: 1px dotted color-mix(in srgb, var(--accent) 50%, transparent); }
+.sha:hover { border-bottom-style: solid; }
+li.clickable { cursor: pointer; border-radius: 4px; padding: .05rem .25rem; margin: 0 -.25rem; }
+li.clickable:hover { background: var(--faint); }
+ul.changed li.clickable .path { flex: 1; }
+
+/* ---- object/diff viewer (slide-over) ---- */
+.viewer {
+  position: fixed; top: 0; right: 0; height: 100vh; width: min(56rem, 82vw);
+  background: var(--panel); border-left: 1px solid var(--line);
+  box-shadow: -10px 0 30px rgba(0,0,0,.14);
+  transform: translateX(100%); transition: transform .16s ease; z-index: 20;
+  display: flex; flex-direction: column;
+}
+.viewer.open { transform: none; }
+.viewer-head {
+  display: flex; align-items: center; gap: .6rem; padding: .6rem 1rem;
+  border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel);
+}
+.viewer-title { font-family: var(--mono); font-size: .9em; word-break: break-all; flex: 1; }
+.viewer-close {
+  border: none; background: var(--faint); color: var(--ink); cursor: pointer;
+  width: 1.7rem; height: 1.7rem; border-radius: 6px; font-size: 1.1rem; line-height: 1;
+}
+.viewer-close:hover { background: var(--line); }
+.viewer-body { overflow: auto; padding: .8rem 1rem 3rem; }
+pre.diff, pre.blob { background: var(--faint); border: 1px solid var(--line); border-radius: 8px;
+  padding: .8rem; overflow: auto; font-family: var(--mono); font-size: .85em; white-space: pre; margin: 0; }
+pre.diff .dl { display: block; }
+pre.diff .add { background: color-mix(in srgb, var(--c-stop) 16%, transparent); color: color-mix(in srgb, var(--c-stop) 80%, var(--ink)); }
+pre.diff .del { background: color-mix(in srgb, var(--c-flag) 16%, transparent); color: color-mix(in srgb, var(--c-flag) 80%, var(--ink)); }
+pre.diff .hunk { color: var(--accent); }
+pre.diff .meta { color: var(--muted); }

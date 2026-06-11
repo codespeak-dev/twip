@@ -16,8 +16,10 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"regexp"
 	"strings"
 
+	"github.com/codespeak/twip/internal/gitutil"
 	"github.com/codespeak/twip/internal/readmodel"
 )
 
@@ -45,6 +47,9 @@ func Serve(ctx context.Context, repoRoot, addr string) error {
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(static))))
 	mux.HandleFunc("/api/timeline.json", s.handleTimelineJSON)
 	mux.HandleFunc("/api/event/", s.handleEventJSON)
+	mux.HandleFunc("/api/commit/", s.handleCommit)
+	mux.HandleFunc("/api/blob", s.handleBlob)
+	mux.HandleFunc("/api/filediff", s.handleFileDiff)
 	mux.HandleFunc("/event/", s.handleApp)
 	mux.HandleFunc("/", s.handleApp)
 
@@ -99,6 +104,57 @@ func (s *server) handleEventJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, detail)
+}
+
+// --- on-demand git queries (so the UI doesn't preload diffs/blobs) ---
+
+var revRe = regexp.MustCompile(`^[0-9a-fA-F]{4,64}$`)
+
+func validRev(s string) bool { return s == "HEAD" || revRe.MatchString(s) }
+
+// handleCommit returns `git show` (stat + patch) for a real commit sha.
+func (s *server) handleCommit(w http.ResponseWriter, r *http.Request) {
+	sha := strings.TrimPrefix(r.URL.Path, "/api/commit/")
+	if !validRev(sha) {
+		http.Error(w, "bad sha", http.StatusBadRequest)
+		return
+	}
+	out, err := gitutil.Out(r.Context(), s.repoRoot, "show", "--stat", "-p", "--no-color", sha)
+	if err != nil {
+		http.Error(w, "unknown commit", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]string{"sha": sha, "text": out})
+}
+
+// handleBlob returns a file's content at a tree/commit (rev:path).
+func (s *server) handleBlob(w http.ResponseWriter, r *http.Request) {
+	rev, path := r.URL.Query().Get("rev"), r.URL.Query().Get("path")
+	if !validRev(rev) || path == "" {
+		http.Error(w, "bad rev/path", http.StatusBadRequest)
+		return
+	}
+	b, err := gitutil.CatFile(r.Context(), s.repoRoot, rev+":"+path)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]string{"path": path, "text": string(b)})
+}
+
+// handleFileDiff returns the unified diff of one path between two trees.
+func (s *server) handleFileDiff(w http.ResponseWriter, r *http.Request) {
+	base, tree, path := r.URL.Query().Get("base"), r.URL.Query().Get("tree"), r.URL.Query().Get("path")
+	if !validRev(base) || !validRev(tree) || path == "" {
+		http.Error(w, "bad args", http.StatusBadRequest)
+		return
+	}
+	out, err := gitutil.Out(r.Context(), s.repoRoot, "diff", "--no-color", base, tree, "--", path)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"path": path, "diff": out})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

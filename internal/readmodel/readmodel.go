@@ -78,7 +78,8 @@ type EventDetail struct {
 	Changed        []FileChange     `json:"changed"`
 	Files          []string         `json:"files"` // file list of the worktree snapshot
 	WorktreeTree   string           `json:"worktreeTree"`
-	GitOp          *store.GitOpMeta `json:"gitop"` // set for session-independent git-op events
+	PrevTree       string           `json:"prevTree"` // base tree for per-file diffs (prev same-worktree snapshot)
+	GitOp          *store.GitOpMeta `json:"gitop"`    // set for session-independent git-op events
 }
 
 // Event builds the detailed view of one event, addressed by its commit id (full
@@ -132,6 +133,7 @@ func Event(ctx context.Context, repoRoot, commitRef string) (*EventDetail, error
 			}
 		}
 		d.Changed = changedFiles(ctx, repoRoot, base, r.WorktreeTree)
+		d.PrevTree = base
 	}
 	return d, nil
 }
