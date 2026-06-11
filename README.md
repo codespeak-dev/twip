@@ -56,8 +56,8 @@ twip shim install                # optional: install a `git` wrapper that record
 # ...run Claude Code sessions as usual; turns are recorded automatically...
 # ...destructive git ops (reset --hard, checkout --, clean, rebase, …) are recorded too...
 
-twip log                         # list recorded sessions and turns
-twip show <session-id> <seq>     # inspect one event: prompt, transcript, changed files
+twip log                         # the event timeline, newest first (first column = event id)
+twip show <event-id>             # inspect one event (commit sha/prefix): prompt, transcript, diffs
 twip audit                       # verify the log has no silent loss (non-zero exit on divergence)
 twip serve                       # browse the timeline at http://localhost:7777
 ```
@@ -65,6 +65,35 @@ twip serve                       # browse the timeline at http://localhost:7777
 `twip audit` is the guarantee behind "silent loss is unacceptable": it checks that every event's
 worktree snapshot resolves, seq numbers are contiguous, transcript offsets join end-to-end, and it
 surfaces any data-quality flags.
+
+## Team rollout (local per-dev recording)
+
+Each developer records their own sessions + git-ops into their clone (no server, no sync). One-time
+per machine, then per-repo opt-in by committing the hooks.
+
+**1. Install (each dev).** Clone this repo and run the installer — it builds twip, installs the git
+shim, and prints the PATH + JetBrains setup:
+
+```sh
+git clone <twip-repo-url> && cd twip && ./scripts/install.sh
+```
+
+It puts `twip` in `~/go/bin` and a `git` shim in `~/.twip/bin`; add both to PATH (shim first), and
+point JetBrains' Git executable at the shim. `twip version` confirms the build everyone's on.
+
+**2. Enable a repo (once, committed).** In each repo you want recorded:
+
+```sh
+twip init
+git add .claude/settings.json && git commit -m "twip: record agent sessions"
+```
+
+Committing `.claude/settings.json` is safe: the hooks are `command -v twip || exit 0`, so they're a
+no-op for anyone without twip installed. Everyone who has twip then records automatically; the git
+shim records destructive ops in any repo that's been `twip init`-ed.
+
+All data lives in that repo's `.git` under `refs/twip/*` — nothing leaves the machine. (Sharing
+teammates' timelines over a remote is future work; see the deferred sync below.)
 
 ## Layout
 
