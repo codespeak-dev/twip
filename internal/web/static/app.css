@@ -64,8 +64,11 @@ body { font: 13.5px/1.55 var(--sans); color: var(--ink); background: var(--bg); 
 
 .node {
   position: relative; display: flex; gap: .6rem; cursor: pointer;
-  border-left: 3px solid transparent; padding: .5rem 1rem .5rem .4rem; min-height: 2.4rem;
+  border-left: 3px solid transparent; padding: 0 1rem 0 .4rem; min-height: 2.4rem;
 }
+/* Vertical padding lives on .body, not .node, so the rail (align-self: stretch)
+   spans the FULL row height and connector segments meet across rows. */
+.node .body { padding: .5rem 0; }
 .node.alt { background: color-mix(in srgb, var(--faint) 55%, transparent); }
 .node:hover { background: var(--faint); }
 .node.selected { background: var(--sel); border-left-color: var(--accent); }
