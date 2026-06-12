@@ -21,11 +21,19 @@ const EmptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 // Run executes git in dir with the given args, feeding stdin (may be nil) and
 // extra environment (appended to the inherited env; may be nil). It returns
 // stdout bytes, or an error that includes stderr.
+//
+// These are twip's own plumbing calls (write-tree, commit-tree, update-ref, …).
+// The installed `git` shim sits on the front of PATH and would otherwise
+// intercept and re-record them — and worse, deadlock: a shimmed commit-tree
+// invoked while we hold the journal lock would block trying to take that same
+// lock. So we force the shim's pass-through guard on for every internal call;
+// only the user's/agent's own git commands should ever be recorded.
 func Run(ctx context.Context, dir string, env []string, stdin []byte, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
+	cmd.Env = append(cmd.Environ(), "TWIP_SHIM_ACTIVE=1")
 	if len(env) > 0 {
-		cmd.Env = append(cmd.Environ(), env...)
+		cmd.Env = append(cmd.Env, env...)
 	}
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
