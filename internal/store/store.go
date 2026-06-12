@@ -129,16 +129,26 @@ type Record struct {
 	Prompt       string          `json:"prompt,omitempty"`
 	Transcript   *DeltaMeta      `json:"transcript,omitempty"`
 	Sidechains   []SidechainMeta `json:"sidechains,omitempty"`
-	Cursor       *agent.Cursor   `json:"cursor,omitempty"` // session transcript cursor after this event
-	GitOp        *GitOpMeta      `json:"gitop,omitempty"`  // set for session-independent git-op events
+	Cursor       *agent.Cursor   `json:"cursor,omitempty"`   // session transcript cursor after this event
+	GitOp        *GitOpMeta      `json:"gitop,omitempty"`    // set for session-independent git-op events
+	ToolUse      *ToolUseMeta    `json:"tool_use,omitempty"` // set for intermediate mutating tool-call events
+}
+
+// ToolUseMeta records which tool produced an intermediate (mid-turn) worktree
+// change, for the tool-use event kind.
+type ToolUseMeta struct {
+	Name   string `json:"name"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // SessionState is a session's derived position in the journal: the cursor to read
-// the next transcript delta from, and the last per-session seq. Both are computed
-// by back-scanning the journal (the journal is the single source of truth).
+// the next transcript delta from, the last per-session seq, and the worktree tree
+// of the session's most recent event (used to skip recording a tool call that
+// changed nothing). All computed by back-scanning the journal.
 type SessionState struct {
 	Cursor agent.Cursor
 	Seq    int
+	Tree   string
 }
 
 // Recorder appends events to a repo's journal.
@@ -171,7 +181,7 @@ func (r *Recorder) PriorSessionState(ctx context.Context, sessionID string) (Ses
 		if ec.Record.SessionID != sessionID {
 			continue
 		}
-		st := SessionState{Seq: ec.Record.Seq}
+		st := SessionState{Seq: ec.Record.Seq, Tree: ec.Record.WorktreeTree}
 		if ec.Record.Cursor != nil {
 			st.Cursor = *ec.Record.Cursor
 		}
@@ -202,6 +212,9 @@ func (r *Recorder) Append(ctx context.Context, ev *agent.Event, snap snapshot.Sn
 		Model:        ev.Model,
 		Prompt:       ev.Prompt,
 		Cursor:       &ev.Cursor,
+	}
+	if ev.Tool != nil {
+		rec.ToolUse = &ToolUseMeta{Name: ev.Tool.Name, Detail: ev.Tool.Detail}
 	}
 
 	// Build the event's tree (meta/ + worktree/). This is independent of the

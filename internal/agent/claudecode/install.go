@@ -30,6 +30,12 @@ type hookSpec struct {
 	verb    string // twip hook verb
 }
 
+// mutatingTools is the PostToolUse matcher for intermediate capture: the tools
+// that can change the worktree. Read-only tools (Read/Grep/Glob/…) are excluded
+// so they never even spawn twip; a Bash that changes nothing is filtered later
+// by the worktree-unchanged check at record time.
+const mutatingTools = "Edit|Write|MultiEdit|NotebookEdit|Bash"
+
 func (a *Agent) hookSpecs() []hookSpec {
 	return []hookSpec{
 		{"SessionStart", "", hookSessionStart},
@@ -37,6 +43,7 @@ func (a *Agent) hookSpecs() []hookSpec {
 		{"Stop", "", hookStop},
 		{"SessionEnd", "", hookSessionEnd},
 		{"PostToolUse", "Task", hookPostTask},
+		{"PostToolUse", mutatingTools, hookPostToolUse},
 	}
 }
 

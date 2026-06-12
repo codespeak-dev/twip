@@ -43,11 +43,14 @@ not via a sha buried in JSON):
 - `meta/` — the event record (`event.json`), the turn's transcript delta (`transcript.jsonl`), and
   any subagent sidechain deltas.
 
-**What's recorded.** Claude Code sessions via hooks, and git operations via the shim: every
-mutating op (read-only `status`/`log`/`diff` are skipped); destructive ops additionally snapshot
-the dirty worktree first (which no git hook can do); history-rewriting ones (`commit --amend`,
-`rebase`, `reset`) pin the orphaned pre-rewrite commit; and stash entries (which live in
-`refs/stash`, outside the worktree) are pinned before a `stash drop`/`clear`.
+**What's recorded.** Claude Code sessions via hooks — turn boundaries (prompt/stop) *and*
+intermediate mutating tool calls (`Edit`/`Write`/`Bash`/…), each snapshotting the worktree at that
+moment so the timeline shows mid-turn states, not just turn ends (a tool call that changes nothing
+is dropped). And git operations via the shim: every mutating op (read-only `status`/`log`/`diff`
+are skipped); destructive ops additionally snapshot the dirty worktree first (which no git hook can
+do); history-rewriting ones (`commit --amend`, `rebase`, `reset`) pin the orphaned pre-rewrite
+commit; and stash entries (which live in `refs/stash`, outside the worktree) are pinned before a
+`stash drop`/`clear`.
 
 **The no-silent-loss guarantee.** `twip audit` checks that every event's worktree snapshot
 resolves, seq numbers are contiguous, transcript offsets join end-to-end, and surfaces any

@@ -92,6 +92,13 @@ func recordHook(ctx context.Context, repoRoot, agentName, event string, payload 
 	if err != nil {
 		return err
 	}
+	// An intermediate tool call is only worth an event if it actually changed the
+	// worktree. Unchanged tree (same content sha as the session's last event) =>
+	// a read-only/no-op call (e.g. `git status` via Bash); skip it so it consumes
+	// no seq and adds no noise. Turn-boundary events are always recorded.
+	if ev.Kind == agent.KindToolUse && snap.Tree != "" && snap.Tree == prior.Tree {
+		return nil
+	}
 	worktreeID := gitutil.WorktreeName(ctx, repoRoot)
 	_, err = rec.Append(ctx, ev, snap, worktreeID, prior.Seq, now)
 	return err

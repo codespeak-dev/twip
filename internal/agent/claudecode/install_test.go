@@ -38,8 +38,8 @@ func TestInstallHooks_FreshRepo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 5 {
-		t.Errorf("installed %d hooks, want 5", n)
+	if n != 6 {
+		t.Errorf("installed %d hooks, want 6", n)
 	}
 	s := readSettingsFile(t, repo)
 
@@ -47,9 +47,20 @@ func TestInstallHooks_FreshRepo(t *testing.T) {
 	if len(stop) != 1 || len(stop[0].Hooks) != 1 || !strings.Contains(stop[0].Hooks[0].Command, "twip hook claude-code stop") {
 		t.Errorf("Stop hook not as expected: %+v", stop)
 	}
+	// PostToolUse carries two matchers: Task (subagent stop) and the mutating-tool
+	// matcher (intermediate tool-use capture).
 	post := decodeHooks(t, s, "PostToolUse")
-	if len(post) != 1 || post[0].Matcher != "Task" {
-		t.Errorf("PostToolUse matcher not Task: %+v", post)
+	byMatcher := map[string]string{}
+	for _, m := range post {
+		for _, h := range m.Hooks {
+			byMatcher[m.Matcher] = h.Command
+		}
+	}
+	if !strings.Contains(byMatcher["Task"], "post-task") {
+		t.Errorf("PostToolUse Task matcher missing/wrong: %+v", post)
+	}
+	if !strings.Contains(byMatcher[mutatingTools], "post-tool-use") {
+		t.Errorf("PostToolUse mutating-tools matcher missing/wrong: %+v", post)
 	}
 
 	// Idempotent.

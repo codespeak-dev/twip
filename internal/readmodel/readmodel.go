@@ -42,6 +42,12 @@ func entryFor(ec store.EventCommit) Entry {
 	if r.GitOp != nil {
 		e.Detail = strings.Join(r.GitOp.Argv, " ")
 	}
+	if r.ToolUse != nil {
+		e.Detail = r.ToolUse.Name
+		if r.ToolUse.Detail != "" {
+			e.Detail += " · " + r.ToolUse.Detail
+		}
+	}
 	if r.Transcript != nil && r.Transcript.Quality != "ok" {
 		e.Quality = r.Transcript.Quality
 	}
@@ -87,16 +93,17 @@ type FileChange struct {
 // EventDetail is the full view of a single recorded event.
 type EventDetail struct {
 	Entry
-	Head           string           `json:"head"`
-	Model          string           `json:"model"`
-	Transcript     string           `json:"transcript"`
-	TranscriptFrom int              `json:"transcriptFrom"`
-	TranscriptTo   int              `json:"transcriptTo"`
-	Changed        []FileChange     `json:"changed"`
-	Files          []string         `json:"files"` // file list of the worktree snapshot
-	WorktreeTree   string           `json:"worktreeTree"`
-	PrevTree       string           `json:"prevTree"` // base tree for per-file diffs (prev same-worktree snapshot)
-	GitOp          *store.GitOpMeta `json:"gitop"`    // set for session-independent git-op events
+	Head           string             `json:"head"`
+	Model          string             `json:"model"`
+	Transcript     string             `json:"transcript"`
+	TranscriptFrom int                `json:"transcriptFrom"`
+	TranscriptTo   int                `json:"transcriptTo"`
+	Changed        []FileChange       `json:"changed"`
+	Files          []string           `json:"files"` // file list of the worktree snapshot
+	WorktreeTree   string             `json:"worktreeTree"`
+	PrevTree       string             `json:"prevTree"` // base tree for per-file diffs (prev same-worktree snapshot)
+	GitOp          *store.GitOpMeta   `json:"gitop"`    // set for session-independent git-op events
+	ToolUse        *store.ToolUseMeta `json:"toolUse"`  // set for intermediate tool-call events
 }
 
 // Event builds the detailed view of one event, addressed by its commit id (full
@@ -132,6 +139,7 @@ func Event(ctx context.Context, repoRoot, commitRef string) (*EventDetail, error
 		Model:        r.Model,
 		WorktreeTree: r.WorktreeTree,
 		GitOp:        r.GitOp,
+		ToolUse:      r.ToolUse,
 	}
 	if r.Transcript != nil {
 		d.TranscriptFrom, d.TranscriptTo = r.Transcript.From, r.Transcript.To

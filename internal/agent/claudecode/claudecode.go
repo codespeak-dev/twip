@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/codespeak-dev/twip/internal/agent"
@@ -40,10 +41,11 @@ const (
 	hookStop         = "stop"
 	hookUserPrompt   = "user-prompt-submit"
 	hookPostTask     = "post-task"
+	hookPostToolUse  = "post-tool-use" // intermediate mutating tool calls (Edit/Write/Bash/…)
 )
 
 func (a *Agent) HookNames() []string {
-	return []string{hookSessionStart, hookUserPrompt, hookStop, hookPostTask, hookSessionEnd}
+	return []string{hookSessionStart, hookUserPrompt, hookStop, hookPostTask, hookPostToolUse, hookSessionEnd}
 }
 
 // SessionID peeks the session_id field common to every Claude Code hook payload.
@@ -80,6 +82,15 @@ type postTaskRaw struct {
 	ToolResponse   struct {
 		AgentID string `json:"agentId"`
 	} `json:"tool_response"`
+}
+
+// postToolUseRaw is the PostToolUse payload for the mutating tools twip matches.
+// tool_input is left as raw JSON since its shape varies per tool (file_path for
+// Edit/Write/NotebookEdit, command for Bash); we extract a short label from it.
+type postToolUseRaw struct {
+	SessionID string          `json:"session_id"`
+	ToolName  string          `json:"tool_name"`
+	ToolInput json.RawMessage `json:"tool_input"`
 }
 
 func parseStdin[T any](r io.Reader) (T, error) {
@@ -141,9 +152,62 @@ func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Read
 	case hookPostTask:
 		return a.parsePostTask(stdin, prior)
 
+	case hookPostToolUse:
+		return a.parsePostToolUse(stdin, prior)
+
 	default:
 		return nil, nil // hook with no recording significance
 	}
+}
+
+// parsePostToolUse records an intermediate mutating tool call. It carries no
+// transcript (the turn's transcript is captured whole at Stop) and an unchanged
+// cursor; the core decides whether the call actually changed the worktree.
+func (a *Agent) parsePostToolUse(stdin io.Reader, prior agent.Cursor) (*agent.Event, error) {
+	raw, err := parseStdin[postToolUseRaw](stdin)
+	if err != nil {
+		return nil, err
+	}
+	if raw.ToolName == "" {
+		return nil, nil
+	}
+	return &agent.Event{
+		SessionID: raw.SessionID,
+		Kind:      agent.KindToolUse,
+		Tool:      &agent.ToolUse{Name: raw.ToolName, Detail: toolDetail(raw.ToolName, raw.ToolInput)},
+		Cursor:    prior.Clone(),
+	}, nil
+}
+
+// toolDetail extracts a short human label from a tool's input: the file path for
+// file-editing tools, the (truncated) command for Bash. Best-effort — an
+// unparseable input just yields an empty detail, never an error.
+func toolDetail(tool string, input json.RawMessage) string {
+	var v struct {
+		FilePath    string `json:"file_path"`
+		NotebookB   string `json:"notebook_path"`
+		Command     string `json:"command"`
+		Description string `json:"description"`
+	}
+	_ = json.Unmarshal(input, &v)
+	switch {
+	case v.FilePath != "":
+		return v.FilePath
+	case v.NotebookB != "":
+		return v.NotebookB
+	case v.Command != "":
+		return truncate(strings.TrimSpace(v.Command), 120)
+	case v.Description != "":
+		return truncate(v.Description, 120)
+	}
+	return ""
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // parseTranscriptEvent handles Stop and SessionEnd: wait for the async flush,

@@ -140,6 +140,93 @@ func TestE2E_RealisticHookSequence(t *testing.T) {
 	}
 }
 
+// TestE2E_ToolUseEvents drives the PostToolUse capture path: mutating tool calls
+// that change the worktree are recorded as intermediate events, while a tool call
+// that changes nothing (e.g. a read-only Bash) is dropped by the change-gate so
+// it consumes no seq and adds no noise.
+func TestE2E_ToolUseEvents(t *testing.T) {
+	ctx := context.Background()
+	repo := e2eInitRepo(t)
+	tr := filepath.Join(t.TempDir(), "session.jsonl")
+	sid := "11111111-2222-3333-4444-555555555555"
+
+	clock := time.Unix(2_000_000, 0)
+	hook := func(event, payload string) {
+		t.Helper()
+		clock = clock.Add(time.Second)
+		if err := recordHook(ctx, repo, "claude-code", event, []byte(payload), clock); err != nil {
+			t.Fatalf("recordHook(%s): %v", event, err)
+		}
+	}
+	info := func(extra string) string {
+		return `{"session_id":"` + sid + `","transcript_path":"` + tr + `"` + extra + `}`
+	}
+
+	hook("session-start", info(`,"model":"claude-opus-4-8"`))
+	hook("user-prompt-submit", info(`,"prompt":"do work"`))
+
+	// Edit changes the worktree -> recorded.
+	e2eWrite(t, repo, "a.go", "package main\n")
+	hook("post-tool-use", info(`,"tool_name":"Edit","tool_input":{"file_path":"a.go"}`))
+
+	// A read-only Bash changes nothing -> dropped by the change-gate.
+	hook("post-tool-use", info(`,"tool_name":"Bash","tool_input":{"command":"git status"}`))
+
+	// Write changes the worktree -> recorded.
+	e2eWrite(t, repo, "b.go", "package main\n")
+	hook("post-tool-use", info(`,"tool_name":"Write","tool_input":{"file_path":"b.go"}`))
+
+	e2eAppend(t, tr, `{"type":"assistant","timestamp":"2026-06-12T00:01:00Z"}`)
+	hook("stop", info(""))
+
+	rec := store.New(repo)
+	events, err := rec.LoadSessionEvents(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// session-start, prompt, tool-use(Edit), tool-use(Write), stop = 5.
+	// The no-op Bash is absent.
+	wantKinds := []string{"session-start", "user-prompt-submit", "tool-use", "tool-use", "stop"}
+	if len(events) != len(wantKinds) {
+		t.Fatalf("recorded %d events, want %d: %+v", len(events), len(wantKinds), kindsOf(events))
+	}
+	for i, ec := range events {
+		if ec.Record.Kind != wantKinds[i] {
+			t.Errorf("event %d kind = %q, want %q", i, ec.Record.Kind, wantKinds[i])
+		}
+		if ec.Record.Seq != i+1 {
+			t.Errorf("event %d seq = %d, want %d", i, ec.Record.Seq, i+1)
+		}
+	}
+
+	// The tool-use events carry the tool name + target and their own snapshots.
+	tools := map[string]string{} // name -> detail
+	for _, ec := range events {
+		if ec.Record.ToolUse != nil {
+			tools[ec.Record.ToolUse.Name] = ec.Record.ToolUse.Detail
+		}
+	}
+	if tools["Edit"] != "a.go" || tools["Write"] != "b.go" {
+		t.Errorf("tool-use details = %v, want Edit:a.go Write:b.go", tools)
+	}
+
+	rep, err := audit.Run(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK() {
+		t.Fatalf("audit failed: %+v", rep.Findings)
+	}
+}
+
+func kindsOf(events []store.EventCommit) []string {
+	ks := make([]string, len(events))
+	for i, ec := range events {
+		ks[i] = ec.Record.Kind
+	}
+	return ks
+}
+
 // --- helpers ---
 
 func e2eInitRepo(t *testing.T) string {

@@ -26,6 +26,7 @@ const (
 	KindStop         Kind = "stop"
 	KindSessionEnd   Kind = "session-end"
 	KindSubagentStop Kind = "post-task"
+	KindToolUse      Kind = "tool-use" // an intermediate (mid-turn) mutating tool call
 )
 
 // Quality records how trustworthy a transcript delta is. Anything other than
@@ -78,6 +79,14 @@ func (c Cursor) Clone() Cursor {
 	return out
 }
 
+// ToolUse describes an intermediate mutating tool call (Edit/Write/Bash/…),
+// captured so the timeline shows mid-turn worktree changes, not just turn
+// boundaries. Populated on KindToolUse events.
+type ToolUse struct {
+	Name   string // the agent's tool name, e.g. "Edit", "Write", "Bash"
+	Detail string // a short human label: the target file path, or a command summary
+}
+
 // Event is the normalized record the core records for one hook firing. The agent
 // fills the agent-specific parts (kind, prompt, transcript bytes, cursor); the
 // core stamps timestamp/HEAD and takes the worktree snapshot.
@@ -88,6 +97,7 @@ type Event struct {
 	Model      string
 	Transcript Delta       // populated on Stop/SessionEnd
 	Sidechains []Sidechain // populated on SubagentStop
+	Tool       *ToolUse    // populated on KindToolUse
 	Cursor     Cursor      // advanced cursor after this event
 }
 

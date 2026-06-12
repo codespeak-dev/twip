@@ -19,6 +19,7 @@
   --c-gitop: #e08a1e;
   --c-flag: #d64545;
   --c-session: #6f8bd6; /* the session lane line */
+  --c-tooluse: #6c8ebf; /* intermediate tool-call dots */
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -96,6 +97,9 @@ body { font: 13.5px/1.55 var(--sans); color: var(--ink); background: var(--bg); 
 .node[data-kind="post-task"] .lane.session .dot { background: var(--c-prompt); }
 .node[data-kind="stop"] .lane.session .dot { background: var(--c-stop); }
 .node[data-kind="session-end"] .lane.session .dot { background: var(--c-end); }
+/* intermediate tool calls are frequent: a smaller, muted dot so turn-boundary
+   events (prompt/stop) still read as the primary beats. */
+.node[data-kind="tool-use"] .lane.session .dot { background: var(--c-tooluse); width: .5rem; height: .5rem; }
 
 /* colored outline chip: text + border color set inline to the branch's color */
 .branch-chip {
