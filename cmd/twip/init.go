@@ -16,6 +16,7 @@ func newInitCmd() *cobra.Command {
 			ctx := cmd.Context()
 			agentName, _ := cmd.Flags().GetString("agent")
 			force, _ := cmd.Flags().GetBool("force")
+			enforce, _ := cmd.Flags().GetBool("enforce")
 
 			root, err := repoRoot(ctx)
 			if err != nil {
@@ -39,9 +40,19 @@ func newInitCmd() *cobra.Command {
 			cmd.Printf("Installed %d %s hook(s) in %s/.claude/settings.json\n", n, agentName, root)
 			cmd.Printf("Events will be recorded to refs/twip/journal/%s in this repo.\n", cloneID)
 
-			// Wire up sync (push via pre-push hook, fetch via refspec). Best-effort:
-			// a failure here shouldn't fail recording setup.
-			if sync, err := rec.InstallSync(ctx); err != nil {
+			// Wire up sync (push via pre-push hook, fetch via refspec). The bundled
+			// hook invokes the stable installed twip by absolute path, so it works
+			// even from a GUI git that never sourced the shell rc. Best-effort: a
+			// failure here shouldn't fail recording setup.
+			dir, err := defaultShimDir()
+			if err != nil {
+				return err
+			}
+			twipPath, err := shimTwipPath(dir)
+			if err != nil {
+				return err
+			}
+			if sync, err := rec.InstallSync(ctx, twipPath, enforce); err != nil {
 				cmd.PrintErrf("twip: sync setup skipped: %v\n", err)
 			} else {
 				reportSync(cmd, sync)
@@ -51,6 +62,7 @@ func newInitCmd() *cobra.Command {
 	}
 	cmd.Flags().String("agent", "claude-code", "agent whose hooks to install")
 	cmd.Flags().Bool("force", false, "reinstall hooks, replacing any twip-owned entries")
+	cmd.Flags().Bool("enforce", false, "also gate `git push`: block pushes from this repo unless recording is active")
 	return cmd
 }
 
@@ -62,9 +74,8 @@ func reportSync(cmd *cobra.Command, s store.SyncSetup) {
 		cmd.Println("Installed git pre-push hook: your journal mirrors to the remote when you push.")
 	case "foreign":
 		cmd.Printf("A pre-push hook already exists (%s); left it untouched.\n", s.HookPath)
-		cmd.Println("  To share on push, add this to it:")
-		cmd.Println("    TWIP_SYNC_PUSH=1 git push --quiet \"$1\" 'refs/twip/journal/*:refs/twip/journal/*' \\")
-		cmd.Println("      'refs/twip/pin/*:refs/twip/pin/*' 'refs/twip/stash/*:refs/twip/stash/*' >/dev/null 2>&1 || true")
+		cmd.Println("  To share on push (and gate it, if requested), add this to it:")
+		cmd.Printf("    %s\n", s.HookSnippet)
 	}
 	switch {
 	case s.Remote == "":
