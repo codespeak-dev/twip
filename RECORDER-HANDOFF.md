@@ -1,5 +1,13 @@
 # Session Recorder — Handoff from Entire Fork Evaluation
 
+> **Status — historical design rationale.** This records *why* we built our own recorder (vs.
+> forking Entire) and the design that survived scrutiny, as of the pre-implementation handoff. It is
+> kept as a reasoning record and is **not** revised as the code evolves, so some names and open
+> questions here are superseded: refs live under `refs/twip/*` (not `refs/recorder/*`), the shim
+> guard env is `TWIP_SHIM_ACTIVE`, and cross-machine sync now ships (`twip sync push` + a
+> `remote.*.fetch` refspec — the "storage sync" open question is resolved). For current behavior and
+> commands see [README.md](README.md) and `twip <command> --help`.
+
 Outcome of evaluating a fork of Entire CLI (entire-cli repo) for internal-team session/repo-state
 recording. **Decision: build our own recorder instead of forking.** This doc distills the goal,
 the design that survived scrutiny, hard-won implementation knowledge to steal from Entire, and

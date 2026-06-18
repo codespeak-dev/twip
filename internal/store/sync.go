@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,39 +17,85 @@ import (
 // idempotent), so push is always a fast-forward and there is never a merge.
 
 // prePushMarker identifies a twip-owned pre-push hook so we re-install ours but
-// never clobber a hook someone else wrote.
+// never clobber a hook someone else wrote. It must appear verbatim in every hook
+// variant prePushHookScript emits, or foreign-hook detection misfires.
 const prePushMarker = "twip-sync (managed by 'twip init')"
 
-// A clone only ever writes its own journal under refs/twip/journal/*, so the
-// wildcard source matches exactly this clone's journal — no clone-id needed.
-// TWIP_SYNC_PUSH guards against the inner push re-triggering this same hook.
-const prePushHook = `#!/bin/sh
-# twip-sync (managed by 'twip init') — mirror this clone's journal/pins/stash to
-# the remote you push to, riding on your normal push. Best-effort: it never
-# blocks or fails your push.
-[ -n "$TWIP_SYNC_PUSH" ] && exit 0
-remote="$1"
-[ -n "$remote" ] || exit 0
-TWIP_SYNC_PUSH=1 git push --quiet "$remote" \
-	'refs/twip/journal/*:refs/twip/journal/*' \
-	'refs/twip/pin/*:refs/twip/pin/*' \
-	'refs/twip/stash/*:refs/twip/stash/*' >/dev/null 2>&1 || true
+// envSyncPush is set on the inner mirror push so the shim passes it through and a
+// re-fired pre-push hook short-circuits instead of recursing.
+const envSyncPush = "TWIP_SYNC_PUSH"
+
+// prePushHookScript builds the twip-owned pre-push hook. twipPath is baked in as
+// an absolute path (option C) so the hook works even when invoked from a GUI git
+// that never sourced the shell rc. With enforce set, it runs the blocking gate
+// (`twip check pre-push`) before the best-effort mirror; the mirror itself never
+// blocks the push. A clone only ever writes its own journal under
+// refs/twip/journal/*, so the mirror needs no clone-id.
+func prePushHookScript(twipPath string, enforce bool) string {
+	gate := ""
+	if enforce {
+		gate = fmt.Sprintf("%q check pre-push || exit 1\n", twipPath)
+	}
+	return fmt.Sprintf(`#!/bin/sh
+# %s — mirror this clone's journal/pins/stash to the remote you push to, riding
+# on your normal push. The mirror is best-effort: it never blocks or fails a push.
+[ -n "$%s" ] && exit 0
+[ -x %q ] || exit 0
+%s%q sync push "$1" || true
 exit 0
-`
+`, prePushMarker, envSyncPush, twipPath, gate, twipPath)
+}
+
+// foreignHookSnippet is the line(s) `twip init` tells the operator to add to a
+// pre-push hook twip does not own (the gate line is included when enforce is set).
+func foreignHookSnippet(twipPath string, enforce bool) string {
+	gate := ""
+	if enforce {
+		gate = fmt.Sprintf("%q check pre-push || exit 1\n    ", twipPath)
+	}
+	return fmt.Sprintf("%s%q sync push \"$1\" || true", gate, twipPath)
+}
 
 // SyncSetup reports what InstallSync did, for `twip init` to surface.
 type SyncSetup struct {
 	HookStatus    string // "installed" | "updated" | "foreign" (left a non-twip hook untouched)
 	HookPath      string
+	HookSnippet   string   // for a foreign hook with no known manager: the raw line(s) to add
+	HookManager   string   // detected hook manager for a foreign hook: "lefthook"|"husky"|"pre-commit"|""
+	Enforce       bool     // whether --enforce was requested (the gate should be wired in)
 	Remote        string   // remote whose fetch refspec is configured ("" if no remote yet)
 	AddedRefspecs []string // refspecs added this run (empty if already present)
 }
 
+// detectHookManager guesses which hook manager owns this repo's git hooks (by its
+// config file/dir in the repo root), so a foreign-hook message can give tailored
+// instructions. Best-effort: an unknown/absent manager yields "" (generic guidance).
+func detectHookManager(repoRoot string) string {
+	has := func(rel string) bool {
+		_, err := os.Stat(filepath.Join(repoRoot, rel))
+		return err == nil
+	}
+	switch {
+	case has("lefthook.yml") || has("lefthook.yaml") || has(".lefthook.yml") ||
+		has(".lefthook.yaml") || has("lefthook.toml") || has(".lefthook.toml") ||
+		has("lefthook.json") || has(".lefthook.json"):
+		return "lefthook"
+	case has(".husky"):
+		return "husky"
+	case has(".pre-commit-config.yaml") || has(".pre-commit-config.yml"):
+		return "pre-commit"
+	}
+	return ""
+}
+
 // InstallSync wires up push (pre-push hook) and fetch (refspec on the remote).
-// Idempotent and merge-preserving: re-running refreshes a twip hook, leaves a
-// foreign one alone, and never duplicates refspecs.
-func (r *Recorder) InstallSync(ctx context.Context) (SyncSetup, error) {
+// twipPath is the absolute twip binary the bundled hook invokes; enforce adds the
+// blocking push gate to that hook. Idempotent and merge-preserving: re-running
+// refreshes a twip hook, leaves a foreign one alone, and never duplicates
+// refspecs.
+func (r *Recorder) InstallSync(ctx context.Context, twipPath string, enforce bool) (SyncSetup, error) {
 	var s SyncSetup
+	s.Enforce = enforce
 	hookPath, err := r.prePushHookPath(ctx)
 	if err != nil {
 		return s, err
@@ -59,11 +106,13 @@ func (r *Recorder) InstallSync(ctx context.Context) (SyncSetup, error) {
 	switch {
 	case readErr == nil && !strings.Contains(string(existing), prePushMarker):
 		s.HookStatus = "foreign" // someone else's hook — don't touch it
+		s.HookManager = detectHookManager(r.RepoRoot)
+		s.HookSnippet = foreignHookSnippet(twipPath, enforce)
 	default:
 		if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
 			return s, err
 		}
-		if err := os.WriteFile(hookPath, []byte(prePushHook), 0o755); err != nil {
+		if err := os.WriteFile(hookPath, []byte(prePushHookScript(twipPath, enforce)), 0o755); err != nil {
 			return s, err
 		}
 		if readErr == nil {
@@ -82,6 +131,30 @@ func (r *Recorder) InstallSync(ctx context.Context) (SyncSetup, error) {
 		s.AddedRefspecs = added
 	}
 	return s, nil
+}
+
+// SyncPush mirrors this clone's journal/pins/stash refs to remote, riding on a
+// normal push. Best-effort by contract: a push failure (offline, no such refs,
+// no remote) returns an error for the caller to log, but the `twip sync push`
+// command and the bundled hook both treat it as non-fatal so a push never blocks.
+// It is a no-op when already inside a mirror push (envSyncPush set), which stops
+// a foreign hook from recursing even without its own guard line.
+func (r *Recorder) SyncPush(ctx context.Context, remote string) error {
+	if remote == "" || os.Getenv(envSyncPush) == "1" {
+		return nil
+	}
+	// --no-verify so this internal mirror push never fires the pre-push hook: it
+	// would otherwise re-run a hook manager's other pre-push jobs (tests, lint, …) a
+	// second time on every push. envSyncPush is belt-and-suspenders (and stops the
+	// shim from recording this push); gitutil.Run also forces TWIP_SHIM_ACTIVE=1.
+	args := []string{
+		"push", "--no-verify", "--quiet", remote,
+		JournalRefPrefix + "*:" + JournalRefPrefix + "*",
+		PinRefPrefix + "*:" + PinRefPrefix + "*",
+		StashRefPrefix + "*:" + StashRefPrefix + "*",
+	}
+	_, err := gitutil.Run(ctx, r.RepoRoot, []string{envSyncPush + "=1"}, nil, args...)
+	return err
 }
 
 // prePushHookPath resolves the hooks dir (honoring core.hooksPath and worktrees)

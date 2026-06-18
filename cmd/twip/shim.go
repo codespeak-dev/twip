@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
@@ -46,31 +45,9 @@ func newShimInstallCmd() *cobra.Command {
 				dir = d
 			}
 
-			realGit, err := resolveRealGit(dir)
+			shimPath, realGit, err := installShim(dir)
 			if err != nil {
 				return err
-			}
-			twipPath, err := os.Executable()
-			if err != nil {
-				return err
-			}
-			if p, e := filepath.EvalSymlinks(twipPath); e == nil {
-				twipPath = p
-			}
-
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return fmt.Errorf("create shim dir: %w", err)
-			}
-			shimPath := filepath.Join(dir, "git")
-			// The fallback exec keeps git working even if twip is removed.
-			script := fmt.Sprintf(`#!/bin/sh
-if [ -x %q ]; then
-  exec %q git-shim --real-git=%q -- "$@"
-fi
-exec %q "$@"
-`, twipPath, twipPath, realGit, realGit)
-			if err := os.WriteFile(shimPath, []byte(script), 0o755); err != nil { //nolint:gosec // intentional executable
-				return fmt.Errorf("write shim: %w", err)
 			}
 
 			cmd.Printf("Installed git shim at %s\n", shimPath)
@@ -116,18 +93,87 @@ func newShimUninstallCmd() *cobra.Command {
 	return cmd
 }
 
-// resolveRealGit finds the real git binary, refusing to point the shim at itself
-// if a previous shim already shadows git on PATH.
-func resolveRealGit(shimDir string) (string, error) {
-	p, err := exec.LookPath("git")
+// installShim writes the `git` shim into dir and returns its path and the real
+// git it falls back to. The shim invokes the stable installed twip (see
+// shimTwipPath) so it survives a toolchain upgrade or GC of the path twip was
+// launched from.
+func installShim(dir string) (shimPath, realGit string, err error) {
+	realGit, err = resolveRealGit(dir)
 	if err != nil {
-		return "", fmt.Errorf("no git on PATH to wrap: %w", err)
+		return "", "", err
 	}
-	if resolved, e := filepath.EvalSymlinks(p); e == nil {
-		p = resolved
+	twipPath, err := shimTwipPath(dir)
+	if err != nil {
+		return "", "", err
 	}
-	if filepath.Dir(p) == filepath.Clean(shimDir) {
-		return "", fmt.Errorf("git on PATH (%s) is the shim itself; remove %s from PATH and re-run", p, shimDir)
+	shimPath, err = writeShim(dir, twipPath, realGit)
+	return shimPath, realGit, err
+}
+
+// shimTwipPath returns the twip binary the shim (and the bundled pre-push hook)
+// should invoke: the stable installed copy at <dir>/twip when present (what
+// `twip install` creates), else the currently-running executable with symlinks
+// resolved. The stable copy is what decouples twip from how it was obtained.
+func shimTwipPath(dir string) (string, error) {
+	stable := filepath.Join(dir, "twip")
+	if fi, err := os.Stat(stable); err == nil && !fi.IsDir() {
+		return stable, nil
 	}
-	return p, nil
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	if p, e := filepath.EvalSymlinks(exe); e == nil {
+		exe = p
+	}
+	return exe, nil
+}
+
+// writeShim writes the `git` wrapper script into dir, pointing at twipPath for
+// capture and realGit as the never-break-git fallback. Returns the shim path.
+func writeShim(dir, twipPath, realGit string) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create shim dir: %w", err)
+	}
+	shimPath := filepath.Join(dir, "git")
+	// The fallback exec keeps git working even if twip is removed.
+	script := fmt.Sprintf(`#!/bin/sh
+if [ -x %q ]; then
+  exec %q git-shim --real-git=%q -- "$@"
+fi
+exec %q "$@"
+`, twipPath, twipPath, realGit, realGit)
+	if err := os.WriteFile(shimPath, []byte(script), 0o755); err != nil { //nolint:gosec // intentional executable
+		return "", fmt.Errorf("write shim: %w", err)
+	}
+	return shimPath, nil
+}
+
+// resolveRealGit finds the first real git on PATH, skipping the twip shim dir so
+// the shim never points at itself. In the global install the shim is always on
+// PATH, so skipping (rather than erroring) keeps `twip install`/`shim install`
+// idempotent and re-runnable with the shim already active.
+func resolveRealGit(shimDir string) (string, error) {
+	shimDir = filepath.Clean(shimDir)
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			continue
+		}
+		cand := filepath.Join(dir, "git")
+		fi, err := os.Stat(cand)
+		if err != nil || fi.IsDir() || fi.Mode()&0o111 == 0 {
+			continue // absent, a dir, or not executable
+		}
+		resolved := cand
+		if r, e := filepath.EvalSymlinks(cand); e == nil {
+			resolved = r
+		}
+		// Skip our own shim, whether this PATH entry IS the shim dir or merely
+		// symlinks git back into it.
+		if filepath.Clean(dir) == shimDir || filepath.Dir(resolved) == shimDir {
+			continue
+		}
+		return resolved, nil
+	}
+	return "", fmt.Errorf("no real git found on PATH (outside the shim dir %s)", shimDir)
 }

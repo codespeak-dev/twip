@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -169,6 +170,181 @@ func TestSync_TwoClonesShareTimeline(t *testing.T) {
 	}
 }
 
+func TestPrePushHookScript(t *testing.T) {
+	const twip = "/home/u/.twip/bin/twip"
+	sync := prePushHookScript(twip, false)
+	enforce := prePushHookScript(twip, true)
+
+	for name, s := range map[string]string{"sync-only": sync, "enforce": enforce} {
+		if !strings.Contains(s, prePushMarker) {
+			t.Errorf("%s hook missing marker %q:\n%s", name, prePushMarker, s)
+		}
+		if !strings.Contains(s, `[ -n "$TWIP_SYNC_PUSH" ] && exit 0`) {
+			t.Errorf("%s hook missing inner-push short-circuit:\n%s", name, s)
+		}
+		if !strings.Contains(s, twip+" sync push") && !strings.Contains(s, `"`+twip+`" sync push`) {
+			t.Errorf("%s hook does not call the mirror by absolute path:\n%s", name, s)
+		}
+	}
+	if strings.Contains(sync, "check pre-push") {
+		t.Errorf("sync-only hook must not gate:\n%s", sync)
+	}
+	if !strings.Contains(enforce, "check pre-push || exit 1") {
+		t.Errorf("enforce hook must run the blocking gate:\n%s", enforce)
+	}
+	// The gate must precede the mirror, so a blocked push never syncs.
+	gate, mirror := strings.Index(enforce, "check pre-push"), strings.Index(enforce, "sync push")
+	if gate < 0 || mirror < 0 || gate > mirror {
+		t.Errorf("gate must come before mirror in enforce hook:\n%s", enforce)
+	}
+}
+
+func TestForeignHookSnippet(t *testing.T) {
+	const twip = "/opt/twip/twip"
+	plain := foreignHookSnippet(twip, false)
+	if strings.Contains(plain, "check pre-push") {
+		t.Errorf("non-enforce snippet must not gate: %q", plain)
+	}
+	if !strings.Contains(plain, "sync push") || !strings.Contains(plain, twip) {
+		t.Errorf("snippet missing mirror / path: %q", plain)
+	}
+	if withGate := foreignHookSnippet(twip, true); !strings.Contains(withGate, "check pre-push") {
+		t.Errorf("enforce snippet must include the gate: %q", withGate)
+	}
+}
+
+// TestSyncPush_NoopGuards covers the two cheap exits that need no remote/repo:
+// an empty remote, and being inside a mirror push (envSyncPush set) — the latter
+// is what stops a foreign hook from recursing without its own guard line.
+func TestSyncPush_NoopGuards(t *testing.T) {
+	ctx := context.Background()
+	if err := New(t.TempDir()).SyncPush(ctx, ""); err != nil {
+		t.Errorf("SyncPush with empty remote should be a no-op, got %v", err)
+	}
+	t.Setenv(envSyncPush, "1")
+	if err := New(t.TempDir()).SyncPush(ctx, "origin"); err != nil {
+		t.Errorf("SyncPush inside a mirror push should be a no-op, got %v", err)
+	}
+}
+
+func TestInstallSync_EnforceHookContent(t *testing.T) {
+	repo := initRepo(t)
+	const twip = "/x/twip"
+	s, err := New(repo).InstallSync(context.Background(), twip, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.HookStatus != "installed" {
+		t.Fatalf("HookStatus = %q, want installed", s.HookStatus)
+	}
+	body, err := os.ReadFile(s.HookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{twip, "check pre-push || exit 1", "sync push"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("enforce hook missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestInstallSync_ForeignHookUntouched(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	hookPath, err := New(repo).prePushHookPath(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const foreign = "#!/bin/sh\necho not-twip\n"
+	if err := os.WriteFile(hookPath, []byte(foreign), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(repo).InstallSync(ctx, "/x/twip", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.HookStatus != "foreign" {
+		t.Fatalf("HookStatus = %q, want foreign", s.HookStatus)
+	}
+	if s.HookSnippet == "" || !strings.Contains(s.HookSnippet, "sync push") {
+		t.Errorf("foreign result should surface a snippet, got %q", s.HookSnippet)
+	}
+	got, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != foreign {
+		t.Errorf("foreign hook was modified:\n%s", got)
+	}
+}
+
+// TestSyncPush_SkipsHooks pins the double-push fix: the mirror push must use
+// --no-verify so it never fires the pre-push hook (which would re-run a hook
+// manager's other jobs), while still mirroring the journal.
+func TestSyncPush_SkipsHooks(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	origin := filepath.Join(base, "origin.git")
+	git(t, base, "init", "-q", "--bare", origin)
+	dir := setupClone(t, base, origin, "c", "C", "c@codespeak.dev")
+	rec := New(dir)
+	appendEvent(t, rec, dir, "sid", 1000) // give the journal a commit to mirror
+
+	// A pre-push hook that records that it ran; SyncPush must NOT trigger it.
+	hookPath, err := rec.prePushHookPath(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(base, "hook-ran")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\ntouch "+sentinel+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rec.SyncPush(ctx, "origin"); err != nil {
+		t.Fatalf("SyncPush: %v", err)
+	}
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Error("SyncPush fired the pre-push hook — it must push with --no-verify")
+	}
+	out, _ := gitutil.Out(ctx, dir, "ls-remote", origin, "refs/twip/journal/*")
+	if !strings.Contains(out, "journal") {
+		t.Errorf("SyncPush did not mirror the journal: %q", out)
+	}
+}
+
+func TestDetectHookManager(t *testing.T) {
+	cases := []struct{ entry, want string }{
+		{"lefthook.yml", "lefthook"},
+		{".lefthook.yaml", "lefthook"},
+		{"lefthook.toml", "lefthook"},
+		{".husky", "husky"}, // a directory
+		{".pre-commit-config.yaml", "pre-commit"},
+	}
+	for _, c := range cases {
+		dir := t.TempDir()
+		p := filepath.Join(dir, c.entry)
+		var err error
+		if c.entry == ".husky" {
+			err = os.Mkdir(p, 0o755)
+		} else {
+			err = os.WriteFile(p, []byte("x"), 0o644)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := detectHookManager(dir); got != c.want {
+			t.Errorf("detectHookManager(with %s) = %q, want %q", c.entry, got, c.want)
+		}
+	}
+	if got := detectHookManager(t.TempDir()); got != "" {
+		t.Errorf("no manager config = %q, want \"\"", got)
+	}
+}
+
 // --- helpers ---
 
 func git(t *testing.T, dir string, args ...string) {
@@ -185,7 +361,11 @@ func setupClone(t *testing.T, base, origin, dir, name, email string) string {
 	git(t, dest, "config", "user.name", name)
 	git(t, dest, "config", "user.email", email)
 	git(t, dest, "config", "commit.gpgsign", "false")
-	if _, err := New(dest).InstallSync(context.Background()); err != nil {
+	// The bundled hook now shells out to an installed twip binary (absent in this
+	// unit test); point it at a path that won't exist so the hook is a clean no-op.
+	// What we exercise here is the store side: the fetch refspec InstallSync
+	// configures, plus SyncPush (driven explicitly in commitAndPush).
+	if _, err := New(dest).InstallSync(context.Background(), filepath.Join(base, "no-twip"), false); err != nil {
 		t.Fatalf("InstallSync(%s): %v", dir, err)
 	}
 	return dest
@@ -215,5 +395,11 @@ func commitAndPush(t *testing.T, repo, file string) {
 	writeFile(t, repo, file, "x\n")
 	git(t, repo, "add", file)
 	git(t, repo, "commit", "-q", "-m", "add "+file)
-	git(t, repo, "push", "-q", "origin", "master") // fires the pre-push hook
+	git(t, repo, "push", "-q", "origin", "master")
+	// The bundled pre-push hook delegates the journal mirror to `twip sync push`;
+	// drive that store path directly (the hook→binary wiring is a cmd/twip e2e
+	// concern). Without this, teammates' journals never reach origin.
+	if err := New(repo).SyncPush(context.Background(), "origin"); err != nil {
+		t.Fatalf("SyncPush(%s): %v", repo, err)
+	}
 }
