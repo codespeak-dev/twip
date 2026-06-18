@@ -87,12 +87,15 @@ data-quality flags — non-zero exit on any divergence. The shim falls back to r
 unavailable, so it can never break git.
 
 **Sharing across the team.** Sync rides on normal git, so there's nothing extra to run. `twip init`
-installs a `pre-push` hook (which calls `twip sync push`) that mirrors your journal to the remote you
-push to, and adds a `remote.origin.fetch` refspec so a plain `git fetch`/`pull` brings teammates'
-journals down (into `refs/twip/remotes/<remote>/journal/*`). Repos with a hook manager (lefthook,
-husky) wire `twip sync push "$1"` — and, if gating, `twip check pre-push` — into the manager instead. It's conflict-free by construction: each clone is the sole
-writer of its own `refs/twip/journal/<clone-id>`, so every push is a fast-forward and there is never
-a merge. The browser then lanes the whole team's timeline, each clone labeled by its author.
+installs a best-effort `pre-push` hook (which calls `twip sync push`, pushing with `--no-verify` so it
+never re-runs your other pre-push checks) that mirrors your journal to the remote you push to, and
+adds a `remote.origin.fetch` refspec so a plain `git fetch`/`pull` brings teammates' journals down
+(into `refs/twip/remotes/<remote>/journal/*`). If a hook manager already owns `pre-push` (lefthook,
+husky, pre-commit), twip detects it, leaves it untouched, and prints the exact config to add —
+wiring `twip sync push` (and, with `--enforce`, `twip check pre-push`) into the manager. It's
+conflict-free by construction: each clone is the sole writer of its own
+`refs/twip/journal/<clone-id>`, so every push is a fast-forward and there is never a merge. The
+browser then lanes the whole team's timeline, each clone labeled by its author.
 
 *Pending:* tripwire hook (detect shim bypass), graded commit↔session links. Only Claude Code is
 implemented, but the agent seam (`internal/agent`) makes adding one "implement the interface +

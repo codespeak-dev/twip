@@ -9,9 +9,15 @@ import (
 func newInitCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "Install agent hooks into this repo and enable recording",
-		Long: "Installs the chosen agent's hooks into <repo>/.claude/settings.json so " +
-			"twip records each session turn. Hooks twip does not own are preserved.",
+		Short: "Enable twip recording in this repo (agent hooks, journal, sync)",
+		Long: "Enables twip for this repo: installs the chosen agent's hooks into " +
+			"<repo>/.claude/settings.json so twip records each session turn (hooks twip " +
+			"does not own are preserved), creates this clone's journal id (the marker the " +
+			"git shim gates on), installs a best-effort pre-push hook that mirrors the " +
+			"journal on push, and adds a fetch refspec for teammates' journals.\n\n" +
+			"With --enforce it also gates `git push`, blocking pushes that aren't being " +
+			"recorded. If a hook manager already owns the pre-push hook (lefthook, husky, " +
+			"pre-commit), twip leaves it untouched and prints the config to wire in instead.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 			agentName, _ := cmd.Flags().GetString("agent")

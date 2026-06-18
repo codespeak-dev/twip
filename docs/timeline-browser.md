@@ -117,4 +117,7 @@ A right-hand slide-over, opened from a clickable SHA or file, dismissed with
   Cross-clone lanes require the other clone's journal to be fetched (see sync).
 - Browsable snapshot *tree* navigation (today: a flat file list, click to view).
 - Auto-refresh / live updates.
-- Cross-clone timelines once sync lands (will union `refs/twip/journal/*`).
+
+(Cross-clone timelines have shipped: sync mirrors each clone's journal and the read
+side unions `refs/twip/journal/*` with the fetched `refs/twip/remotes/*`, laning the
+whole team — see "Lanes are workspaces" above.)
