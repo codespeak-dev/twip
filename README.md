@@ -23,6 +23,33 @@ Committed hooks are a no-op for anyone without twip. Optionally `twip init --enf
 `git push` from the repo, blocking pushes that aren't being recorded (bypass once with
 `git push --no-verify`). Everyday commands: `twip log` / `show <event-id>` / `audit` / `serve`.
 
+### Manual PATH setup (if a new shell can't find the shim)
+
+`twip install` writes `~/.twip/env` (a POSIX-sh snippet that prepends `~/.twip/bin` to `PATH`) and
+sources it from your shell's startup files. (For a **macOS zsh** account with no `~/.zshrc` — zsh
+ignores `~/.profile`, so the wiring wouldn't take — `twip install` detects this and offers to create
+`~/.zshrc`, after a confirmation prompt; `--yes` accepts automatically.) If your environment still
+isn't covered — managed dotfiles, a shell whose rc isn't sourced, etc. — wire it by hand. All you
+need is `~/.twip/bin` on `PATH`:
+
+```sh
+# bash — add to ~/.bashrc (and ~/.bash_profile; macOS Terminal sources that for login shells)
+. "$HOME/.twip/env"
+# zsh  — add to ~/.zshrc (honors $ZDOTDIR); macOS's default shell
+. "$HOME/.twip/env"
+# fish — fish auto-sources conf.d, but you can also just:
+fish_add_path "$HOME/.twip/bin"
+# any shell — or skip the env file and prepend directly:
+export PATH="$HOME/.twip/bin:$PATH"
+```
+
+Verify in a **new** shell: `which git` → `~/.twip/bin/git`, and `git --version` still works (the
+shim falls back to real git, so it can never break git). Install with `--no-modify-path` to do all
+of the above except the rc edit (and print the line to add).
+
+**GUI git (JetBrains, GitHub Desktop, …)** bypass `PATH` entirely. Point their "Path to Git
+executable" at `~/.twip/bin/git` (an absolute path) — the shim works without any `PATH` wiring.
+
 ## How it works
 
 **One journal per clone.** Each clone has a single append-only commit chain on

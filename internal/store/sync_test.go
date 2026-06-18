@@ -282,6 +282,69 @@ func TestInstallSync_ForeignHookUntouched(t *testing.T) {
 	}
 }
 
+// TestSyncPush_SkipsHooks pins the double-push fix: the mirror push must use
+// --no-verify so it never fires the pre-push hook (which would re-run a hook
+// manager's other jobs), while still mirroring the journal.
+func TestSyncPush_SkipsHooks(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	origin := filepath.Join(base, "origin.git")
+	git(t, base, "init", "-q", "--bare", origin)
+	dir := setupClone(t, base, origin, "c", "C", "c@codespeak.dev")
+	rec := New(dir)
+	appendEvent(t, rec, dir, "sid", 1000) // give the journal a commit to mirror
+
+	// A pre-push hook that records that it ran; SyncPush must NOT trigger it.
+	hookPath, err := rec.prePushHookPath(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(base, "hook-ran")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\ntouch "+sentinel+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rec.SyncPush(ctx, "origin"); err != nil {
+		t.Fatalf("SyncPush: %v", err)
+	}
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Error("SyncPush fired the pre-push hook — it must push with --no-verify")
+	}
+	out, _ := gitutil.Out(ctx, dir, "ls-remote", origin, "refs/twip/journal/*")
+	if !strings.Contains(out, "journal") {
+		t.Errorf("SyncPush did not mirror the journal: %q", out)
+	}
+}
+
+func TestDetectHookManager(t *testing.T) {
+	cases := []struct{ entry, want string }{
+		{"lefthook.yml", "lefthook"},
+		{".lefthook.yaml", "lefthook"},
+		{"lefthook.toml", "lefthook"},
+		{".husky", "husky"}, // a directory
+		{".pre-commit-config.yaml", "pre-commit"},
+	}
+	for _, c := range cases {
+		dir := t.TempDir()
+		p := filepath.Join(dir, c.entry)
+		var err error
+		if c.entry == ".husky" {
+			err = os.Mkdir(p, 0o755)
+		} else {
+			err = os.WriteFile(p, []byte("x"), 0o644)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := detectHookManager(dir); got != c.want {
+			t.Errorf("detectHookManager(with %s) = %q, want %q", c.entry, got, c.want)
+		}
+	}
+	if got := detectHookManager(t.TempDir()); got != "" {
+		t.Errorf("no manager config = %q, want \"\"", got)
+	}
+}
+
 // --- helpers ---
 
 func git(t *testing.T, dir string, args ...string) {

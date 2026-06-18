@@ -73,9 +73,7 @@ func reportSync(cmd *cobra.Command, s store.SyncSetup) {
 	case "installed", "updated":
 		cmd.Println("Installed git pre-push hook: your journal mirrors to the remote when you push.")
 	case "foreign":
-		cmd.Printf("A pre-push hook already exists (%s); left it untouched.\n", s.HookPath)
-		cmd.Println("  To share on push (and gate it, if requested), add this to it:")
-		cmd.Printf("    %s\n", s.HookSnippet)
+		reportForeignHook(cmd, s)
 	}
 	switch {
 	case s.Remote == "":
@@ -83,4 +81,75 @@ func reportSync(cmd *cobra.Command, s store.SyncSetup) {
 	case len(s.AddedRefspecs) > 0:
 		cmd.Printf("Configured '%s' to fetch teammates' journals on `git fetch`/`pull`.\n", s.Remote)
 	}
+}
+
+// reportForeignHook explains that a non-twip pre-push hook was left untouched, and
+// prints either config tailored to the detected hook manager or a generic raw-hook
+// snippet to wire twip in by hand.
+func reportForeignHook(cmd *cobra.Command, s store.SyncSetup) {
+	if guide := hookManagerGuidance(s.HookManager, s.Remote, s.Enforce); guide != "" {
+		cmd.Printf("A pre-push hook already exists (%s) — looks like %s; left it untouched.\n", s.HookPath, s.HookManager)
+		cmd.Printf("Wire twip into your %s config instead:\n", s.HookManager)
+		cmd.Print(guide)
+		return
+	}
+	cmd.Printf("A pre-push hook already exists (%s); left it untouched.\n", s.HookPath)
+	cmd.Println("  To share on push (and gate it, if requested), add this to it:")
+	cmd.Printf("    %s\n", s.HookSnippet)
+}
+
+// hookManagerGuidance returns paste-ready config for wiring twip into a detected
+// hook manager, or "" when the manager is unknown (caller uses the generic snippet).
+// remote is the remote to mirror to; enforce also wires the blocking push gate.
+func hookManagerGuidance(manager, remote string, enforce bool) string {
+	if remote == "" {
+		remote = "origin"
+	}
+	switch manager {
+	case "lefthook":
+		s := "  # lefthook.yml — add under `pre-push:` -> `jobs:`\n" +
+			"    - name: twip-sync         # mirror the journal on push (best-effort)\n" +
+			"      run: |\n" +
+			"        [ \"${TWIP_SYNC_PUSH:-}\" = \"1\" ] && exit 0\n" +
+			"        command -v twip >/dev/null 2>&1 || exit 0\n" +
+			"        twip sync push " + remote + "\n"
+		if enforce {
+			s += "    - name: twip-enabled      # gate: refuse pushes that aren't recorded\n" +
+				"      run: |\n" +
+				"        [ \"${TWIP_SYNC_PUSH:-}\" = \"1\" ] && exit 0\n" +
+				"        command -v twip >/dev/null 2>&1 || exit 0\n" +
+				"        twip check pre-push\n"
+		}
+		return s
+	case "husky":
+		s := "  # .husky/pre-push — add:\n" +
+			"  [ \"${TWIP_SYNC_PUSH:-}\" = \"1\" ] && exit 0\n" +
+			"  command -v twip >/dev/null 2>&1 || exit 0\n"
+		if enforce {
+			s += "  twip check pre-push || exit 1   # gate: refuse unrecorded pushes\n"
+		}
+		return s + "  twip sync push " + remote + "\n"
+	case "pre-commit":
+		s := "  # .pre-commit-config.yaml  (then: pre-commit install --hook-type pre-push)\n" +
+			"  - repo: local\n" +
+			"    hooks:\n" +
+			"      - id: twip-sync\n" +
+			"        name: twip sync push\n" +
+			"        entry: twip sync push " + remote + "\n" +
+			"        language: system\n" +
+			"        stages: [pre-push]\n" +
+			"        always_run: true\n" +
+			"        pass_filenames: false\n"
+		if enforce {
+			s += "      - id: twip-enabled        # gate: refuse pushes that aren't recorded\n" +
+				"        name: twip check pre-push\n" +
+				"        entry: twip check pre-push\n" +
+				"        language: system\n" +
+				"        stages: [pre-push]\n" +
+				"        always_run: true\n" +
+				"        pass_filenames: false\n"
+		}
+		return s
+	}
+	return ""
 }

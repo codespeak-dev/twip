@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -28,10 +29,20 @@ func newInstallCmd() *cobra.Command {
 		Short: "Install twip machine-wide: stable binary, git shim, and PATH wiring",
 		Long: "Copies the running twip to a stable ~/.twip/bin/twip, installs the git shim " +
 			"there, and sources ~/.twip/env from your shell rc so the shim is on PATH. Run " +
-			"once per machine; then `twip init` any repo. Undo with `twip uninstall`.",
+			"once per machine; then `twip init` any repo. Undo with `twip uninstall`.\n\n" +
+			"Manual setup, if the PATH edit doesn't take effect (managed dotfiles, a shell " +
+			"whose rc isn't sourced, or a GUI app that ignores PATH):\n" +
+			"  - source ~/.twip/env from your shell's startup file by hand, e.g. add\n" +
+			"      . \"$HOME/.twip/env\"\n" +
+			"    to ~/.bashrc / ~/.zshrc / ~/.bash_profile (or `fish_add_path ~/.twip/bin`),\n" +
+			"    or just prepend it:  export PATH=\"$HOME/.twip/bin:$PATH\"\n" +
+			"  - GUI git (JetBrains, GitHub Desktop): point \"Path to Git executable\" at\n" +
+			"    ~/.twip/bin/git — the shim works by absolute path, no PATH needed.\n" +
+			"Use --no-modify-path to install without touching any rc file.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			dir, _ := cmd.Flags().GetString("dir")
 			noModifyPath, _ := cmd.Flags().GetBool("no-modify-path")
+			assumeYes, _ := cmd.Flags().GetBool("yes")
 			if dir == "" {
 				d, err := defaultShimDir()
 				if err != nil {
@@ -75,13 +86,15 @@ func newInstallCmd() *cobra.Command {
 				cmd.Println("\n--no-modify-path: not touching your shell rc. Add this line yourself:")
 				cmd.Printf("  . %q\n", envFile)
 			} else {
-				if err := modifyPath(cmd, home, envFile, dir); err != nil {
+				if err := modifyPath(cmd, home, envFile, dir, assumeYes); err != nil {
 					return err
 				}
 			}
 
 			cmd.Println("\nStart a new shell (or `source " + envFile + "`), then `which git` should show:")
 			cmd.Printf("  %s\n", shimPath)
+			cmd.Println("\nIf a new shell still can't find it, wire it by hand (see `twip install --help`):")
+			cmd.Printf("  . %q\n", envFile)
 			cmd.Println("\nJetBrains IDEs bypass PATH — set Settings → Version Control → Git →")
 			cmd.Printf("  \"Path to Git executable\" to: %s\n", shimPath)
 			cmd.Println("\nThe shim only records in repos where you've run `twip init`. Undo with `twip uninstall`.")
@@ -90,6 +103,7 @@ func newInstallCmd() *cobra.Command {
 	}
 	cmd.Flags().String("dir", "", "directory for the binary + shim (default ~/.twip/bin)")
 	cmd.Flags().Bool("no-modify-path", false, "install everything but do not edit shell rc files")
+	cmd.Flags().BoolP("yes", "y", false, "assume yes to prompts (e.g. creating ~/.zshrc for a zsh login shell)")
 	return cmd
 }
 
@@ -224,7 +238,7 @@ esac
 
 // modifyPath sources the env file from the user's shell rc files (POSIX shells)
 // and writes a fish drop-in when fish is in use.
-func modifyPath(cmd *cobra.Command, home, envFile, dir string) error {
+func modifyPath(cmd *cobra.Command, home, envFile, dir string, assumeYes bool) error {
 	profile := filepath.Join(home, ".profile")
 	for _, rc := range rcCandidates(home) {
 		// Edit only existing rc files, plus ~/.profile always (the login fallback).
@@ -241,6 +255,26 @@ func modifyPath(cmd *cobra.Command, home, envFile, dir string) error {
 			cmd.Printf("%s already wired for twip\n", rc)
 		}
 	}
+
+	// macOS's default shell is zsh, which never reads ~/.profile. If the login
+	// shell is zsh but there's no ~/.zshrc, the loop above wired only ~/.profile
+	// and zsh won't pick twip up — warn and (with consent) create ~/.zshrc.
+	if loginShellIsZsh() {
+		if zshrc := zshrcPath(home); !fileExists(zshrc) {
+			if confirmCreateZshrc(cmd, zshrc, assumeYes) {
+				changed, err := ensureRCBlock(zshrc, envFile)
+				if err != nil {
+					return err
+				}
+				if changed {
+					cmd.Printf("Created %s (sources %s)\n", zshrc, envFile)
+				}
+			} else {
+				cmd.Printf("Left %s alone — wire zsh yourself with:  . %q\n", zshrc, envFile)
+			}
+		}
+	}
+
 	// fish does not use POSIX rc files; it auto-sources conf.d.
 	if dirExists(filepath.Join(home, ".config", "fish")) {
 		p := fishConfPath(home)
@@ -256,18 +290,48 @@ func modifyPath(cmd *cobra.Command, home, envFile, dir string) error {
 	return nil
 }
 
-// rcCandidates is the full set of shell rc files twip may touch, in install
-// order. zsh honors $ZDOTDIR.
+// rcCandidates is the full set of shell rc files twip may touch, in install order.
 func rcCandidates(home string) []string {
-	zdot := os.Getenv("ZDOTDIR")
-	if zdot == "" {
-		zdot = home
-	}
 	return []string{
 		filepath.Join(home, ".bashrc"),
 		filepath.Join(home, ".bash_profile"),
 		filepath.Join(home, ".profile"),
-		filepath.Join(zdot, ".zshrc"),
+		zshrcPath(home),
+	}
+}
+
+// zshrcPath is the user's .zshrc, honoring $ZDOTDIR (zsh's config home).
+func zshrcPath(home string) string {
+	zdot := os.Getenv("ZDOTDIR")
+	if zdot == "" {
+		zdot = home
+	}
+	return filepath.Join(zdot, ".zshrc")
+}
+
+// loginShellIsZsh reports whether the user's login shell ($SHELL) looks like zsh.
+func loginShellIsZsh() bool {
+	return strings.Contains(filepath.Base(os.Getenv("SHELL")), "zsh")
+}
+
+// confirmCreateZshrc warns that a zsh login shell won't see twip's PATH wiring
+// without a ~/.zshrc, then asks whether to create one. --yes (assumeYes) returns
+// true without prompting; EOF / non-"yes" input returns false, so a non-interactive
+// install skips the file rather than hanging.
+func confirmCreateZshrc(cmd *cobra.Command, zshrc string, assumeYes bool) bool {
+	cmd.Printf("\nWARNING: your login shell is zsh but %s does not exist.\n", zshrc)
+	cmd.Println("zsh does not read ~/.profile, so twip's PATH wiring won't take effect there.")
+	if assumeYes {
+		cmd.Println("Creating it (--yes given).")
+		return true
+	}
+	cmd.Printf("Create %s and source twip's env from it? [y/N] ", zshrc)
+	line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -137,6 +137,7 @@ func TestRCBlockRoundTrip(t *testing.T) {
 func TestInstallUninstall_EndToEnd(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/bash") // deterministic: don't trigger the zsh prompt
 	// An existing .bashrc gets edited; .zshrc is absent and must stay absent.
 	if err := os.WriteFile(filepath.Join(home, ".bashrc"), []byte("# bash\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -225,6 +226,60 @@ func TestInstall_NoModifyPath(t *testing.T) {
 	if fileExists(filepath.Join(home, ".profile")) {
 		t.Error("--no-modify-path must not create .profile")
 	}
+}
+
+// TestInstall_ZshNoZshrc covers the macOS gap: a zsh login shell with no ~/.zshrc.
+// install must WARN and only create the file with consent (prompt "y", or --yes);
+// EOF input declines so a non-interactive install never hangs or surprises.
+func TestInstall_ZshNoZshrc(t *testing.T) {
+	zshrcOf := func(home string) string { return filepath.Join(home, ".zshrc") }
+
+	runInstall := func(t *testing.T, stdin string, args ...string) string {
+		t.Helper()
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("SHELL", "/bin/zsh")
+		t.Setenv("ZDOTDIR", "")
+		root := newRootCmd()
+		var buf bytes.Buffer
+		root.SetArgs(append([]string{"install"}, args...))
+		root.SetIn(strings.NewReader(stdin))
+		root.SetOut(&buf)
+		root.SetErr(&buf)
+		if err := root.Execute(); err != nil {
+			t.Fatalf("install: %v\n%s", err, buf.String())
+		}
+		t.Cleanup(func() {}) // home is a TempDir; auto-removed
+		return home
+	}
+
+	t.Run("decline on EOF leaves no zshrc", func(t *testing.T) {
+		home := runInstall(t, "") // empty stdin -> EOF -> decline
+		if fileExists(zshrcOf(home)) {
+			t.Error("declined prompt should not create ~/.zshrc")
+		}
+		if !fileExists(filepath.Join(home, ".twip", "bin", "git")) {
+			t.Error("the rest of the install should still happen")
+		}
+	})
+
+	t.Run("confirm with y creates and wires zshrc", func(t *testing.T) {
+		home := runInstall(t, "y\n")
+		zshrc := zshrcOf(home)
+		if !fileExists(zshrc) {
+			t.Fatal("confirming should create ~/.zshrc")
+		}
+		if data, _ := os.ReadFile(zshrc); !strings.Contains(string(data), rcBlockStart) {
+			t.Errorf("created ~/.zshrc not wired:\n%s", data)
+		}
+	})
+
+	t.Run("--yes creates without a prompt", func(t *testing.T) {
+		home := runInstall(t, "", "--yes")
+		if !fileExists(zshrcOf(home)) {
+			t.Error("--yes should create ~/.zshrc")
+		}
+	})
 }
 
 func TestCheckPrePush(t *testing.T) {

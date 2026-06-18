@@ -60,9 +60,32 @@ func foreignHookSnippet(twipPath string, enforce bool) string {
 type SyncSetup struct {
 	HookStatus    string // "installed" | "updated" | "foreign" (left a non-twip hook untouched)
 	HookPath      string
-	HookSnippet   string   // for a foreign hook: the line(s) to add by hand
+	HookSnippet   string   // for a foreign hook with no known manager: the raw line(s) to add
+	HookManager   string   // detected hook manager for a foreign hook: "lefthook"|"husky"|"pre-commit"|""
+	Enforce       bool     // whether --enforce was requested (the gate should be wired in)
 	Remote        string   // remote whose fetch refspec is configured ("" if no remote yet)
 	AddedRefspecs []string // refspecs added this run (empty if already present)
+}
+
+// detectHookManager guesses which hook manager owns this repo's git hooks (by its
+// config file/dir in the repo root), so a foreign-hook message can give tailored
+// instructions. Best-effort: an unknown/absent manager yields "" (generic guidance).
+func detectHookManager(repoRoot string) string {
+	has := func(rel string) bool {
+		_, err := os.Stat(filepath.Join(repoRoot, rel))
+		return err == nil
+	}
+	switch {
+	case has("lefthook.yml") || has("lefthook.yaml") || has(".lefthook.yml") ||
+		has(".lefthook.yaml") || has("lefthook.toml") || has(".lefthook.toml") ||
+		has("lefthook.json") || has(".lefthook.json"):
+		return "lefthook"
+	case has(".husky"):
+		return "husky"
+	case has(".pre-commit-config.yaml") || has(".pre-commit-config.yml"):
+		return "pre-commit"
+	}
+	return ""
 }
 
 // InstallSync wires up push (pre-push hook) and fetch (refspec on the remote).
@@ -72,6 +95,7 @@ type SyncSetup struct {
 // refspecs.
 func (r *Recorder) InstallSync(ctx context.Context, twipPath string, enforce bool) (SyncSetup, error) {
 	var s SyncSetup
+	s.Enforce = enforce
 	hookPath, err := r.prePushHookPath(ctx)
 	if err != nil {
 		return s, err
@@ -82,6 +106,7 @@ func (r *Recorder) InstallSync(ctx context.Context, twipPath string, enforce boo
 	switch {
 	case readErr == nil && !strings.Contains(string(existing), prePushMarker):
 		s.HookStatus = "foreign" // someone else's hook — don't touch it
+		s.HookManager = detectHookManager(r.RepoRoot)
 		s.HookSnippet = foreignHookSnippet(twipPath, enforce)
 	default:
 		if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
@@ -118,14 +143,16 @@ func (r *Recorder) SyncPush(ctx context.Context, remote string) error {
 	if remote == "" || os.Getenv(envSyncPush) == "1" {
 		return nil
 	}
+	// --no-verify so this internal mirror push never fires the pre-push hook: it
+	// would otherwise re-run a hook manager's other pre-push jobs (tests, lint, …) a
+	// second time on every push. envSyncPush is belt-and-suspenders (and stops the
+	// shim from recording this push); gitutil.Run also forces TWIP_SHIM_ACTIVE=1.
 	args := []string{
-		"push", "--quiet", remote,
+		"push", "--no-verify", "--quiet", remote,
 		JournalRefPrefix + "*:" + JournalRefPrefix + "*",
 		PinRefPrefix + "*:" + PinRefPrefix + "*",
 		StashRefPrefix + "*:" + StashRefPrefix + "*",
 	}
-	// envSyncPush keeps the shim (and any re-fired pre-push hook) from recording or
-	// recursing on this inner push. gitutil.Run also forces TWIP_SHIM_ACTIVE=1.
 	_, err := gitutil.Run(ctx, r.RepoRoot, []string{envSyncPush + "=1"}, nil, args...)
 	return err
 }
