@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -127,6 +128,8 @@ func capture(ctx context.Context, rec *store.Recorder, repoRoot, op string, args
 		// Snapshot the pre-destruction worktree. Objects persist after the op runs.
 		if s, err := snapshot.Capture(ctx, repoRoot); err == nil {
 			snap = s
+		} else if gitutil.IsWritesBlocked(err) {
+			noteWritesBlocked()
 		} else {
 			fmt.Fprintln(os.Stderr, "twip git-shim: pre-op snapshot failed:", err)
 		}
@@ -153,9 +156,28 @@ func capture(ctx context.Context, rec *store.Recorder, repoRoot, op string, args
 		ExitCode: exitCode, Dirty: dirty, Stashed: stashed,
 	}
 	if _, err := rec.AppendGitOp(ctx, op2, snap, gitutil.WorktreeName(ctx, repoRoot), time.Now()); err != nil {
-		fmt.Fprintln(os.Stderr, "twip git-shim: record failed:", err)
+		if gitutil.IsWritesBlocked(err) {
+			noteWritesBlocked()
+		} else {
+			fmt.Fprintln(os.Stderr, "twip git-shim: record failed:", err)
+		}
 	}
 	os.Exit(exitCode)
+}
+
+// writesBlockedOnce guards noteWritesBlocked so a single git invocation that hits
+// the denial at more than one write site (pre-op snapshot, then the journal
+// append) reports it only once.
+var writesBlockedOnce sync.Once
+
+// noteWritesBlocked prints, at most once per process, a concise non-alarming note
+// that journaling was skipped because the environment denied a git write (see
+// gitutil.IsWritesBlocked). It must not read like a git failure to an agent
+// scanning stderr — the user's git command already ran and is unaffected.
+func noteWritesBlocked() {
+	writesBlockedOnce.Do(func() {
+		fmt.Fprintln(os.Stderr, "twip: journaling skipped — this environment denied a git write (e.g. a sandboxed read-only command); your git command ran normally")
+	})
 }
 
 func worktreeDirty(ctx context.Context, repoRoot string) bool {

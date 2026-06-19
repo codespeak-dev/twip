@@ -18,6 +18,22 @@ import (
 // every path in a tree as added.
 const EmptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
+// IsWritesBlocked reports whether err is the environment denying a git object or
+// ref write — EPERM ("Operation not permitted") or EACCES ("Permission denied")
+// raised by a child git. This is the signature of a per-command sandbox that
+// granted a command read-only access (e.g. an agent running `git remote -v`):
+// the user's git ran fine, but twip's hidden journal write into .git/objects was
+// denied. Callers treat it as "journaling unavailable in this context" and
+// degrade quietly instead of surfacing a scary error — git itself was unaffected.
+func IsWritesBlocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "operation not permitted") ||
+		strings.Contains(s, "permission denied")
+}
+
 // Run executes git in dir with the given args, feeding stdin (may be nil) and
 // extra environment (appended to the inherited env; may be nil). It returns
 // stdout bytes, or an error that includes stderr.

@@ -25,7 +25,11 @@ func newHookCmd() *cobra.Command {
 			// A hook must never break the agent: report failures to stderr (the
 			// audit later catches any resulting gap) but always exit 0.
 			if err := runHook(cmd.Context(), args[0], args[1], cmd.InOrStdin()); err != nil {
-				fmt.Fprintln(os.Stderr, "twip hook:", err)
+				if gitutil.IsWritesBlocked(err) {
+					noteWritesBlocked()
+				} else {
+					fmt.Fprintln(os.Stderr, "twip hook:", err)
+				}
 			}
 			return nil
 		},
