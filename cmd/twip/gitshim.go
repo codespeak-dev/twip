@@ -181,7 +181,12 @@ func noteWritesBlocked() {
 }
 
 func worktreeDirty(ctx context.Context, repoRoot string) bool {
-	out, err := gitutil.Out(ctx, repoRoot, "status", "--porcelain")
+	// --no-optional-locks: status otherwise opportunistically refreshes and
+	// rewrites the real index, taking .git/index.lock to do so. twip runs this
+	// before every recorded git op, so without the flag an interrupted/disk-full
+	// dirty check can orphan index.lock and block the user's next commit. A pure
+	// read can't create or contend for the lock.
+	out, err := gitutil.Out(ctx, repoRoot, "--no-optional-locks", "status", "--porcelain")
 	return err == nil && strings.TrimSpace(out) != ""
 }
 
