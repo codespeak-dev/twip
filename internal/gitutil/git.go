@@ -48,7 +48,7 @@ func IsWritesBlocked(err error) bool {
 // lock. So we force the shim's pass-through guard on for every internal call;
 // only the user's/agent's own git commands should ever be recorded.
 func Run(ctx context.Context, dir string, env []string, stdin []byte, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, "git", gcOff(args)...)
 	cmd.Dir = dir
 	cmd.Env = append(cmd.Environ(), "TWIP_SHIM_ACTIVE=1")
 	if len(env) > 0 {
@@ -64,6 +64,16 @@ func Run(ctx context.Context, dir string, env []string, stdin []byte, args ...st
 		return out.Bytes(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errBuf.String()))
 	}
 	return out.Bytes(), nil
+}
+
+// gcOff prepends `-c gc.auto=0` to a git arg vector. twip's plumbing creates many
+// loose objects and ref updates per recorded event; without this, git's auto-gc
+// can fire from one of those internal calls and hold ref locks for seconds on a
+// large repo, stalling the journal CAS loop (or exhausting its retries). The
+// user's own git commands run through the real git, not this, so they still
+// auto-gc normally and keep loose-object growth in check.
+func gcOff(args []string) []string {
+	return append([]string{"-c", "gc.auto=0"}, args...)
 }
 
 // Out runs git and returns trimmed stdout as a string.
@@ -202,7 +212,7 @@ type BatchReader struct {
 
 // NewBatchReader starts the cat-file process. Close it to release the process.
 func NewBatchReader(ctx context.Context, repoRoot string) (*BatchReader, error) {
-	cmd := exec.CommandContext(ctx, "git", "cat-file", "--batch")
+	cmd := exec.CommandContext(ctx, "git", gcOff([]string{"cat-file", "--batch"})...)
 	cmd.Dir = repoRoot
 	cmd.Env = append(cmd.Environ(), "TWIP_SHIM_ACTIVE=1")
 	stdin, err := cmd.StdinPipe()
