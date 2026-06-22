@@ -144,19 +144,10 @@ func (r *Recorder) Transcript(ctx context.Context, commit string) ([]byte, error
 	return b, nil
 }
 
-// loadJournalNewestFirst returns this clone's own journal events, tip-first, for
-// the prior-state back-scan.
-func (r *Recorder) loadJournalNewestFirst(ctx context.Context) ([]EventCommit, error) {
-	cloneID, err := r.CloneID(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return r.eventsForRef(ctx, journalRef(cloneID), false)
-}
-
-// eventsForRef loads the events on one journal ref. reverse=true yields append
-// order (oldest first); reverse=false yields tip first.
-func (r *Recorder) eventsForRef(ctx context.Context, ref string, reverse bool) ([]EventCommit, error) {
+// commitShas lists the commit shas on a journal ref. reverse=true yields append
+// order (oldest first); reverse=false yields tip first. A missing ref yields no
+// shas (and no error) — the journal simply has no events yet.
+func (r *Recorder) commitShas(ctx context.Context, ref string, reverse bool) ([]string, error) {
 	args := []string{"rev-list"}
 	if reverse {
 		args = append(args, "--reverse")
@@ -166,10 +157,28 @@ func (r *Recorder) eventsForRef(ctx context.Context, ref string, reverse bool) (
 	if err != nil {
 		return nil, nil //nolint:nilerr // missing ref => no events yet
 	}
+	return strings.Fields(string(out)), nil
+}
+
+// eventsForRef loads every event on one journal ref. reverse=true yields append
+// order (oldest first); reverse=false yields tip first. All of a ref's event.json
+// blobs are read through one `git cat-file --batch` process, so the cost is one
+// process spawn rather than one per event.
+func (r *Recorder) eventsForRef(ctx context.Context, ref string, reverse bool) ([]EventCommit, error) {
+	commits, err := r.commitShas(ctx, ref, reverse)
+	if err != nil || len(commits) == 0 {
+		return nil, err
+	}
+	br, err := gitutil.NewBatchReader(ctx, r.RepoRoot)
+	if err != nil {
+		return nil, err
+	}
+	defer br.Close()
+
 	clone, _ := cloneIDFromRef(ref)
-	var events []EventCommit
-	for _, commit := range strings.Fields(string(out)) {
-		rec, err := r.readRecord(ctx, commit)
+	events := make([]EventCommit, 0, len(commits))
+	for _, commit := range commits {
+		rec, err := r.readRecordBatch(br, commit)
 		if err != nil {
 			return nil, err
 		}
@@ -196,11 +205,32 @@ func (r *Recorder) CloneAuthor(ctx context.Context, clone string) string {
 	return strings.TrimSpace(name)
 }
 
+// readRecord reads one journal commit's event.json with a single-object
+// cat-file. eventsForRef and PriorSessionState read many records and use a
+// BatchReader instead; this stays for the occasional one-off lookup.
 func (r *Recorder) readRecord(ctx context.Context, commit string) (Record, error) {
 	data, err := gitutil.CatFile(ctx, r.RepoRoot, commit+":meta/event.json")
 	if err != nil {
 		return Record{}, fmt.Errorf("read %s event.json: %w", shortSHA(commit), err)
 	}
+	return parseRecord(commit, data)
+}
+
+// readRecordBatch reads one journal commit's event.json through an open
+// BatchReader. A journal commit always carries meta/event.json, so a missing
+// object is corruption, surfaced as an error.
+func (r *Recorder) readRecordBatch(br *gitutil.BatchReader, commit string) (Record, error) {
+	data, found, err := br.Read(commit + ":meta/event.json")
+	if err != nil {
+		return Record{}, fmt.Errorf("read %s event.json: %w", shortSHA(commit), err)
+	}
+	if !found {
+		return Record{}, fmt.Errorf("read %s event.json: object missing", shortSHA(commit))
+	}
+	return parseRecord(commit, data)
+}
+
+func parseRecord(commit string, data []byte) (Record, error) {
 	var rec Record
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return Record{}, fmt.Errorf("parse %s event.json: %w", shortSHA(commit), err)

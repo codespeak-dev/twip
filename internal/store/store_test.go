@@ -13,7 +13,7 @@ import (
 	"github.com/codespeak-dev/twip/internal/snapshot"
 )
 
-func initRepo(t *testing.T) string {
+func initRepo(t testing.TB) string {
 	t.Helper()
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -37,7 +37,7 @@ func initRepo(t *testing.T) string {
 	return dir
 }
 
-func writeFile(t *testing.T, dir, rel, content string) {
+func writeFile(t testing.TB, dir, rel, content string) {
 	t.Helper()
 	p := filepath.Join(dir, rel)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -156,6 +156,53 @@ func TestAppend_ChainsAndIsReadable(t *testing.T) {
 	if prior2.Cursor.Main != 1 || prior2.Seq != 2 {
 		t.Errorf("round-tripped prior = %+v, want cursor.Main=1 seq=2", prior2)
 	}
+}
+
+// BenchmarkPriorSessionState exercises the SessionStart hot path on a journal of
+// many events. "tip" is the resume case (the session's newest event is at the
+// tip → early-exit reads ~1 record); "absent" is the worst case (session id not
+// in this clone's journal → a full tip-to-root walk, still one cat-file process).
+func BenchmarkPriorSessionState(b *testing.B) {
+	ctx := context.Background()
+	repo := initRepo(b)
+	rec := New(repo)
+
+	const old = 500
+	oldSID := "00000000-0000-0000-0000-000000000000"
+	tipSID := "11111111-1111-1111-1111-111111111111"
+	for i := 0; i < old; i++ {
+		snap, err := snapshot.Capture(ctx, repo)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ev := &agent.Event{SessionID: oldSID, Kind: agent.KindToolUse, Cursor: agent.Cursor{Main: i}}
+		if _, err := rec.Append(ctx, ev, snap, "main", i, time.Unix(int64(1000+i), 0)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	snap, err := snapshot.Capture(ctx, repo)
+	if err != nil {
+		b.Fatal(err)
+	}
+	ev := &agent.Event{SessionID: tipSID, Kind: agent.KindSessionStart, Cursor: agent.Cursor{Main: old}}
+	if _, err := rec.Append(ctx, ev, snap, "main", old, time.Unix(9000, 0)); err != nil {
+		b.Fatal(err)
+	}
+
+	b.Run("tip", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if _, err := rec.PriorSessionState(ctx, tipSID); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("absent", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if _, err := rec.PriorSessionState(ctx, "deadbeef-0000-0000-0000-000000000000"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func TestSnapshot_DedupesUnchangedTree(t *testing.T) {

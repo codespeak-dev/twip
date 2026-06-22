@@ -6,11 +6,14 @@
 package gitutil
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -180,6 +183,82 @@ func CatFile(ctx context.Context, repoRoot, spec string) ([]byte, error) {
 func ObjectExists(ctx context.Context, repoRoot, spec string) bool {
 	_, err := Run(ctx, repoRoot, nil, nil, "cat-file", "-e", spec)
 	return err == nil
+}
+
+// BatchReader reads object contents through a single long-lived
+// `git cat-file --batch` process, so reading N objects costs one process spawn
+// instead of N. Specs are sent one at a time and the response read back before
+// the next is sent (request/response), so a caller scanning tip-first can stop
+// early — via Close — without paying to read the rest of the journal. It is not
+// safe for concurrent use; drive it from one goroutine and Close when done.
+//
+// Like the rest of gitutil it forces TWIP_SHIM_ACTIVE=1 so the installed git
+// shim passes the call straight through instead of trying to record it.
+type BatchReader struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+}
+
+// NewBatchReader starts the cat-file process. Close it to release the process.
+func NewBatchReader(ctx context.Context, repoRoot string) (*BatchReader, error) {
+	cmd := exec.CommandContext(ctx, "git", "cat-file", "--batch")
+	cmd.Dir = repoRoot
+	cmd.Env = append(cmd.Environ(), "TWIP_SHIM_ACTIVE=1")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("cat-file --batch stdin: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("cat-file --batch stdout: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start cat-file --batch: %w", err)
+	}
+	return &BatchReader{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
+}
+
+// Read returns the bytes of one object spec (e.g. "<sha>:meta/event.json").
+// found is false (with nil error) when git reports the object missing.
+func (b *BatchReader) Read(spec string) (data []byte, found bool, err error) {
+	if _, err := io.WriteString(b.stdin, spec+"\n"); err != nil {
+		return nil, false, fmt.Errorf("cat-file --batch write %q: %w", spec, err)
+	}
+	// Per-object header is "<oid> <type> <size>"; a missing object yields
+	// "<spec> missing".
+	header, err := b.stdout.ReadString('\n')
+	if err != nil {
+		return nil, false, fmt.Errorf("cat-file --batch header for %q: %w", spec, err)
+	}
+	fields := strings.Fields(header)
+	if len(fields) >= 2 && fields[len(fields)-1] == "missing" {
+		return nil, false, nil
+	}
+	if len(fields) != 3 {
+		return nil, false, fmt.Errorf("cat-file --batch: unexpected header %q", strings.TrimSpace(header))
+	}
+	size, err := strconv.Atoi(fields[2])
+	if err != nil {
+		return nil, false, fmt.Errorf("cat-file --batch: bad size %q", fields[2])
+	}
+	data = make([]byte, size)
+	if _, err := io.ReadFull(b.stdout, data); err != nil {
+		return nil, false, fmt.Errorf("cat-file --batch body for %q: %w", spec, err)
+	}
+	// git writes a trailing newline after the contents; consume it.
+	if _, err := b.stdout.Discard(1); err != nil {
+		return nil, false, fmt.Errorf("cat-file --batch trailer for %q: %w", spec, err)
+	}
+	return data, true, nil
+}
+
+// Close ends the cat-file process. Closing stdin sends it EOF, which it treats
+// as end-of-input and exits; Wait then reaps it. Safe to call after an early
+// stop (the request/response protocol leaves no unread output pending).
+func (b *BatchReader) Close() error {
+	_ = b.stdin.Close()
+	return b.cmd.Wait()
 }
 
 // StashEntries returns the commit shas of the current stash stack (newest first),

@@ -172,20 +172,42 @@ func (r *Recorder) Lock(ctx context.Context, key string) (release func(), err er
 
 // PriorSessionState back-scans this clone's journal for the most recent event of
 // the session and returns its cursor + seq. Zero value if the session is new.
+//
+// It walks the journal tip-first and stops at the first event matching the
+// session — for a resumed or active session that event is at (or near) the tip,
+// so the scan reads a handful of records, not the whole journal. Records are
+// read through one `git cat-file --batch` process, so even the worst case (a
+// session id absent from this clone's journal, which forces a full walk) is one
+// process spawn rather than one per event. Both matter on the SessionStart hook,
+// which Claude Code blocks on before the session becomes interactive.
 func (r *Recorder) PriorSessionState(ctx context.Context, sessionID string) (SessionState, error) {
-	events, err := r.loadJournalNewestFirst(ctx)
+	cloneID, err := r.CloneID(ctx)
 	if err != nil {
 		return SessionState{}, err
 	}
-	for _, ec := range events {
-		if ec.Record.SessionID != sessionID {
+	commits, err := r.commitShas(ctx, journalRef(cloneID), false) // tip-first
+	if err != nil || len(commits) == 0 {
+		return SessionState{}, err
+	}
+	br, err := gitutil.NewBatchReader(ctx, r.RepoRoot)
+	if err != nil {
+		return SessionState{}, err
+	}
+	defer br.Close()
+
+	for _, commit := range commits {
+		rec, err := r.readRecordBatch(br, commit)
+		if err != nil {
+			return SessionState{}, err
+		}
+		if rec.SessionID != sessionID {
 			continue
 		}
-		st := SessionState{Seq: ec.Record.Seq, Tree: ec.Record.WorktreeTree}
-		if ec.Record.Cursor != nil {
-			st.Cursor = *ec.Record.Cursor
+		st := SessionState{Seq: rec.Seq, Tree: rec.WorktreeTree}
+		if rec.Cursor != nil {
+			st.Cursor = *rec.Cursor
 		}
-		return st, nil
+		return st, nil // early-exit at the session's newest event
 	}
 	return SessionState{}, nil
 }
