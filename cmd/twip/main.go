@@ -11,6 +11,7 @@ import (
 
 	// Register supported agents.
 	_ "github.com/codespeak-dev/twip/internal/agent/claudecode"
+	_ "github.com/codespeak-dev/twip/internal/agent/codex"
 )
 
 func main() {

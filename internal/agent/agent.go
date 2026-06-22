@@ -35,9 +35,10 @@ type Quality string
 
 const (
 	QualityOK           Quality = "ok"
-	QualityFlushTimeout Quality = "flush_timeout" // sentinel/quiescence not reached before timeout
-	QualityStaleSkip    Quality = "stale_skip"    // transcript untouched for a while; agent likely gone
-	QualityTruncated    Quality = "truncated"     // read ended early; next turn self-heals (not SessionEnd)
+	QualityFlushTimeout          Quality = "flush_timeout"          // sentinel/quiescence not reached before timeout
+	QualityStaleSkip             Quality = "stale_skip"             // transcript untouched for a while; agent likely gone
+	QualityTruncated             Quality = "truncated"              // read ended early; next turn self-heals (not SessionEnd)
+	QualityTranscriptUnavailable Quality = "transcript_unavailable" // hook payload carried no usable transcript path
 )
 
 // Delta is a slice of transcript bytes captured for one event: the raw lines in

@@ -10,11 +10,11 @@ func newInitCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "init",
 		Short: "Enable twip recording in this repo (agent hooks, journal, sync)",
-		Long: "Enables twip for this repo: installs the chosen agent's hooks into " +
-			"<repo>/.claude/settings.json so twip records each session turn (hooks twip " +
-			"does not own are preserved), creates this clone's journal id (the marker the " +
-			"git shim gates on), installs a best-effort pre-push hook that mirrors the " +
-			"journal on push, and adds a fetch refspec for teammates' journals.\n\n" +
+		Long: "Enables twip for this repo: installs the chosen agent's hooks into its " +
+			"config directory so twip records each session turn (hooks twip does not own " +
+			"are preserved), creates this clone's journal id (the marker the git shim " +
+			"gates on), installs a best-effort pre-push hook that mirrors the journal on " +
+			"push, and adds a fetch refspec for teammates' journals.\n\n" +
 			"With --enforce it also gates `git push`, blocking pushes that aren't being " +
 			"recorded. If a hook manager already owns the pre-push hook (lefthook, husky, " +
 			"pre-commit), twip leaves it untouched and prints the config to wire in instead.",
@@ -43,7 +43,10 @@ func newInitCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cmd.Printf("Installed %d %s hook(s) in %s/.claude/settings.json\n", n, agentName, root)
+			cmd.Printf("Installed %d %s hook(s).\n", n, agentName)
+			if agentName == "codex" {
+				cmd.Println("Note: Codex requires you to trust the .codex/ project layer and may prompt you to approve hooks with `/hooks`.")
+			}
 			cmd.Printf("Events will be recorded to refs/twip/journal/%s in this repo.\n", cloneID)
 
 			// Wire up sync (push via pre-push hook, fetch via refspec). The bundled

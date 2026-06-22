@@ -1,99 +1,10 @@
 package claudecode
 
-import (
-	"bufio"
-	"errors"
-	"io"
-	"os"
-)
+import "github.com/codespeak-dev/twip/internal/agent"
 
-// countLines returns the number of JSONL lines in a transcript file. A trailing
-// segment without a newline counts as a line (Claude Code may not have flushed
-// the final newline yet). Returns 0 if the file is absent or empty. Uses
-// bufio.ReadBytes so arbitrarily long lines (e.g. base64 images) are handled.
-func countLines(path string) (int, error) {
-	if path == "" {
-		return 0, nil
-	}
-	f, err := os.Open(path) //nolint:gosec // path comes from the agent hook payload
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	defer f.Close()
+// countLines, deltaFrom, and readDelta delegate to the shared agent package
+// utilities so both claudecode and codex use a single implementation.
 
-	r := bufio.NewReader(f)
-	n := 0
-	for {
-		line, err := r.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF {
-				if len(line) > 0 {
-					n++ // final line without trailing newline
-				}
-				return n, nil
-			}
-			return 0, err
-		}
-		n++
-	}
-}
-
-// deltaFrom returns the raw bytes of all lines after the first `fromLine` lines,
-// together with the new total line count. Line offsets are counts (not byte
-// positions), so reading "from N" skips the first N lines and returns lines
-// (N, total]. Exact bytes are preserved (including the trailing partial line, if
-// any) so the stored delta is a faithful slice of the transcript. truncated
-// reports whether fromLine pointed past the data we found (a stale/short read);
-// callers may flag it, knowing the next turn's delta self-heals.
-func deltaFrom(data []byte, fromLine int) (delta []byte, total int, truncated bool) {
-	if fromLine < 0 {
-		fromLine = 0
-	}
-	// start = byte offset where line index `fromLine` begins (0-indexed lines).
-	start := len(data) // default: nothing new
-	if fromLine == 0 {
-		start = 0
-	}
-	newlines := 0
-	for i := 0; i < len(data); i++ {
-		if data[i] == '\n' {
-			newlines++
-			if newlines == fromLine {
-				start = i + 1
-			}
-		}
-	}
-	total = newlines
-	if len(data) > 0 && data[len(data)-1] != '\n' {
-		total++ // trailing partial line
-	}
-	// If fromLine asked to skip more complete lines than exist, there is no new
-	// data and we never set `start`; that is a short/stale baseline, not loss.
-	if fromLine > newlines {
-		truncated = true
-		start = len(data)
-	}
-	if start > len(data) {
-		start = len(data)
-	}
-	return data[start:], total, truncated
-}
-
-// readDelta reads the transcript file and returns the delta after `fromLine`.
-func readDelta(path string, fromLine int) (delta []byte, total int, truncated bool, err error) {
-	if path == "" {
-		return nil, 0, false, nil
-	}
-	data, err := os.ReadFile(path) //nolint:gosec // path comes from the agent hook payload
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, 0, false, nil
-		}
-		return nil, 0, false, err
-	}
-	d, total, truncated := deltaFrom(data, fromLine)
-	return d, total, truncated, nil
-}
+func countLines(path string) (int, error)                                              { return agent.CountLines(path) }
+func deltaFrom(data []byte, fromLine int) ([]byte, int, bool)                         { return agent.DeltaFrom(data, fromLine) }
+func readDelta(path string, fromLine int) ([]byte, int, bool, error)                  { return agent.ReadDelta(path, fromLine) }

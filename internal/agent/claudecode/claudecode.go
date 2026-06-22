@@ -264,7 +264,7 @@ func (a *Agent) parsePostTask(stdin io.Reader, prior agent.Cursor) (*agent.Event
 	if id == "" {
 		return ev, nil // Task that spawned no recorded subagent
 	}
-	if err := validateAgentID(id); err != nil {
+	if err := agent.ValidateAgentID(id); err != nil {
 		return nil, err
 	}
 	path := sidechainPath(raw.TranscriptPath, id)
