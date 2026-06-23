@@ -92,6 +92,15 @@ type FileChange struct {
 	InHead bool   `json:"inHead"`
 }
 
+// SidechainDetail holds the content of one subagent's transcript delta.
+type SidechainDetail struct {
+	ID         string `json:"id"`
+	From       int    `json:"from"`
+	To         int    `json:"to"`
+	Quality    string `json:"quality,omitempty"`
+	Transcript string `json:"transcript"`
+}
+
 // EventDetail is the full view of a single recorded event.
 type EventDetail struct {
 	Entry
@@ -101,6 +110,7 @@ type EventDetail struct {
 	Transcript     string             `json:"transcript"`
 	TranscriptFrom int                `json:"transcriptFrom"`
 	TranscriptTo   int                `json:"transcriptTo"`
+	Sidechains     []SidechainDetail  `json:"sidechains,omitempty"`
 	Changed        []FileChange       `json:"changed"`
 	Files          []string           `json:"files"` // file list of the worktree snapshot
 	WorktreeTree   string             `json:"worktreeTree"`
@@ -150,6 +160,13 @@ func Event(ctx context.Context, repoRoot, commitRef string) (*EventDetail, error
 		if b, _ := rec.Transcript(ctx, cur.Commit); len(b) > 0 {
 			d.Transcript = string(b)
 		}
+	}
+	for _, sc := range r.Sidechains {
+		sd := SidechainDetail{ID: sc.ID, From: sc.From, To: sc.To, Quality: sc.Quality}
+		if b, _ := rec.SidechainTranscript(ctx, cur.Commit, sc.ID); len(b) > 0 {
+			sd.Transcript = string(b)
+		}
+		d.Sidechains = append(d.Sidechains, sd)
 	}
 	if r.WorktreeTree != "" {
 		d.Files = lsTree(ctx, repoRoot, r.WorktreeTree)

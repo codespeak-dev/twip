@@ -144,6 +144,16 @@ func (r *Recorder) Transcript(ctx context.Context, commit string) ([]byte, error
 	return b, nil
 }
 
+// SidechainTranscript returns the stored transcript bytes for one subagent of an
+// event commit, or nil if none was recorded.
+func (r *Recorder) SidechainTranscript(ctx context.Context, commit, agentID string) ([]byte, error) {
+	b, err := gitutil.CatFile(ctx, r.RepoRoot, commit+":meta/sidechains/agent-"+agentID+".jsonl")
+	if err != nil {
+		return nil, nil //nolint:nilerr // absent sidechain is not an error
+	}
+	return b, nil
+}
+
 // commitShas lists the commit shas on a journal ref. reverse=true yields append
 // order (oldest first); reverse=false yields tip first. A missing ref yields no
 // shas (and no error) — the journal simply has no events yet.
