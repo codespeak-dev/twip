@@ -126,6 +126,7 @@ type Record struct {
 	Branch       string          `json:"branch,omitempty"`
 	WorktreeTree string          `json:"worktree_tree,omitempty"`
 	Model        string          `json:"model,omitempty"`
+	ForkedFrom   string          `json:"forked_from,omitempty"` // parent session ID (Codex fork sessions only)
 	Prompt       string          `json:"prompt,omitempty"`
 	Transcript   *DeltaMeta      `json:"transcript,omitempty"`
 	Sidechains   []SidechainMeta `json:"sidechains,omitempty"`
@@ -232,6 +233,7 @@ func (r *Recorder) Append(ctx context.Context, ev *agent.Event, snap snapshot.Sn
 		Branch:       snap.Branch,
 		WorktreeTree: snap.Tree,
 		Model:        ev.Model,
+		ForkedFrom:   ev.ForkedFrom,
 		Prompt:       ev.Prompt,
 		Cursor:       &ev.Cursor,
 	}

@@ -5,10 +5,13 @@
 package codex
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -107,17 +110,24 @@ func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Read
 			return nil, err
 		}
 		cur := prior.Clone()
-		if raw.TranscriptPath != nil {
-			if n, err := agent.CountLines(*raw.TranscriptPath); err == nil {
-				cur.Main = n
-			}
-		}
-		return &agent.Event{
+		ev := &agent.Event{
 			SessionID: raw.SessionID,
 			Kind:      agent.KindSessionStart,
 			Model:     raw.Model,
-			Cursor:    cur,
-		}, nil
+		}
+		if raw.TranscriptPath != nil {
+			// Single read: derive line count, preamble bytes, and fork parent ID
+			// together to avoid a race between separate CountLines and ReadDelta calls.
+			data, _ := os.ReadFile(*raw.TranscriptPath) //nolint:gosec
+			preamble, total, _ := agent.DeltaFrom(data, 0)
+			cur.Main = total
+			if forkedFrom := forkParent(data); forkedFrom != "" {
+				ev.ForkedFrom = forkedFrom
+				ev.Transcript = agent.Delta{Bytes: preamble, From: 0, To: total, Quality: agent.QualityOK}
+			}
+		}
+		ev.Cursor = cur
+		return ev, nil
 
 	case hookUserPrompt:
 		raw, err := parseStdin[userPromptRaw](stdin)
@@ -143,6 +153,27 @@ func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Read
 	default:
 		return nil, nil
 	}
+}
+
+// forkParent reads the first session_meta line from transcript bytes and returns
+// forked_from_id, or "" for a fresh (non-forked) session. Codex forks copy the
+// parent's transcript into the child file as a preamble; the first line
+// identifies whether this is a fork and names the parent session.
+func forkParent(data []byte) string {
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	if !sc.Scan() {
+		return ""
+	}
+	var entry struct {
+		Type    string `json:"type"`
+		Payload struct {
+			ForkedFromID string `json:"forked_from_id"`
+		} `json:"payload"`
+	}
+	if json.Unmarshal(sc.Bytes(), &entry) != nil || entry.Type != "session_meta" {
+		return ""
+	}
+	return entry.Payload.ForkedFromID
 }
 
 // parseStop handles the Stop hook: wait for task_complete flush then read delta.

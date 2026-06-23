@@ -537,6 +537,93 @@ func TestInstallHooks_Idempotent(t *testing.T) {
 	}
 }
 
+// --- Fork preamble ---
+
+// writeForkTranscript creates a transcript file whose first line is a
+// session_meta with forked_from_id, followed by extraLines generic lines.
+func writeForkTranscript(t *testing.T, parentID string, extraLines int) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "transcript-fork-*.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fmt.Fprintf(f, `{"type":"session_meta","payload":{"id":"child","forked_from_id":%s}}`+"\n", jsonStr(parentID))
+	for i := 0; i < extraLines; i++ {
+		fmt.Fprintf(f, `{"line":%d}`+"\n", i)
+	}
+	return f.Name()
+}
+
+func TestSessionStart_ForkPreambleStored(t *testing.T) {
+	parentID := "019ef42d-6d82-75d1-95e9-4bb6200586ed"
+	path := writeForkTranscript(t, parentID, 9) // 1 session_meta + 9 lines = 10 total
+	payload := strings.Replace(sessionStartPayload, `"transcript_path": null`, `"transcript_path": `+jsonStr(path), 1)
+	ev := parse(t, hookSessionStart, payload, agent.Cursor{})
+
+	if ev.ForkedFrom != parentID {
+		t.Errorf("ForkedFrom = %q, want %q", ev.ForkedFrom, parentID)
+	}
+	if ev.Cursor.Main != 10 {
+		t.Errorf("Cursor.Main = %d, want 10", ev.Cursor.Main)
+	}
+	if ev.Transcript.From != 0 || ev.Transcript.To != 10 {
+		t.Errorf("Transcript = {From:%d To:%d}, want {From:0 To:10}", ev.Transcript.From, ev.Transcript.To)
+	}
+	if ev.Transcript.Quality != agent.QualityOK {
+		t.Errorf("Transcript.Quality = %v, want OK", ev.Transcript.Quality)
+	}
+	if len(ev.Transcript.Bytes) == 0 {
+		t.Error("Transcript.Bytes is empty, want preamble content")
+	}
+}
+
+func TestSessionStart_NonForkNoPreamble(t *testing.T) {
+	// A non-fork session must not set ForkedFrom or populate Transcript.
+	path := writeTranscriptLines(t, 5)
+	payload := strings.Replace(sessionStartPayload, `"transcript_path": null`, `"transcript_path": `+jsonStr(path), 1)
+	ev := parse(t, hookSessionStart, payload, agent.Cursor{})
+
+	if ev.ForkedFrom != "" {
+		t.Errorf("ForkedFrom = %q, want empty", ev.ForkedFrom)
+	}
+	if ev.Cursor.Main != 5 {
+		t.Errorf("Cursor.Main = %d, want 5", ev.Cursor.Main)
+	}
+	if len(ev.Transcript.Bytes) != 0 {
+		t.Error("Transcript.Bytes should be empty for non-fork session")
+	}
+}
+
+// --- forkParent ---
+
+func TestForkParent_ReturnsParentID(t *testing.T) {
+	data := []byte(`{"type":"session_meta","payload":{"id":"child","forked_from_id":"parent-123"}}` + "\n")
+	if got := forkParent(data); got != "parent-123" {
+		t.Errorf("forkParent = %q, want parent-123", got)
+	}
+}
+
+func TestForkParent_EmptyForNonFork(t *testing.T) {
+	data := []byte(`{"type":"session_meta","payload":{"id":"child"}}` + "\n")
+	if got := forkParent(data); got != "" {
+		t.Errorf("forkParent = %q, want empty", got)
+	}
+}
+
+func TestForkParent_EmptyForWrongType(t *testing.T) {
+	data := []byte(`{"type":"event_msg","payload":{"forked_from_id":"parent-123"}}` + "\n")
+	if got := forkParent(data); got != "" {
+		t.Errorf("forkParent = %q, want empty (wrong type)", got)
+	}
+}
+
+func TestForkParent_EmptyForNilInput(t *testing.T) {
+	if got := forkParent(nil); got != "" {
+		t.Errorf("forkParent(nil) = %q, want empty", got)
+	}
+}
+
 // --- patchConfigTOML ---
 
 func TestPatchConfigTOML(t *testing.T) {

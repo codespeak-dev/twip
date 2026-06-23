@@ -95,6 +95,7 @@ type EventDetail struct {
 	Entry
 	Head           string             `json:"head"`
 	Model          string             `json:"model"`
+	ForkedFrom     string             `json:"forkedFrom,omitempty"` // parent session ID for Codex fork sessions
 	Transcript     string             `json:"transcript"`
 	TranscriptFrom int                `json:"transcriptFrom"`
 	TranscriptTo   int                `json:"transcriptTo"`
@@ -137,6 +138,7 @@ func Event(ctx context.Context, repoRoot, commitRef string) (*EventDetail, error
 		Entry:        entryFor(cur),
 		Head:         r.Head,
 		Model:        r.Model,
+		ForkedFrom:   r.ForkedFrom,
 		WorktreeTree: r.WorktreeTree,
 		GitOp:        r.GitOp,
 		ToolUse:      r.ToolUse,
