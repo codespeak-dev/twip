@@ -58,7 +58,7 @@ func TestE2E_Codex_RealisticHookSequence(t *testing.T) {
 	// Subagent sidechain written to its own transcript file.
 	side := filepath.Join(t.TempDir(), "agent-tx.jsonl")
 	e2eAppend(t, side, `{"type":"subagent","timestamp":"2026-06-10T00:02:30Z"}`)
-	hook("subagent-stop", `{"session_id":"`+sid+`","turn_id":"`+turn2+`","transcript_path":"` +tr+`","model":"gpt-5.5","agent_id":"`+agentID+`","agent_transcript_path":"`+side+`"}`)
+	hook("subagent-stop", `{"session_id":"`+sid+`","turn_id":"`+turn2+`","transcript_path":"`+tr+`","model":"gpt-5.5","agent_id":"`+agentID+`","agent_transcript_path":"`+side+`"}`)
 
 	e2eAppend(t, tr, `{"type":"assistant","timestamp":"2026-06-10T00:03:00Z"}`)
 	e2eAppend(t, tr, `{"type":"event_msg","payload":{"type":"task_complete","turn_id":"`+turn2+`","completed_at":1782141950}}`)
@@ -75,6 +75,9 @@ func TestE2E_Codex_RealisticHookSequence(t *testing.T) {
 		t.Fatalf("recorded %d events, want 6: %v", len(events), kindsOf(events))
 	}
 	for i, ec := range events {
+		if ec.Record.Agent != "codex" {
+			t.Errorf("event %d agent = %q, want codex", i, ec.Record.Agent)
+		}
 		if ec.Record.Seq != i+1 {
 			t.Errorf("event %d has seq %d, want %d", i, ec.Record.Seq, i+1)
 		}
@@ -294,6 +297,9 @@ func TestE2E_Codex_ToolUseEvents(t *testing.T) {
 		t.Fatalf("recorded %d events, want %d: %v", len(events), len(wantKinds), kindsOf(events))
 	}
 	for i, ec := range events {
+		if ec.Record.Agent != "codex" {
+			t.Errorf("event %d agent = %q, want codex", i, ec.Record.Agent)
+		}
 		if ec.Record.Kind != wantKinds[i] {
 			t.Errorf("event %d kind = %q, want %q", i, ec.Record.Kind, wantKinds[i])
 		}

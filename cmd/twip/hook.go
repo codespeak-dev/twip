@@ -89,6 +89,7 @@ func recordHook(ctx context.Context, repoRoot, agentName, event string, payload 
 	if ev == nil {
 		return nil // hook with no recording significance
 	}
+	ev.Agent = agentName
 	if ev.SessionID == "" {
 		ev.SessionID = sessionID
 	}

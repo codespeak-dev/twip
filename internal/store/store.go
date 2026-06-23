@@ -117,6 +117,7 @@ func (r *Recorder) ArchiveStash(ctx context.Context, shas []string) []string {
 // session events and (later) session-independent ones.
 type Record struct {
 	Schema       int             `json:"schema"`
+	Agent        string          `json:"agent,omitempty"`
 	Kind         string          `json:"kind"`
 	TS           string          `json:"ts"`
 	SessionID    string          `json:"session_id,omitempty"`
@@ -224,6 +225,7 @@ func (r *Recorder) Append(ctx context.Context, ev *agent.Event, snap snapshot.Sn
 
 	rec := Record{
 		Schema:       SchemaVersion,
+		Agent:        ev.Agent,
 		Kind:         string(ev.Kind),
 		TS:           now.UTC().Format(time.RFC3339Nano),
 		SessionID:    ev.SessionID,

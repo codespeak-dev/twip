@@ -130,6 +130,11 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 
 .row1 { display: flex; align-items: baseline; gap: .5rem; }
 .kind { font-weight: 600; font-size: .92em; }
+.agent-chip {
+  font-size: .68em; text-transform: uppercase; letter-spacing: .05em;
+  border: 1px solid var(--line); color: var(--muted); background: var(--panel);
+  border-radius: 1em; padding: .02em .45em;
+}
 .flag { color: var(--c-flag); font-weight: 700; font-size: .78em; }
 .annot { color: var(--muted); font-size: .9em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .annot.code { font-family: var(--mono); }

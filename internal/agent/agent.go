@@ -34,7 +34,7 @@ const (
 type Quality string
 
 const (
-	QualityOK           Quality = "ok"
+	QualityOK                    Quality = "ok"
 	QualityFlushTimeout          Quality = "flush_timeout"          // sentinel/quiescence not reached before timeout
 	QualityStaleSkip             Quality = "stale_skip"             // transcript untouched for a while; agent likely gone
 	QualityTruncated             Quality = "truncated"              // read ended early; next turn self-heals (not SessionEnd)
@@ -92,6 +92,7 @@ type ToolUse struct {
 // fills the agent-specific parts (kind, prompt, transcript bytes, cursor); the
 // core stamps timestamp/HEAD and takes the worktree snapshot.
 type Event struct {
+	Agent      string
 	SessionID  string
 	Kind       Kind
 	Prompt     string // PromptSubmit only

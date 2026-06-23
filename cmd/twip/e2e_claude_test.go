@@ -78,6 +78,9 @@ func TestE2E_RealisticHookSequence(t *testing.T) {
 		t.Fatalf("recorded %d events, want 7", len(events))
 	}
 	for i, ec := range events {
+		if ec.Record.Agent != "claude-code" {
+			t.Errorf("event %d agent = %q, want claude-code", i, ec.Record.Agent)
+		}
 		if ec.Record.Seq != i+1 {
 			t.Errorf("event %d has seq %d, want %d", i, ec.Record.Seq, i+1)
 		}
@@ -191,6 +194,9 @@ func TestE2E_ToolUseEvents(t *testing.T) {
 		t.Fatalf("recorded %d events, want %d: %+v", len(events), len(wantKinds), kindsOf(events))
 	}
 	for i, ec := range events {
+		if ec.Record.Agent != "claude-code" {
+			t.Errorf("event %d agent = %q, want claude-code", i, ec.Record.Agent)
+		}
 		if ec.Record.Kind != wantKinds[i] {
 			t.Errorf("event %d kind = %q, want %q", i, ec.Record.Kind, wantKinds[i])
 		}
