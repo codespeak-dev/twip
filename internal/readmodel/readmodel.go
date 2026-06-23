@@ -173,7 +173,7 @@ func Event(ctx context.Context, repoRoot, commitRef string) (*EventDetail, error
 		base := gitutil.EmptyTree
 		for i := idx - 1; i >= 0; i-- {
 			p := events[i].Record
-			if p.WorktreeID == r.WorktreeID && p.WorktreeTree != "" {
+			if events[i].Clone == cur.Clone && p.WorktreeID == r.WorktreeID && p.WorktreeTree != "" {
 				base = p.WorktreeTree
 				break
 			}
