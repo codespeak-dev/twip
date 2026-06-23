@@ -170,22 +170,30 @@ func (r *Recorder) Lock(ctx context.Context, key string) (release func(), err er
 	return lockKey(ctx, r.RepoRoot, key)
 }
 
+// backScanLimit caps how far back PriorSessionState walks the journal. The session
+// being looked up is at (or near) the tip for an active or freshly-resumed session,
+// so this window is found quickly; the cap exists for the SessionStart miss — a
+// brand-new session id is absent from the journal, which would otherwise force a
+// full walk of every event the clone has ever recorded (a journal that only grows).
+// A resumed session whose newest event is older than this many *other* events is
+// rare; if it happens it re-baselines (a gap the audit surfaces) rather than stalling
+// the SessionStart hook Claude Code blocks on.
+const backScanLimit = 2000
+
 // PriorSessionState back-scans this clone's journal for the most recent event of
 // the session and returns its cursor + seq. Zero value if the session is new.
 //
-// It walks the journal tip-first and stops at the first event matching the
-// session — for a resumed or active session that event is at (or near) the tip,
-// so the scan reads a handful of records, not the whole journal. Records are
-// read through one `git cat-file --batch` process, so even the worst case (a
-// session id absent from this clone's journal, which forces a full walk) is one
-// process spawn rather than one per event. Both matter on the SessionStart hook,
-// which Claude Code blocks on before the session becomes interactive.
+// It walks the journal tip-first (capped at backScanLimit) and stops at the first
+// event matching the session. Records are read through one `git cat-file --batch`
+// process, so the cost is one process spawn rather than one per event. Both the cap
+// and the batching matter on the SessionStart hook, which Claude Code blocks on
+// before the session becomes interactive.
 func (r *Recorder) PriorSessionState(ctx context.Context, sessionID string) (SessionState, error) {
 	cloneID, err := r.CloneID(ctx)
 	if err != nil {
 		return SessionState{}, err
 	}
-	commits, err := r.commitShas(ctx, journalRef(cloneID), false) // tip-first
+	commits, err := r.commitShas(ctx, journalRef(cloneID), false, backScanLimit) // tip-first, bounded
 	if err != nil || len(commits) == 0 {
 		return SessionState{}, err
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/codespeak-dev/twip/internal/gitutil"
@@ -145,10 +146,15 @@ func (r *Recorder) Transcript(ctx context.Context, commit string) ([]byte, error
 }
 
 // commitShas lists the commit shas on a journal ref. reverse=true yields append
-// order (oldest first); reverse=false yields tip first. A missing ref yields no
-// shas (and no error) — the journal simply has no events yet.
-func (r *Recorder) commitShas(ctx context.Context, ref string, reverse bool) ([]string, error) {
+// order (oldest first); reverse=false yields tip first. maxCount>0 caps the walk to
+// that many commits from the tip (rev-list -n), bounding a tip-first back-scan;
+// maxCount<=0 lists them all. A missing ref yields no shas (and no error) — the
+// journal simply has no events yet.
+func (r *Recorder) commitShas(ctx context.Context, ref string, reverse bool, maxCount int) ([]string, error) {
 	args := []string{"rev-list"}
+	if maxCount > 0 {
+		args = append(args, "-n", strconv.Itoa(maxCount))
+	}
 	if reverse {
 		args = append(args, "--reverse")
 	}
@@ -165,7 +171,7 @@ func (r *Recorder) commitShas(ctx context.Context, ref string, reverse bool) ([]
 // blobs are read through one `git cat-file --batch` process, so the cost is one
 // process spawn rather than one per event.
 func (r *Recorder) eventsForRef(ctx context.Context, ref string, reverse bool) ([]EventCommit, error) {
-	commits, err := r.commitShas(ctx, ref, reverse)
+	commits, err := r.commitShas(ctx, ref, reverse, 0) // reads load the whole ref
 	if err != nil || len(commits) == 0 {
 		return nil, err
 	}

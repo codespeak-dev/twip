@@ -1,8 +1,9 @@
 // Package snapshot captures the full worktree as a git tree object with no side
-// effects on HEAD, the index, or the working tree. It uses a throwaway index
-// seeded from the real one (so `git add -A` only re-stats changed files) and
-// `git write-tree`. This captures the literal on-disk state — independent of any
-// transcript-derived change list — so capture never depends on derivation.
+// effects on HEAD, the index, or the working tree. It stages the worktree into a
+// per-worktree index it keeps across calls (so unchanged files hit git's stat
+// fast-path instead of being re-hashed every hook) and runs `git write-tree`. This
+// captures the literal on-disk state — independent of any transcript-derived change
+// list — so capture never depends on derivation.
 package snapshot
 
 import (
@@ -10,9 +11,20 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 
 	"github.com/codespeak-dev/twip/internal/gitutil"
 )
+
+// defaultMaxFileBytes caps the size of an individual file included in a snapshot.
+// Files larger than this are skipped (not hashed), so a stray multi-GB artifact in
+// the worktree can't dominate every hook. Override with TWIP_SNAPSHOT_MAX_FILE_BYTES
+// (0 disables the cap). It bounds per-file hashing cost; it does not change which
+// files git must stat to discover changes (that's what .gitignore is for).
+const defaultMaxFileBytes = 100 << 20 // 100 MiB
 
 // Snapshot is one captured worktree state plus the repo's HEAD at capture time.
 type Snapshot struct {
@@ -31,8 +43,54 @@ func Capture(ctx context.Context, repoRoot string) (Snapshot, error) {
 	return Snapshot{Tree: tree, Head: head, Branch: branch}, nil
 }
 
-// worktreeTree stages the whole worktree into a temporary index and writes a tree.
+// worktreeTree stages the whole worktree and writes a tree. It prefers a persistent
+// per-worktree index (kept under <git-dir>/twip) so files unchanged since the last
+// hook are not re-hashed — the dominant cost on a large or dirty worktree. A
+// per-worktree flock serializes concurrent snapshots (two `git add` against one
+// index would corrupt it). Anything that goes wrong falls back to a throwaway index
+// so capture never fails because of the optimization.
 func worktreeTree(ctx context.Context, repoRoot string) (string, error) {
+	gitDir, err := gitutil.GitDir(ctx, repoRoot)
+	if err != nil {
+		// No resolvable git dir: there's no stable home for a persistent index, so
+		// use a throwaway one (the original behavior).
+		return tempIndexTree(ctx, repoRoot, "")
+	}
+	twipDir := filepath.Join(gitDir, "twip")
+	idxPath := filepath.Join(twipDir, "snapshot-index")
+
+	unlock, err := flock(filepath.Join(twipDir, "snapshot.lock"))
+	if err != nil {
+		// Can't serialize: don't risk corrupting the shared index — use a throwaway.
+		return tempIndexTree(ctx, repoRoot, gitDir)
+	}
+	defer unlock()
+
+	// Within our flock, any leftover git lock on the index is from a dead process and
+	// is safe to clear; otherwise the next `git add` would fail on it.
+	_ = os.Remove(idxPath + ".lock")
+	// Seed from the real index on first use so tracked files start with a stat cache
+	// (only untracked files hash on the first snapshot); reuse it thereafter.
+	if !exists(idxPath) {
+		if err := os.MkdirAll(twipDir, 0o750); err == nil {
+			_ = copyFile(filepath.Join(gitDir, "index"), idxPath) // best-effort seed
+		}
+	}
+
+	tree, err := addAndWriteTree(ctx, repoRoot, idxPath)
+	if err != nil {
+		// A corrupt/locked persistent index must not break capture: reset it so the
+		// next snapshot re-seeds, and fall back to a throwaway index for this one.
+		_ = os.Remove(idxPath)
+		_ = os.Remove(idxPath + ".lock")
+		return tempIndexTree(ctx, repoRoot, gitDir)
+	}
+	return tree, nil
+}
+
+// tempIndexTree is the fallback: stage into a throwaway index (seeded from the real
+// one when gitDir is known) and write a tree, removing the index afterward.
+func tempIndexTree(ctx context.Context, repoRoot, gitDir string) (string, error) {
 	tmp, err := os.CreateTemp("", "twip-index-*")
 	if err != nil {
 		return "", fmt.Errorf("create temp index: %w", err)
@@ -41,22 +99,40 @@ func worktreeTree(ctx context.Context, repoRoot string) (string, error) {
 	tmp.Close()
 	defer os.Remove(tmpPath)
 
-	// Seed the temp index from the real one so `git add -A` re-stats only files
-	// whose mtime/size changed (the standard index fast-path). Best-effort.
+	// Seed from the real index so `git add -A` re-stats only changed tracked files.
 	seeded := false
-	if gitDir, err := gitutil.GitDir(ctx, repoRoot); err == nil {
-		seeded = copyFile(gitDir+"/index", tmpPath) == nil
+	if gitDir != "" {
+		seeded = copyFile(filepath.Join(gitDir, "index"), tmpPath) == nil
 	}
 	if !seeded {
-		// No index to seed from (e.g. a repo with no commits yet). The leftover
-		// 0-byte temp file is NOT a valid empty index — git rejects it ("index
-		// file smaller than expected") — so remove it and let git create a fresh
-		// empty index, which just means a full stat pass.
+		// A leftover 0-byte temp file is not a valid empty index (git rejects it);
+		// remove it so git creates a fresh one (a full stat pass).
 		_ = os.Remove(tmpPath)
 	}
+	return addAndWriteTree(ctx, repoRoot, tmpPath)
+}
 
-	env := []string{"GIT_INDEX_FILE=" + tmpPath}
-	if _, err := gitutil.Run(ctx, repoRoot, env, nil, "add", "-A"); err != nil {
+// addAndWriteTree stages the worktree into the index at idxPath and returns its tree
+// sha. Files larger than the size cap are excluded from staging so they are never
+// hashed.
+func addAndWriteTree(ctx context.Context, repoRoot, idxPath string) (string, error) {
+	env := []string{"GIT_INDEX_FILE=" + idxPath}
+
+	addArgs := []string{"add", "-A"}
+	if cap := maxFileBytes(); cap > 0 {
+		over, err := oversizeFiles(ctx, repoRoot, env, cap)
+		if err == nil && len(over) > 0 {
+			specFile, derr := writePathspecFile(over)
+			if derr == nil {
+				defer os.Remove(specFile)
+				// "." stages everything; the :(exclude) entries drop the oversize files.
+				addArgs = []string{"add", "-A", "--pathspec-from-file=" + specFile, "--pathspec-file-nul"}
+				fmt.Fprintf(os.Stderr, "twip: snapshot skipped %d file(s) over %d bytes\n", len(over), cap)
+			}
+		}
+	}
+
+	if _, err := gitutil.Run(ctx, repoRoot, env, nil, addArgs...); err != nil {
 		return "", fmt.Errorf("stage worktree: %w", err)
 	}
 	b, err := gitutil.Run(ctx, repoRoot, env, nil, "write-tree")
@@ -66,19 +142,108 @@ func worktreeTree(ctx context.Context, repoRoot string) (string, error) {
 	return trim(string(b)), nil
 }
 
+// oversizeFiles returns the worktree-relative paths of hash candidates (untracked +
+// modified, respecting .gitignore) whose on-disk size exceeds cap. Tracked-unchanged
+// files are not candidates (git won't re-hash them), so they are not listed. The
+// listing uses the index stat cache for modified detection — it does not hash.
+func oversizeFiles(ctx context.Context, repoRoot string, env []string, cap int64) ([]string, error) {
+	out, err := gitutil.Run(ctx, repoRoot, env, nil,
+		"ls-files", "-z", "--others", "--modified", "--exclude-standard")
+	if err != nil {
+		return nil, err
+	}
+	var over []string
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p == "" {
+			continue
+		}
+		fi, err := os.Lstat(filepath.Join(repoRoot, p))
+		if err != nil || fi.IsDir() || !fi.Mode().IsRegular() {
+			continue
+		}
+		if fi.Size() > cap {
+			over = append(over, p)
+		}
+	}
+	return over, nil
+}
+
+// writePathspecFile writes a NUL-separated pathspec file that includes everything
+// ("." ) then excludes each given path, for `git add --pathspec-from-file`.
+func writePathspecFile(exclude []string) (string, error) {
+	f, err := os.CreateTemp("", "twip-pathspec-*")
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	b.WriteString(".\x00")
+	for _, p := range exclude {
+		b.WriteString(":(exclude,literal)")
+		b.WriteString(p)
+		b.WriteString("\x00")
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
+// maxFileBytes is the per-file snapshot size cap, overridable via
+// TWIP_SNAPSHOT_MAX_FILE_BYTES (0 or negative disables the cap).
+func maxFileBytes() int64 {
+	if v := os.Getenv("TWIP_SNAPSHOT_MAX_FILE_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return defaultMaxFileBytes
+}
+
+// flock takes an exclusive advisory lock on path, creating it if needed, and returns
+// an unlock func. It serializes twip's own snapshots within a worktree; a process
+// that dies releases the lock when its fd closes.
+func flock(path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) //nolint:gosec // private lock file
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
 func copyFile(src, dst string) error {
 	in, err := os.Open(src) //nolint:gosec // src is the repo's own index path
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.Create(dst) //nolint:gosec // dst is our temp index
+	out, err := os.Create(dst) //nolint:gosec // dst is our snapshot index
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 	_, err = io.Copy(out, in)
 	return err
+}
+
+func exists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func trim(s string) string {
