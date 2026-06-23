@@ -262,6 +262,62 @@ func TestGitOpAndSub_ReadOnlyClassification(t *testing.T) {
 	}
 }
 
+// TestDestructiveOps_IncludesContentClobbering pins that ops which can destroy dirty
+// worktree content are classified destructive (so the shim snapshots before them).
+func TestDestructiveOps_IncludesContentClobbering(t *testing.T) {
+	for _, op := range []string{"rm", "mv", "checkout-index"} {
+		if !destructiveOps[op] {
+			t.Errorf("%q should be a destructive op (snapshot before it)", op)
+		}
+		if skipOps[op] {
+			t.Errorf("%q must not be skipped", op)
+		}
+	}
+}
+
+// TestGitShim_RmSnapshotsDirtyContent is the end-to-end proof: `git rm -f` of a file
+// with uncommitted changes destroys that content, and twip must have snapshotted it
+// first (the same pre-destruction capability as reset --hard).
+func TestGitShim_RmSnapshotsDirtyContent(t *testing.T) {
+	ctx := context.Background()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	twip := buildTwip(t)
+	repo := e2eInitRepo(t)
+
+	e2eWrite(t, repo, "doomed.txt", "committed\n")
+	gitInRepo(t, repo, "add", "doomed.txt")
+	gitInRepo(t, repo, "commit", "-q", "-m", "add doomed")
+	if _, err := store.New(repo).CloneID(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e2eWrite(t, repo, "doomed.txt", "UNCOMMITTED work\n") // now dirty
+
+	runShim(t, twip, realGit, repo, "rm", "-f", "doomed.txt")
+
+	// git ran: the file is gone from the worktree.
+	if _, err := os.Stat(filepath.Join(repo, "doomed.txt")); !os.IsNotExist(err) {
+		t.Errorf("git rm -f did not remove doomed.txt (err=%v)", err)
+	}
+	// twip snapshotted the dirty content before the rm.
+	var gitop *store.EventCommit
+	events, _ := store.New(repo).LoadAllEvents(ctx)
+	for i := range events {
+		if g := events[i].Record.GitOp; g != nil && g.Op == "rm" {
+			gitop = &events[i]
+		}
+	}
+	if gitop == nil {
+		t.Fatal("no rm gitop event recorded")
+	}
+	preserved, err := gitutil.CatFile(ctx, repo, gitop.Commit+":worktree/doomed.txt")
+	if err != nil || string(preserved) != "UNCOMMITTED work\n" {
+		t.Errorf("dirty content not preserved before rm: got %q (err %v)", preserved, err)
+	}
+}
+
 // --- helpers ---
 
 func buildTwip(t *testing.T) string {

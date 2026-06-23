@@ -57,6 +57,11 @@ var destructiveOps = map[string]bool{
 	"checkout": true, "switch": true, "reset": true, "restore": true,
 	"clean": true, "stash": true, "rebase": true, "merge": true,
 	"cherry-pick": true, "revert": true, "pull": true, "am": true, "apply": true,
+	// Content-clobbering ops: `git rm -f` deletes a tracked file with uncommitted
+	// changes, `git mv -f` can overwrite the destination, and `git checkout-index -f`
+	// rewrites the worktree from the index — each can destroy dirty content, so
+	// snapshot it first like any other destructive op.
+	"rm": true, "mv": true, "checkout-index": true,
 }
 
 func newGitShimCmd() *cobra.Command {
