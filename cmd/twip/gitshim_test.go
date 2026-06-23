@@ -104,6 +104,13 @@ func TestGitShim_BenignOpAndNonEnabledRepoAreNoops(t *testing.T) {
 		t.Errorf("benign op recorded %d events, want 0", len(ev))
 	}
 
+	// Read-only sub-subcommand (`worktree list`) → no record, even though
+	// `worktree` is not a skipOp (its `add`/`remove` forms do mutate).
+	runShim(t, twip, realGit, repo, "worktree", "list", "--porcelain")
+	if ev, _ := store.New(repo).LoadAllEvents(ctx); len(ev) != 0 {
+		t.Errorf("worktree list recorded %d events, want 0", len(ev))
+	}
+
 	// Non-enabled repo, tracked op → still no record (no clone-id marker).
 	repo2 := e2eInitRepo(t)
 	e2eWrite(t, repo2, "f.txt", "x\n")
@@ -210,6 +217,47 @@ func TestGitShim_AmendRecordedAndPreHeadPinned(t *testing.T) {
 	}
 	if amend.BeforeHead != preAmend || amend.AfterHead != postAmend {
 		t.Errorf("amend heads = %s..%s, want %s..%s", amend.BeforeHead, amend.AfterHead, preAmend, postAmend)
+	}
+}
+
+// TestGitOpAndSub_ReadOnlyClassification covers the parse + skip decision for
+// ops whose mutating-ness depends on the sub-subcommand: `worktree list` and
+// `stash list`/`show` must pass through unrecorded, while `worktree add`/`remove`
+// and bare `stash` (an implicit push) must still record.
+func TestGitOpAndSub_ReadOnlyClassification(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantOp  string
+		wantSub string
+		skip    bool // skipOps[op] || readOnlySubcmds[op][sub]
+	}{
+		{"worktree list", []string{"worktree", "list", "--porcelain"}, "worktree", "list", true},
+		{"bare worktree (usage)", []string{"worktree"}, "worktree", "", true},
+		{"worktree add records", []string{"worktree", "add", "/tmp/wt", "main"}, "worktree", "add", false},
+		{"worktree remove records", []string{"worktree", "remove", "/tmp/wt"}, "worktree", "remove", false},
+		{"stash list", []string{"stash", "list"}, "stash", "list", true},
+		{"stash show", []string{"stash", "show"}, "stash", "show", true},
+		{"bare stash records (implicit push)", []string{"stash"}, "stash", "", false},
+		{"stash push records", []string{"stash", "push", "-m", "x"}, "stash", "push", false},
+		{"status skipped via skipOps", []string{"status", "--porcelain"}, "status", "", true},
+		// sub here is the `-m` value, not a real sub-subcommand — gitOpAndSub
+		// doesn't track sub-level value-flags. Harmless: sub is only consulted for
+		// ops in readOnlySubcmds (worktree/stash), where the subcommand is the
+		// first token after the op, so it parses correctly there.
+		{"commit records (sub unused)", []string{"commit", "-m", "x"}, "commit", "x", false},
+		{"global opts before op", []string{"-C", "/repo", "-c", "x=list", "worktree", "list"}, "worktree", "list", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op, sub := gitOpAndSub(tt.args)
+			if op != tt.wantOp || sub != tt.wantSub {
+				t.Fatalf("gitOpAndSub = (%q, %q), want (%q, %q)", op, sub, tt.wantOp, tt.wantSub)
+			}
+			if got := skipOps[op] || readOnlySubcmds[op][sub]; got != tt.skip {
+				t.Errorf("skip = %v, want %v", got, tt.skip)
+			}
+		})
 	}
 }
 

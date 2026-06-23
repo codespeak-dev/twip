@@ -8,12 +8,13 @@ deleted. Browse it at `twip serve`.
 
 ```sh
 go install github.com/codespeak-dev/twip/cmd/twip@latest   # get the binary
-twip install                                               # once per machine: stable copy + git shim + PATH
+twip install                                               # once per machine: stable binary + git shim + PATH
 ```
 
-`twip install` copies twip to a stable `~/.twip/bin/twip`, installs the git shim there, and sources
-`~/.twip/env` from your shell rc so the shim is on `PATH` (rustup-style; `--no-modify-path` to skip
-the rc edit, `twip uninstall` to reverse it). Start a new shell, then in each repo you want recorded:
+`twip install` points a stable `~/.twip/bin/twip` at the binary (a symlink when twip is a `go install`
+target, a copy when the source is transient), installs the git shim there, and sources `~/.twip/env`
+from your shell rc so the shim is on `PATH` (rustup-style; `--no-modify-path` to skip the rc edit,
+`twip uninstall` to reverse it). Start a new shell, then in each repo you want recorded:
 
 ```sh
 twip init && git add .claude/settings.json && git commit -m "twip: record agent sessions"
@@ -22,6 +23,17 @@ twip init && git add .claude/settings.json && git commit -m "twip: record agent 
 Committed hooks are a no-op for anyone without twip. Optionally `twip init --enforce` also gates
 `git push` from the repo, blocking pushes that aren't being recorded (bypass once with
 `git push --no-verify`). Everyday commands: `twip log` / `show <event-id>` / `audit` / `serve`.
+
+### Updating
+
+```sh
+go install github.com/codespeak-dev/twip/cmd/twip@latest   # that's it
+```
+
+After the first `twip install`, `~/.twip/bin/twip` is a symlink to your `go install` target, so a
+plain `go install` updates the binary the shim, the hooks, and your shell all run — no re-run needed.
+Re-run `twip install` only if you change `GOBIN`/`GOPATH`, or installed via a version manager
+(mise/asdf/brew) or `go run`, where twip keeps an independent **copy** that doesn't auto-follow.
 
 ### Manual PATH setup (if a new shell can't find the shim)
 
@@ -86,14 +98,17 @@ resolves, seq numbers are contiguous, transcript offsets join end-to-end, and su
 data-quality flags — non-zero exit on any divergence. The shim falls back to real git if twip is
 unavailable, so it can never break git.
 
-**Sharing across the team.** Sync rides on normal git, so there's nothing extra to run. `twip init`
-installs a best-effort `pre-push` hook (which calls `twip sync push`, pushing with `--no-verify` so it
-never re-runs your other pre-push checks) that mirrors your journal to the remote you push to, and
-adds a `remote.origin.fetch` refspec so a plain `git fetch`/`pull` brings teammates' journals down
-(into `refs/twip/remotes/<remote>/journal/*`). If a hook manager already owns `pre-push` (lefthook,
-husky, pre-commit), twip detects it, leaves it untouched, and prints the exact config to add —
-wiring `twip sync push` (and, with `--enforce`, `twip check pre-push`) into the manager. It's
-conflict-free by construction: each clone is the sole writer of its own
+**Sharing across the team.** Push rides on normal git: `twip init` installs a best-effort `pre-push`
+hook (which calls `twip sync push`, pushing with `--no-verify` so it never re-runs your other
+pre-push checks) that mirrors your journal to the remote you push to. If a hook manager already owns
+`pre-push` (lefthook, husky, pre-commit), twip detects it, leaves it untouched, and prints the exact
+config to add — wiring `twip sync push` (and, with `--enforce`, `twip check pre-push`) into the
+manager.
+
+Fetching teammates' journals is **opt-in** — a plain `git fetch`/`pull` does *not* pull them. Run
+`twip sync fetch [remote]` when you want them; it pulls each clone's journal into
+`refs/twip/remotes/<remote>/journal/<clone-id>` (authors/branches stay separate), and pins/stash
+flat. It's conflict-free by construction: each clone is the sole writer of its own
 `refs/twip/journal/<clone-id>`, so every push is a fast-forward and there is never a merge. The
 browser then lanes the whole team's timeline, each clone labeled by its author.
 

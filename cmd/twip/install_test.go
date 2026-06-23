@@ -50,14 +50,16 @@ func TestResolveRealGit_ErrorsWhenOnlyShim(t *testing.T) {
 	}
 }
 
-func TestSelfCopy(t *testing.T) {
+func TestCopyBinary(t *testing.T) {
+	exe, _ := os.Executable()
+	exe, _ = filepath.EvalSymlinks(exe)
 	dst := filepath.Join(t.TempDir(), "twip")
-	copied, err := selfCopy(dst)
+	copied, err := copyBinary(dst, exe)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !copied {
-		t.Fatal("first selfCopy should report copied=true")
+		t.Fatal("first copyBinary should report copied=true")
 	}
 	fi, err := os.Stat(dst)
 	if err != nil {
@@ -66,27 +68,133 @@ func TestSelfCopy(t *testing.T) {
 	if fi.Mode()&0o111 == 0 {
 		t.Error("installed binary is not executable")
 	}
-	exe, _ := os.Executable()
-	exe, _ = filepath.EvalSymlinks(exe)
 	want, _ := os.ReadFile(exe)
 	got, _ := os.ReadFile(dst)
 	if !bytes.Equal(want, got) {
-		t.Error("copied binary differs from the running binary")
+		t.Error("copied binary differs from the source")
 	}
 }
 
-func TestSelfCopy_SkipsWhenSourceIsDest(t *testing.T) {
+func TestCopyBinary_SkipsWhenSourceIsDest(t *testing.T) {
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	exe, _ = filepath.EvalSymlinks(exe)
-	copied, err := selfCopy(exe) // dst == the running binary
+	copied, err := copyBinary(exe, exe) // dst == src
 	if err != nil {
 		t.Fatal(err)
 	}
 	if copied {
-		t.Error("selfCopy should be a no-op when source == dest")
+		t.Error("copyBinary should be a no-op when source == dest")
+	}
+}
+
+func TestSymlinkBinary(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src-twip")
+	writeExec(t, src)
+	dst := filepath.Join(dir, "bin", "twip") // a not-yet-existing nested dir
+
+	linked, err := symlinkBinary(dst, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !linked {
+		t.Fatal("first symlinkBinary should report linked=true")
+	}
+	fi, err := os.Lstat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("dst is not a symlink")
+	}
+	if got, _ := os.Readlink(dst); got != src {
+		t.Errorf("symlink target = %q, want %q", got, src)
+	}
+	// Idempotent: re-linking the same src is a no-op.
+	if linked, err := symlinkBinary(dst, src); err != nil || linked {
+		t.Errorf("re-link should be a no-op: linked=%v err=%v", linked, err)
+	}
+}
+
+func TestSymlinkBinary_ReplacesExistingCopy(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src-twip")
+	writeExec(t, src)
+	dst := filepath.Join(dir, "twip")
+	// dst starts life as a regular file (an old copy install) that must be replaced.
+	if err := os.WriteFile(dst, []byte("old copy"), 0o755); err != nil { //nolint:gosec // test fixture
+		t.Fatal(err)
+	}
+	if _, err := symlinkBinary(dst, src); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Lstat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("symlinkBinary should replace an existing regular file with a symlink")
+	}
+}
+
+func TestInstallBinary_SymlinksDurableSource(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "bin", "twip")
+	// A durable absolute path: not under the temp dir, no transient segment. It need
+	// not exist — a symlink can point at a (future) target.
+	src := filepath.Join(string(os.PathSeparator), "opt", "twip-durable", "twip")
+	state, err := installBinary(dst, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != installSymlinked {
+		t.Fatalf("durable source should be symlinked, got state %v", state)
+	}
+	if got, _ := os.Readlink(dst); got != src {
+		t.Errorf("symlink target = %q, want %q", got, src)
+	}
+}
+
+func TestInstallBinary_CopiesTransientSource(t *testing.T) {
+	dir := t.TempDir() // under the OS temp dir -> transient
+	src := filepath.Join(dir, "src-twip")
+	writeExec(t, src)
+	dst := filepath.Join(dir, "bin", "twip")
+	state, err := installBinary(dst, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != installCopied {
+		t.Fatalf("transient source should be copied, got state %v", state)
+	}
+	fi, err := os.Lstat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Error("transient source should be copied, not symlinked")
+	}
+}
+
+func TestIsTransientSource(t *testing.T) {
+	tmp, _ := filepath.EvalSymlinks(os.TempDir())
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{filepath.Join(tmp, "go-build123", "exe", "twip"), true},      // `go run`
+		{"/home/u/.local/share/mise/installs/go/1.22/bin/twip", true}, // mise
+		{"/home/u/.asdf/installs/golang/1.22/bin/twip", true},         // asdf
+		{"/opt/homebrew/Cellar/twip/1.0/bin/twip", true},              // Homebrew
+		{"/home/u/go/bin/twip", false},                                // `go install`
+		{"/usr/local/bin/twip", false},                                // hand-installed
+	}
+	for _, c := range cases {
+		if got := isTransientSource(c.path); got != c.want {
+			t.Errorf("isTransientSource(%q) = %v, want %v", c.path, got, c.want)
+		}
 	}
 }
 

@@ -37,6 +37,17 @@ var skipOps = map[string]bool{
 	"count-objects": true, "fsck": true, "whatchanged": true, "annotate": true,
 }
 
+// readOnlySubcmds maps a recorded op to the sub-subcommands that are read-only,
+// so the shim passes them through unrecorded. The op itself is absent from
+// skipOps because OTHER forms of it mutate (e.g. `git worktree add`, or bare
+// `git stash` = implicit push), so the skip has to key on the sub-subcommand.
+// The empty-string key marks the bare op (no sub-subcommand) read-only — true
+// for `git worktree` (just prints usage) but not for `git stash`, hence per-op.
+var readOnlySubcmds = map[string]map[string]bool{
+	"worktree": {"": true, "list": true},
+	"stash":    {"list": true, "show": true},
+}
+
 // destructiveOps can clobber dirty worktree state, so the shim snapshots the
 // worktree BEFORE running them (the pre-destruction snapshot no git hook can
 // take). Other recorded ops get the event only.
@@ -107,13 +118,14 @@ func gitShim(ctx context.Context, realGit string, args []string) error {
 	if enabled, _ := rec.Enabled(ctx); !enabled {
 		return execReal(realGit, args) // repo not twip-enabled: stay invisible
 	}
-	if skipOps[gitSubcommand(args)] {
+	op, sub := gitOpAndSub(args)
+	if skipOps[op] || readOnlySubcmds[op][sub] {
 		return execReal(realGit, args) // read-only/noisy op: pass through, no record
 	}
 
 	// Recorded op: capture the pre-op state, run git, record the result. Capture is
 	// always best-effort — a failure here must never change git's behavior.
-	capture(ctx, rec, repoRoot, gitSubcommand(args), args)
+	capture(ctx, rec, repoRoot, op, args)
 	return nil // capture() exits the process with git's own exit code
 }
 
@@ -190,24 +202,36 @@ func worktreeDirty(ctx context.Context, repoRoot string) bool {
 	return err == nil && strings.TrimSpace(out) != ""
 }
 
-// gitSubcommand finds the git subcommand, skipping global options (and the values
-// of those that take one). Misclassification only over/under-records; it never
-// affects what git does.
-func gitSubcommand(args []string) string {
+// gitOpAndSub finds the git subcommand (op) and the first positional token after
+// it (its sub-subcommand) — e.g. ("worktree", "list") for `git worktree list`.
+// Global options (and the values of those that take one) are skipped before the
+// op; flags between the op and its sub-subcommand are skipped too. sub is "" when
+// the op has no positional sub-subcommand. Misclassification only over/under-
+// records; it never affects what git does.
+func gitOpAndSub(args []string) (op, sub string) {
 	consumesValue := map[string]bool{
 		"-C": true, "-c": true, "--git-dir": true, "--work-tree": true,
 		"--namespace": true, "--super-prefix": true, "--exec-path": true,
 	}
-	for i := 0; i < len(args); i++ {
+	i := 0
+	for ; i < len(args); i++ {
 		a := args[i]
 		if !strings.HasPrefix(a, "-") {
-			return a
+			op = a
+			i++
+			break
 		}
 		if consumesValue[a] {
 			i++
 		}
 	}
-	return ""
+	for ; i < len(args); i++ {
+		if !strings.HasPrefix(args[i], "-") {
+			sub = args[i]
+			break
+		}
+	}
+	return op, sub
 }
 
 // execReal replaces this process with the real git (transparent pass-through).
