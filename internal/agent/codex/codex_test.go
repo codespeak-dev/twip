@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/codespeak-dev/twip/internal/agent"
+	"github.com/codespeak-dev/twip/internal/hookutil"
 )
 
 var ctx = context.Background()
@@ -468,11 +469,11 @@ func TestUninstallHooks_RemovesOnlyTwipOwned(t *testing.T) {
 	var matchers []hookMatcher
 	_ = json.Unmarshal(hooks["SessionStart"], &matchers)
 	matchers = append(matchers, hookMatcher{Hooks: []hookEntry{{Type: "command", Command: "echo foreign"}}})
-	raw, _ := marshalNoEscape(matchers)
+	raw, _ := hookutil.MarshalNoEscape(matchers)
 	hooks["SessionStart"] = raw
-	hooksRaw, _ := marshalNoEscape(hooks)
+	hooksRaw, _ := hookutil.MarshalNoEscape(hooks)
 	outer["hooks"] = hooksRaw
-	out, _ := marshalIndentNoEscape(outer)
+	out, _ := hookutil.MarshalIndentNoEscape(outer)
 	_ = os.WriteFile(path, out, 0o600)
 
 	// Uninstall.
@@ -687,17 +688,17 @@ func TestPatchConfigTOML(t *testing.T) {
 
 func TestTruncate(t *testing.T) {
 	// ASCII: truncates at rune boundary (same as byte boundary).
-	if got := truncate("hello world", 5); got != "hello…" {
+	if got := hookutil.Truncate("hello world", 5); got != "hello…" {
 		t.Errorf("got %q", got)
 	}
 	// Short string: returned unchanged.
-	if got := truncate("hi", 10); got != "hi" {
+	if got := hookutil.Truncate("hi", 10); got != "hi" {
 		t.Errorf("got %q", got)
 	}
 	// Multi-byte UTF-8: must not cut mid-rune.
 	// "日" is 3 bytes each; truncating at rune 2 should yield "日日…" not invalid UTF-8.
 	s := strings.Repeat("日", 5) // 15 bytes, 5 runes
-	got := truncate(s, 2)
+	got := hookutil.Truncate(s, 2)
 	if got != "日日…" {
 		t.Errorf("got %q, want %q", got, "日日…")
 	}

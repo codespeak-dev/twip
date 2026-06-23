@@ -34,7 +34,7 @@ func TestDeltaFrom(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			delta, total, trunc := deltaFrom([]byte(tc.data), tc.from)
+			delta, total, trunc := agent.DeltaFrom([]byte(tc.data), tc.from)
 			if string(delta) != tc.wantDelta {
 				t.Errorf("delta = %q, want %q", delta, tc.wantDelta)
 			}

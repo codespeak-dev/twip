@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/codespeak-dev/twip/internal/agent"
+	"github.com/codespeak-dev/twip/internal/hookutil"
 )
 
 // Name is the registry key and hook namespace.
@@ -93,20 +94,6 @@ type postToolUseRaw struct {
 	ToolInput json.RawMessage `json:"tool_input"`
 }
 
-func parseStdin[T any](r io.Reader) (T, error) {
-	var v T
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return v, fmt.Errorf("read hook stdin: %w", err)
-	}
-	if len(data) == 0 {
-		return v, nil
-	}
-	if err := json.Unmarshal(data, &v); err != nil {
-		return v, fmt.Errorf("parse hook payload: %w", err)
-	}
-	return v, nil
-}
 
 // ParseHookEvent translates a Claude Code hook firing into a normalized Event,
 // reading transcript deltas (relative to `prior`) for the events that carry them.
@@ -114,7 +101,7 @@ func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Read
 	hookStart := time.Now()
 	switch hookName {
 	case hookSessionStart:
-		raw, err := parseStdin[sessionInfoRaw](stdin)
+		raw, err := hookutil.ParseStdin[sessionInfoRaw](stdin)
 		if err != nil {
 			return nil, err
 		}
@@ -132,7 +119,7 @@ func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Read
 		}, nil
 
 	case hookUserPrompt:
-		raw, err := parseStdin[userPromptRaw](stdin)
+		raw, err := hookutil.ParseStdin[userPromptRaw](stdin)
 		if err != nil {
 			return nil, err
 		}
@@ -164,7 +151,7 @@ func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Read
 // transcript (the turn's transcript is captured whole at Stop) and an unchanged
 // cursor; the core decides whether the call actually changed the worktree.
 func (a *Agent) parsePostToolUse(stdin io.Reader, prior agent.Cursor) (*agent.Event, error) {
-	raw, err := parseStdin[postToolUseRaw](stdin)
+	raw, err := hookutil.ParseStdin[postToolUseRaw](stdin)
 	if err != nil {
 		return nil, err
 	}
@@ -196,24 +183,18 @@ func toolDetail(tool string, input json.RawMessage) string {
 	case v.NotebookB != "":
 		return v.NotebookB
 	case v.Command != "":
-		return truncate(strings.TrimSpace(v.Command), 120)
+		return hookutil.Truncate(strings.TrimSpace(v.Command), 120)
 	case v.Description != "":
-		return truncate(v.Description, 120)
+		return hookutil.Truncate(v.Description, 120)
 	}
 	return ""
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
-}
 
 // parseTranscriptEvent handles Stop and SessionEnd: wait for the async flush,
 // then read the main-transcript delta since the prior cursor.
 func (a *Agent) parseTranscriptEvent(stdin io.Reader, prior agent.Cursor, hookStart time.Time, kind agent.Kind) (*agent.Event, error) {
-	raw, err := parseStdin[sessionInfoRaw](stdin)
+	raw, err := hookutil.ParseStdin[sessionInfoRaw](stdin)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +232,7 @@ func (a *Agent) parseTranscriptEvent(stdin io.Reader, prior agent.Cursor, hookSt
 // <dir>/agent-<id>.jsonl), so no path-discovery is needed — but the id is
 // validated as path-safe before it becomes part of a filename.
 func (a *Agent) parsePostTask(stdin io.Reader, prior agent.Cursor) (*agent.Event, error) {
-	raw, err := parseStdin[postTaskRaw](stdin)
+	raw, err := hookutil.ParseStdin[postTaskRaw](stdin)
 	if err != nil {
 		return nil, err
 	}

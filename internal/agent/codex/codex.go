@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/codespeak-dev/twip/internal/agent"
+	"github.com/codespeak-dev/twip/internal/hookutil"
 )
 
 // Name is the registry key and hook namespace.
@@ -85,27 +86,12 @@ type subagentStopRaw struct {
 	AgentTranscriptPath *string `json:"agent_transcript_path"`
 }
 
-func parseStdin[T any](r io.Reader) (T, error) {
-	var v T
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return v, fmt.Errorf("read hook stdin: %w", err)
-	}
-	if len(data) == 0 {
-		return v, nil
-	}
-	if err := json.Unmarshal(data, &v); err != nil {
-		return v, fmt.Errorf("parse hook payload: %w", err)
-	}
-	return v, nil
-}
-
 // ParseHookEvent translates a Codex hook firing into a normalized Event.
 func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Reader, prior agent.Cursor) (*agent.Event, error) {
 	hookStart := time.Now()
 	switch hookName {
 	case hookSessionStart:
-		raw, err := parseStdin[commonRaw](stdin)
+		raw, err := hookutil.ParseStdin[commonRaw](stdin)
 		if err != nil {
 			return nil, err
 		}
@@ -132,7 +118,7 @@ func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Read
 		return ev, nil
 
 	case hookUserPrompt:
-		raw, err := parseStdin[userPromptRaw](stdin)
+		raw, err := hookutil.ParseStdin[userPromptRaw](stdin)
 		if err != nil {
 			return nil, err
 		}
@@ -180,7 +166,7 @@ func forkParent(data []byte) string {
 
 // parseStop handles the Stop hook: wait for task_complete flush then read delta.
 func (a *Agent) parseStop(stdin io.Reader, prior agent.Cursor, hookStart time.Time) (*agent.Event, error) {
-	raw, err := parseStdin[commonRaw](stdin)
+	raw, err := hookutil.ParseStdin[commonRaw](stdin)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +208,7 @@ func (a *Agent) parseStop(stdin io.Reader, prior agent.Cursor, hookStart time.Ti
 
 // parsePostToolUse records an intermediate mutating tool call.
 func (a *Agent) parsePostToolUse(stdin io.Reader, prior agent.Cursor) (*agent.Event, error) {
-	raw, err := parseStdin[postToolUseRaw](stdin)
+	raw, err := hookutil.ParseStdin[postToolUseRaw](stdin)
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +231,7 @@ func toolDetail(tool string, input json.RawMessage) string {
 	_ = json.Unmarshal(input, &v)
 	switch tool {
 	case "Bash":
-		return truncate(strings.TrimSpace(v.Command), 120)
+		return hookutil.Truncate(strings.TrimSpace(v.Command), 120)
 	case "apply_patch":
 		return patchPathSummary(v.Command)
 	}
@@ -258,7 +244,7 @@ func toolDetail(tool string, input json.RawMessage) string {
 func patchPathSummary(cmd string) string {
 	for _, line := range strings.Split(cmd, "\n") {
 		line = strings.TrimSpace(line)
-		for _, prefix := range []string{"*** Add File: ", "*** Update File: ", "*** Delete File: ", "+++ "} {
+		for _, prefix := range []string{"*** Add File: ", "*** Update File: ", "*** Delete File: "} {
 			if strings.HasPrefix(line, prefix) {
 				return strings.TrimSpace(strings.TrimPrefix(line, prefix))
 			}
@@ -267,18 +253,10 @@ func patchPathSummary(cmd string) string {
 	return ""
 }
 
-func truncate(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n]) + "…"
-}
-
 // parseSubagentStop captures the finished subagent's sidechain delta.
 // The subagent transcript path is provided directly in the payload.
 func (a *Agent) parseSubagentStop(stdin io.Reader, prior agent.Cursor) (*agent.Event, error) {
-	raw, err := parseStdin[subagentStopRaw](stdin)
+	raw, err := hookutil.ParseStdin[subagentStopRaw](stdin)
 	if err != nil {
 		return nil, err
 	}

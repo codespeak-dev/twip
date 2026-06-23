@@ -1,13 +1,14 @@
 package codex
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/codespeak-dev/twip/internal/hookutil"
 )
 
 const (
@@ -44,17 +45,6 @@ func (a *Agent) hookSpecs() []hookSpec {
 	}
 }
 
-func (a *Agent) command(verb string) string {
-	return fmt.Sprintf(
-		"sh -c 'command -v twip >/dev/null 2>&1 || exit 0; exec twip hook %s %s'",
-		a.Name(), verb,
-	)
-}
-
-func isTwipHook(cmd string) bool {
-	return strings.Contains(cmd, "twip hook ")
-}
-
 // InstallHooks adds twip's hooks to .codex/hooks.json (preserving any hooks
 // twip does not own) and ensures .codex/config.toml enables hooks.
 // Returns the number of hooks added.
@@ -74,7 +64,7 @@ func (a *Agent) InstallHooks(_ context.Context, repoRoot string, force bool) (in
 		if force {
 			matchers = removeTwipHooks(matchers)
 		}
-		cmd := a.command(spec.verb)
+		cmd := hookutil.HookCommand(a.Name(), spec.verb)
 		if !hasCommand(matchers, spec.matcher, cmd) {
 			matchers = addHook(matchers, spec.matcher, cmd)
 			count++
@@ -142,7 +132,7 @@ func readHooksFile(path string) (outer, hooks map[string]json.RawMessage, err er
 
 func writeHooksFile(path string, outer, hooks map[string]json.RawMessage) error {
 	if len(hooks) > 0 {
-		raw, err := marshalNoEscape(hooks)
+		raw, err := hookutil.MarshalNoEscape(hooks)
 		if err != nil {
 			return err
 		}
@@ -150,7 +140,7 @@ func writeHooksFile(path string, outer, hooks map[string]json.RawMessage) error 
 	} else {
 		delete(outer, "hooks")
 	}
-	out, err := marshalIndentNoEscape(outer)
+	out, err := hookutil.MarshalIndentNoEscape(outer)
 	if err != nil {
 		return err
 	}
@@ -179,7 +169,7 @@ func setMatchers(hooks map[string]json.RawMessage, event string, matchers []hook
 		delete(hooks, event)
 		return
 	}
-	raw, err := marshalNoEscape(matchers)
+	raw, err := hookutil.MarshalNoEscape(matchers)
 	if err != nil {
 		return
 	}
@@ -216,7 +206,7 @@ func removeTwipHooks(matchers []hookMatcher) []hookMatcher {
 	for _, m := range matchers {
 		kept := make([]hookEntry, 0, len(m.Hooks))
 		for _, h := range m.Hooks {
-			if !isTwipHook(h.Command) {
+			if !hookutil.IsTwipHook(h.Command) {
 				kept = append(kept, h)
 			}
 		}
@@ -226,27 +216,6 @@ func removeTwipHooks(matchers []hookMatcher) []hookMatcher {
 		}
 	}
 	return out
-}
-
-func marshalNoEscape(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
-}
-
-func marshalIndentNoEscape(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
 }
 
 // --- .codex/config.toml management ---
