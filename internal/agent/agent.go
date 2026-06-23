@@ -34,10 +34,11 @@ const (
 type Quality string
 
 const (
-	QualityOK           Quality = "ok"
-	QualityFlushTimeout Quality = "flush_timeout" // sentinel/quiescence not reached before timeout
-	QualityStaleSkip    Quality = "stale_skip"    // transcript untouched for a while; agent likely gone
-	QualityTruncated    Quality = "truncated"     // read ended early; next turn self-heals (not SessionEnd)
+	QualityOK                    Quality = "ok"
+	QualityFlushTimeout          Quality = "flush_timeout"          // sentinel/quiescence not reached before timeout
+	QualityStaleSkip             Quality = "stale_skip"             // transcript untouched for a while; agent likely gone
+	QualityTruncated             Quality = "truncated"              // read ended early; next turn self-heals (not SessionEnd)
+	QualityTranscriptUnavailable Quality = "transcript_unavailable" // hook payload carried no usable transcript path
 )
 
 // Delta is a slice of transcript bytes captured for one event: the raw lines in
@@ -91,11 +92,13 @@ type ToolUse struct {
 // fills the agent-specific parts (kind, prompt, transcript bytes, cursor); the
 // core stamps timestamp/HEAD and takes the worktree snapshot.
 type Event struct {
+	Agent      string
 	SessionID  string
 	Kind       Kind
 	Prompt     string // PromptSubmit only
 	Model      string
-	Transcript Delta       // populated on Stop/SessionEnd
+	ForkedFrom string      // parent session ID when this session was forked (Codex only)
+	Transcript Delta       // populated on Stop/SessionEnd; also on SessionStart for fork preamble
 	Sidechains []Sidechain // populated on SubagentStop
 	Tool       *ToolUse    // populated on KindToolUse
 	Cursor     Cursor      // advanced cursor after this event

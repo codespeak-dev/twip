@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/codespeak-dev/twip/internal/hookutil"
 )
 
 func readSettingsFile(t *testing.T, repoRoot string) map[string]json.RawMessage {
@@ -107,7 +109,7 @@ func TestInstallHooks_PreservesForeignHooksAndKeys(t *testing.T) {
 			if h.Command == "my-own-tool stop" {
 				foundForeign = true
 			}
-			if isTwipHook(h.Command) {
+			if hookutil.IsTwipHook(h.Command) {
 				foundTwip = true
 			}
 		}
@@ -148,7 +150,7 @@ func TestUninstallHooks_RemovesOnlyTwip(t *testing.T) {
 	stop := decodeMatchers(hooks["Stop"])
 	for _, m := range stop {
 		for _, h := range m.Hooks {
-			if isTwipHook(h.Command) {
+			if hookutil.IsTwipHook(h.Command) {
 				t.Errorf("twip Stop hook survived uninstall: %q", h.Command)
 			}
 		}

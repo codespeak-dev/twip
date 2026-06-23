@@ -10,11 +10,11 @@ func newInitCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "init",
 		Short: "Enable twip recording in this repo (agent hooks, journal, sync)",
-		Long: "Enables twip for this repo: installs the chosen agent's hooks into " +
-			"<repo>/.claude/settings.json so twip records each session turn (hooks twip " +
-			"does not own are preserved), creates this clone's journal id (the marker the " +
-			"git shim gates on), and installs a best-effort pre-push hook that mirrors the " +
-			"journal on push. Teammates' journals are not fetched automatically — run " +
+		Long: "Enables twip for this repo: installs the chosen agent's hooks into its " +
+			"config directory so twip records each session turn (hooks twip does not own " +
+			"are preserved), creates this clone's journal id (the marker the git shim " +
+			"gates on), and installs a best-effort pre-push hook that mirrors the journal on " +
+			"push. Teammates' journals are not fetched automatically — run " +
 			"`twip sync fetch` to pull them on demand.\n\n" +
 			"With --enforce it also gates `git push`, blocking pushes that aren't being " +
 			"recorded. If a hook manager already owns the pre-push hook (lefthook, husky, " +
@@ -29,14 +29,14 @@ func newInitCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ag, err := agent.Get(agentName)
-			if err != nil {
-				return err
+
+			// Determine which agents to install. An explicit --agent flag installs
+			// only that agent; the default (flag not set) installs all registered agents.
+			agentNames := agent.List()
+			if cmd.Flags().Changed("agent") {
+				agentNames = []string{agentName}
 			}
-			n, err := ag.InstallHooks(ctx, root, force)
-			if err != nil {
-				return err
-			}
+
 			rec := store.New(root)
 			// Create the clone-id eagerly: it's the marker the git shim gates on,
 			// so destructive git ops are recorded only in repos that opted in here.
@@ -44,7 +44,21 @@ func newInitCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cmd.Printf("Installed %d %s hook(s) in %s/.claude/settings.json\n", n, agentName, root)
+
+			for _, name := range agentNames {
+				ag, err := agent.Get(name)
+				if err != nil {
+					return err
+				}
+				n, err := ag.InstallHooks(ctx, root, force)
+				if err != nil {
+					return err
+				}
+				cmd.Printf("Installed %d %s hook(s).\n", n, name)
+				if name == "codex" {
+					cmd.Println("Note: Codex requires you to trust the .codex/ project layer and may prompt you to approve hooks with `/hooks`.")
+				}
+			}
 			cmd.Printf("Events will be recorded to refs/twip/journal/%s in this repo.\n", cloneID)
 
 			// Wire up sync (push via pre-push hook, fetch via refspec). The bundled
@@ -67,7 +81,7 @@ func newInitCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().String("agent", "claude-code", "agent whose hooks to install")
+	cmd.Flags().String("agent", "claude-code", "agent whose hooks to install (default: all registered agents)")
 	cmd.Flags().Bool("force", false, "reinstall hooks, replacing any twip-owned entries")
 	cmd.Flags().Bool("enforce", false, "also gate `git push`: block pushes from this repo unless recording is active")
 	return cmd

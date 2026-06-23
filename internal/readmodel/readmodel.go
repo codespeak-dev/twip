@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/codespeak-dev/twip/internal/agent"
 	"github.com/codespeak-dev/twip/internal/gitutil"
 	"github.com/codespeak-dev/twip/internal/store"
 )
@@ -18,6 +19,7 @@ import (
 // the workspace lane; CloneLabel is the human-friendly clone name (its journal's
 // commit author). All of these may be empty — the renderer falls back.
 type Entry struct {
+	Agent      string `json:"agent,omitempty"`
 	Session    string `json:"session"` // attribution only ("" for session-independent events)
 	Commit     string `json:"commit"`
 	Seq        int    `json:"seq"`
@@ -35,7 +37,7 @@ type Entry struct {
 func entryFor(ec store.EventCommit) Entry {
 	r := ec.Record
 	e := Entry{
-		Session: r.SessionID, Commit: ec.Commit, Seq: r.Seq, Kind: r.Kind,
+		Agent: r.Agent, Session: r.SessionID, Commit: ec.Commit, Seq: r.Seq, Kind: r.Kind,
 		TS: r.TS, Branch: r.Branch, Worktree: r.WorktreeID, Clone: ec.Clone,
 		Prompt: r.Prompt, Detail: r.Prompt,
 	}
@@ -48,7 +50,7 @@ func entryFor(ec store.EventCommit) Entry {
 			e.Detail += " · " + r.ToolUse.Detail
 		}
 	}
-	if r.Transcript != nil && r.Transcript.Quality != "ok" {
+	if r.Transcript != nil && r.Transcript.Quality != string(agent.QualityOK) {
 		e.Quality = r.Transcript.Quality
 	}
 	return e
@@ -95,6 +97,7 @@ type EventDetail struct {
 	Entry
 	Head           string             `json:"head"`
 	Model          string             `json:"model"`
+	ForkedFrom     string             `json:"forkedFrom,omitempty"` // parent session ID for Codex fork sessions
 	Transcript     string             `json:"transcript"`
 	TranscriptFrom int                `json:"transcriptFrom"`
 	TranscriptTo   int                `json:"transcriptTo"`
@@ -137,6 +140,7 @@ func Event(ctx context.Context, repoRoot, commitRef string) (*EventDetail, error
 		Entry:        entryFor(cur),
 		Head:         r.Head,
 		Model:        r.Model,
+		ForkedFrom:   r.ForkedFrom,
 		WorktreeTree: r.WorktreeTree,
 		GitOp:        r.GitOp,
 		ToolUse:      r.ToolUse,

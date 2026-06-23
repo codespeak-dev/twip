@@ -73,7 +73,7 @@ func TestAppend_ChainsAndIsReadable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev1 := &agent.Event{SessionID: sid, Kind: agent.KindSessionStart, Cursor: agent.Cursor{Main: 0}}
+	ev1 := &agent.Event{Agent: "claude-code", SessionID: sid, Kind: agent.KindSessionStart, Cursor: agent.Cursor{Main: 0}}
 	r1, err := rec.Append(ctx, ev1, snap1, "main", prior.Seq, time.Unix(1000, 0))
 	if err != nil {
 		t.Fatal(err)
@@ -103,6 +103,7 @@ func TestAppend_ChainsAndIsReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	ev2 := &agent.Event{
+		Agent:      "claude-code",
 		SessionID:  sid,
 		Kind:       agent.KindStop,
 		Transcript: agent.Delta{Bytes: []byte("{\"x\":1}\n"), From: 0, To: 1, Quality: agent.QualityOK},
@@ -147,8 +148,8 @@ func TestAppend_ChainsAndIsReadable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec2.SessionID != sid || rec2.WorktreeID != "main" {
-		t.Errorf("attribution fields = session %q worktree %q", rec2.SessionID, rec2.WorktreeID)
+	if rec2.Agent != "claude-code" || rec2.SessionID != sid || rec2.WorktreeID != "main" {
+		t.Errorf("attribution fields = agent %q session %q worktree %q", rec2.Agent, rec2.SessionID, rec2.WorktreeID)
 	}
 
 	// Cursor round-trips through the log via back-scan.

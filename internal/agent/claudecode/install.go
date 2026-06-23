@@ -1,13 +1,13 @@
 package claudecode
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+
+	"github.com/codespeak-dev/twip/internal/hookutil"
 )
 
 // settingsFile is the Claude Code config we install hooks into, relative to repoRoot.
@@ -49,16 +49,7 @@ func (a *Agent) hookSpecs() []hookSpec {
 
 // command builds the safe, PATH-resolved hook command. The `command -v` guard
 // makes the hook a no-op when twip is not installed, so it never breaks the agent.
-func (a *Agent) command(verb string) string {
-	return fmt.Sprintf(
-		"sh -c 'command -v twip >/dev/null 2>&1 || exit 0; exec twip hook %s %s'",
-		a.Name(), verb,
-	)
-}
-
-func isTwipHook(cmd string) bool {
-	return strings.Contains(cmd, "twip hook ")
-}
+func (a *Agent) command(verb string) string { return hookutil.HookCommand(a.Name(), verb) }
 
 // InstallHooks adds twip's hooks to .claude/settings.json, preserving any hooks
 // (and any settings) twip does not own. Returns the number of hooks added.
@@ -134,7 +125,7 @@ func readSettings(path string) (settings, hooks map[string]json.RawMessage, err 
 
 func writeSettings(path string, settings, hooks map[string]json.RawMessage) error {
 	if len(hooks) > 0 {
-		raw, err := marshalNoEscape(hooks)
+		raw, err := hookutil.MarshalNoEscape(hooks)
 		if err != nil {
 			return err
 		}
@@ -142,7 +133,7 @@ func writeSettings(path string, settings, hooks map[string]json.RawMessage) erro
 	} else {
 		delete(settings, "hooks")
 	}
-	out, err := marshalIndentNoEscape(settings)
+	out, err := hookutil.MarshalIndentNoEscape(settings)
 	if err != nil {
 		return err
 	}
@@ -171,7 +162,7 @@ func setMatchers(hooks map[string]json.RawMessage, event string, matchers []hook
 		delete(hooks, event)
 		return
 	}
-	raw, err := marshalNoEscape(matchers)
+	raw, err := hookutil.MarshalNoEscape(matchers)
 	if err != nil {
 		return
 	}
@@ -208,7 +199,7 @@ func removeTwipHooks(matchers []hookMatcher) []hookMatcher {
 	for _, m := range matchers {
 		kept := make([]hookEntry, 0, len(m.Hooks))
 		for _, h := range m.Hooks {
-			if !isTwipHook(h.Command) {
+			if !hookutil.IsTwipHook(h.Command) {
 				kept = append(kept, h)
 			}
 		}
@@ -220,25 +211,3 @@ func removeTwipHooks(matchers []hookMatcher) []hookMatcher {
 	return out
 }
 
-// marshalNoEscape / marshalIndentNoEscape avoid HTML-escaping so the shell hook
-// commands (which contain >, |, &) stay readable in settings.json.
-func marshalNoEscape(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
-}
-
-func marshalIndentNoEscape(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}

@@ -28,10 +28,13 @@ func TestDeltaFrom(t *testing.T) {
 		{"empty", "", 0, "", 0, false},
 		{"from beyond data", "a\nb\n", 5, "", 2, true},
 		{"single partial line", "x", 0, "x", 1, false},
+		// cursor exactly at total with no trailing newline must not be truncated
+		{"cursor at total, no trailing newline", "a\nb", 2, "", 2, false},
+		{"cursor past total, no trailing newline", "a\nb", 3, "", 2, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			delta, total, trunc := deltaFrom([]byte(tc.data), tc.from)
+			delta, total, trunc := agent.DeltaFrom([]byte(tc.data), tc.from)
 			if string(delta) != tc.wantDelta {
 				t.Errorf("delta = %q, want %q", delta, tc.wantDelta)
 			}
@@ -63,13 +66,13 @@ func TestCountLines(t *testing.T) {
 
 func TestValidateAgentID(t *testing.T) {
 	for _, ok := range []string{"a089f8e", "abc-123_X"} {
-		if err := validateAgentID(ok); err != nil {
-			t.Errorf("validateAgentID(%q) unexpected error: %v", ok, err)
+		if err := agent.ValidateAgentID(ok); err != nil {
+			t.Errorf("agent.ValidateAgentID(%q) unexpected error: %v", ok, err)
 		}
 	}
 	for _, bad := range []string{"", "../etc", "a/b", "a.jsonl", "a b"} {
-		if err := validateAgentID(bad); err == nil {
-			t.Errorf("validateAgentID(%q) = nil, want error", bad)
+		if err := agent.ValidateAgentID(bad); err == nil {
+			t.Errorf("agent.ValidateAgentID(%q) = nil, want error", bad)
 		}
 	}
 }

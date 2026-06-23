@@ -117,6 +117,7 @@ func (r *Recorder) ArchiveStash(ctx context.Context, shas []string) []string {
 // session events and (later) session-independent ones.
 type Record struct {
 	Schema       int             `json:"schema"`
+	Agent        string          `json:"agent,omitempty"`
 	Kind         string          `json:"kind"`
 	TS           string          `json:"ts"`
 	SessionID    string          `json:"session_id,omitempty"`
@@ -126,6 +127,7 @@ type Record struct {
 	Branch       string          `json:"branch,omitempty"`
 	WorktreeTree string          `json:"worktree_tree,omitempty"`
 	Model        string          `json:"model,omitempty"`
+	ForkedFrom   string          `json:"forked_from,omitempty"` // parent session ID (Codex fork sessions only)
 	Prompt       string          `json:"prompt,omitempty"`
 	Transcript   *DeltaMeta      `json:"transcript,omitempty"`
 	Sidechains   []SidechainMeta `json:"sidechains,omitempty"`
@@ -231,6 +233,7 @@ func (r *Recorder) Append(ctx context.Context, ev *agent.Event, snap snapshot.Sn
 
 	rec := Record{
 		Schema:       SchemaVersion,
+		Agent:        ev.Agent,
 		Kind:         string(ev.Kind),
 		TS:           now.UTC().Format(time.RFC3339Nano),
 		SessionID:    ev.SessionID,
@@ -240,6 +243,7 @@ func (r *Recorder) Append(ctx context.Context, ev *agent.Event, snap snapshot.Sn
 		Branch:       snap.Branch,
 		WorktreeTree: snap.Tree,
 		Model:        ev.Model,
+		ForkedFrom:   ev.ForkedFrom,
 		Prompt:       ev.Prompt,
 		Cursor:       &ev.Cursor,
 	}

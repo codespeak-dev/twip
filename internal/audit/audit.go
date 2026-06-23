@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/codespeak-dev/twip/internal/agent"
 	"github.com/codespeak-dev/twip/internal/gitutil"
 	"github.com/codespeak-dev/twip/internal/store"
 )
@@ -118,7 +119,7 @@ func Run(ctx context.Context, repoRoot string) (*Report, error) {
 			if r.Cursor != nil && r.Transcript.To != r.Cursor.Main {
 				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("transcript to=%d disagrees with cursor.main=%d", r.Transcript.To, r.Cursor.Main))
 			}
-			if r.Transcript.Quality != "ok" {
+			if r.Transcript.Quality != string(agent.QualityOK) {
 				add(r.SessionID, r.Seq, SeverityWarn, "transcript quality: "+r.Transcript.Quality)
 			}
 		}
@@ -136,7 +137,7 @@ func Run(ctx context.Context, repoRoot string) (*Report, error) {
 			if side.From != sc.sidechain[side.ID] {
 				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("sidechain %s discontinuity: from=%d, expected %d", side.ID, side.From, sc.sidechain[side.ID]))
 			}
-			if side.Quality != "ok" {
+			if side.Quality != string(agent.QualityOK) {
 				add(r.SessionID, r.Seq, SeverityWarn, fmt.Sprintf("sidechain %s quality: %s", side.ID, side.Quality))
 			}
 			sc.sidechain[side.ID] = side.To
