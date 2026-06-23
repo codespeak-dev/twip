@@ -29,14 +29,14 @@ func newInitCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ag, err := agent.Get(agentName)
-			if err != nil {
-				return err
+
+			// Determine which agents to install. An explicit --agent flag installs
+			// only that agent; the default (flag not set) installs all registered agents.
+			agentNames := agent.List()
+			if cmd.Flags().Changed("agent") {
+				agentNames = []string{agentName}
 			}
-			n, err := ag.InstallHooks(ctx, root, force)
-			if err != nil {
-				return err
-			}
+
 			rec := store.New(root)
 			// Create the clone-id eagerly: it's the marker the git shim gates on,
 			// so destructive git ops are recorded only in repos that opted in here.
@@ -44,9 +44,20 @@ func newInitCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cmd.Printf("Installed %d %s hook(s).\n", n, agentName)
-			if agentName == "codex" {
-				cmd.Println("Note: Codex requires you to trust the .codex/ project layer and may prompt you to approve hooks with `/hooks`.")
+
+			for _, name := range agentNames {
+				ag, err := agent.Get(name)
+				if err != nil {
+					return err
+				}
+				n, err := ag.InstallHooks(ctx, root, force)
+				if err != nil {
+					return err
+				}
+				cmd.Printf("Installed %d %s hook(s).\n", n, name)
+				if name == "codex" {
+					cmd.Println("Note: Codex requires you to trust the .codex/ project layer and may prompt you to approve hooks with `/hooks`.")
+				}
 			}
 			cmd.Printf("Events will be recorded to refs/twip/journal/%s in this repo.\n", cloneID)
 
@@ -70,7 +81,7 @@ func newInitCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().String("agent", "claude-code", "agent whose hooks to install")
+	cmd.Flags().String("agent", "claude-code", "agent whose hooks to install (default: all registered agents)")
 	cmd.Flags().Bool("force", false, "reinstall hooks, replacing any twip-owned entries")
 	cmd.Flags().Bool("enforce", false, "also gate `git push`: block pushes from this repo unless recording is active")
 	return cmd

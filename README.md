@@ -1,8 +1,8 @@
 # twip — agent/git history collector
 
-A browsable, append-only timeline of your repo as coding agents develop it. Every Claude Code turn
-and every mutating git op is linked to the exact worktree snapshot at that moment; nothing is ever
-deleted. Browse it at `twip serve`.
+A browsable, append-only timeline of your repo as coding agents develop it. Every Claude Code and
+Codex turn and every mutating git op is linked to the exact worktree snapshot at that moment;
+nothing is ever deleted. Browse it at `twip serve`.
 
 ## Installation
 
@@ -17,12 +17,17 @@ from your shell rc so the shim is on `PATH` (rustup-style; `--no-modify-path` to
 `twip uninstall` to reverse it). Start a new shell, then in each repo you want recorded:
 
 ```sh
-twip init && git add .claude/settings.json && git commit -m "twip: record agent sessions"
+twip init && git add .claude/settings.json .codex/hooks.json .codex/config.toml && git commit -m "twip: record agent sessions"
 ```
 
-Committed hooks are a no-op for anyone without twip. Optionally `twip init --enforce` also gates
-`git push` from the repo, blocking pushes that aren't being recorded (bypass once with
-`git push --no-verify`). Everyday commands: `twip log` / `show <event-id>` / `audit` / `serve`.
+`twip init` installs hooks for all supported agents (Claude Code and Codex) by default. Pass
+`--agent claude-code` or `--agent codex` to install only one. Committed hooks are a no-op for
+anyone without twip. Optionally `twip init --enforce` also gates `git push` from the repo,
+blocking pushes that aren't being recorded (bypass once with `git push --no-verify`). Everyday
+commands: `twip log` / `show <event-id>` / `audit` / `serve`.
+
+> **Codex note:** after `twip init`, open Codex in the repo and run `/hooks` to approve the hooks
+> in its project layer.
 
 ### Updating
 
@@ -84,14 +89,14 @@ not via a sha buried in JSON):
 - `meta/` — the event record (`event.json`), the turn's transcript delta (`transcript.jsonl`), and
   any subagent sidechain deltas.
 
-**What's recorded.** Claude Code sessions via hooks — turn boundaries (prompt/stop) *and*
-intermediate mutating tool calls (`Edit`/`Write`/`Bash`/…), each snapshotting the worktree at that
-moment so the timeline shows mid-turn states, not just turn ends (a tool call that changes nothing
-is dropped). And git operations via the shim: every mutating op (read-only `status`/`log`/`diff`
-are skipped); destructive ops additionally snapshot the dirty worktree first (which no git hook can
-do); history-rewriting ones (`commit --amend`, `rebase`, `reset`) pin the orphaned pre-rewrite
-commit; and stash entries (which live in `refs/stash`, outside the worktree) are pinned before a
-`stash drop`/`clear`.
+**What's recorded.** Claude Code and Codex sessions via hooks — turn boundaries (prompt/stop) *and*
+intermediate mutating tool calls (`Edit`/`Write`/`Bash`/`apply_patch`/…), each snapshotting the
+worktree at that moment so the timeline shows mid-turn states, not just turn ends (a tool call that
+changes nothing is dropped). And git operations via the shim: every mutating op (read-only
+`status`/`log`/`diff` are skipped); destructive ops additionally snapshot the dirty worktree first
+(which no git hook can do); history-rewriting ones (`commit --amend`, `rebase`, `reset`) pin the
+orphaned pre-rewrite commit; and stash entries (which live in `refs/stash`, outside the worktree)
+are pinned before a `stash drop`/`clear`.
 
 **The no-silent-loss guarantee.** `twip audit` checks that every event's worktree snapshot
 resolves, seq numbers are contiguous, transcript offsets join end-to-end, and surfaces any
@@ -112,9 +117,7 @@ flat. It's conflict-free by construction: each clone is the sole writer of its o
 `refs/twip/journal/<clone-id>`, so every push is a fast-forward and there is never a merge. The
 browser then lanes the whole team's timeline, each clone labeled by its author.
 
-*Pending:* tripwire hook (detect shim bypass), graded commit↔session links. Only Claude Code is
-implemented, but the agent seam (`internal/agent`) makes adding one "implement the interface +
-register".
+*Pending:* tripwire hook (detect shim bypass), graded commit↔session links.
 
 ## Layout
 
@@ -122,6 +125,7 @@ register".
 cmd/twip/                CLI (cobra): init, install, hook, check, sync, audit, log, show, serve, version
 internal/agent/          agent-extension seam: lean Agent interface + registry + normalized Event
 internal/agent/claudecode/  Claude Code: hook parse/install, transcript flush + delta + sidechains
+internal/agent/codex/    Codex: hook parse/install, transcript flush + delta + sidechains
 cmd/twip/gitshim.go      the `git` shim capture path (pre-destruction snapshot, recursion guard)
 cmd/twip/shim.go         `twip shim install/uninstall` (writes the git wrapper + PATH guidance)
 cmd/twip/install.go      `twip install/uninstall` (stable binary copy + shim + shell-rc PATH wiring)
