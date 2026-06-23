@@ -13,8 +13,9 @@ func newInitCmd() *cobra.Command {
 		Long: "Enables twip for this repo: installs the chosen agent's hooks into " +
 			"<repo>/.claude/settings.json so twip records each session turn (hooks twip " +
 			"does not own are preserved), creates this clone's journal id (the marker the " +
-			"git shim gates on), installs a best-effort pre-push hook that mirrors the " +
-			"journal on push, and adds a fetch refspec for teammates' journals.\n\n" +
+			"git shim gates on), and installs a best-effort pre-push hook that mirrors the " +
+			"journal on push. Teammates' journals are not fetched automatically — run " +
+			"`twip sync fetch` to pull them on demand.\n\n" +
 			"With --enforce it also gates `git push`, blocking pushes that aren't being " +
 			"recorded. If a hook manager already owns the pre-push hook (lefthook, husky, " +
 			"pre-commit), twip leaves it untouched and prints the config to wire in instead.",
@@ -83,9 +84,11 @@ func reportSync(cmd *cobra.Command, s store.SyncSetup) {
 	}
 	switch {
 	case s.Remote == "":
-		cmd.Println("No remote yet — add an 'origin' and re-run `twip init` to fetch teammates' journals.")
-	case len(s.AddedRefspecs) > 0:
-		cmd.Printf("Configured '%s' to fetch teammates' journals on `git fetch`/`pull`.\n", s.Remote)
+		cmd.Println("No remote yet — your journal will mirror to it once you add one and push.")
+	case len(s.RemovedRefspecs) > 0:
+		cmd.Printf("Disabled auto-fetch of teammates' journals on '%s' (it's opt-in now: run `twip sync fetch`).\n", s.Remote)
+	default:
+		cmd.Println("Teammates' journals aren't fetched automatically — run `twip sync fetch` when you want them.")
 	}
 }
 

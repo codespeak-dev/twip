@@ -11,8 +11,9 @@ import (
 )
 
 // twip sync rides on normal git: a pre-push hook mirrors this clone's journal to
-// the remote you push to, and a fetch refspec pulls teammates' journals on a
-// normal fetch/pull. It works because the refs/twip/* namespace is conflict-free
+// the remote you push to. Fetching teammates' journals is opt-in — `twip sync
+// fetch` pulls them on demand; twip no longer wires a fetch refspec into a normal
+// `git fetch`/`pull`. It works because the refs/twip/* namespace is conflict-free
 // (each clone is the sole writer of its own journal; pins/stash are sha-keyed and
 // idempotent), so push is always a fast-forward and there is never a merge.
 
@@ -58,13 +59,13 @@ func foreignHookSnippet(twipPath string, enforce bool) string {
 
 // SyncSetup reports what InstallSync did, for `twip init` to surface.
 type SyncSetup struct {
-	HookStatus    string // "installed" | "updated" | "foreign" (left a non-twip hook untouched)
-	HookPath      string
-	HookSnippet   string   // for a foreign hook with no known manager: the raw line(s) to add
-	HookManager   string   // detected hook manager for a foreign hook: "lefthook"|"husky"|"pre-commit"|""
-	Enforce       bool     // whether --enforce was requested (the gate should be wired in)
-	Remote        string   // remote whose fetch refspec is configured ("" if no remote yet)
-	AddedRefspecs []string // refspecs added this run (empty if already present)
+	HookStatus      string // "installed" | "updated" | "foreign" (left a non-twip hook untouched)
+	HookPath        string
+	HookSnippet     string   // for a foreign hook with no known manager: the raw line(s) to add
+	HookManager     string   // detected hook manager for a foreign hook: "lefthook"|"husky"|"pre-commit"|""
+	Enforce         bool     // whether --enforce was requested (the gate should be wired in)
+	Remote          string   // remote sync targets ("" if no remote yet)
+	RemovedRefspecs []string // legacy auto-fetch refspecs stripped this run (fetch is opt-in now)
 }
 
 // detectHookManager guesses which hook manager owns this repo's git hooks (by its
@@ -122,13 +123,13 @@ func (r *Recorder) InstallSync(ctx context.Context, twipPath string, enforce boo
 		}
 	}
 
-	if remote := r.syncRemote(ctx); remote != "" {
+	if remote := r.SyncRemote(ctx); remote != "" {
 		s.Remote = remote
-		added, err := r.ensureFetchRefspecs(ctx, remote)
+		removed, err := r.removeFetchRefspecs(ctx, remote)
 		if err != nil {
 			return s, err
 		}
-		s.AddedRefspecs = added
+		s.RemovedRefspecs = removed
 	}
 	return s, nil
 }
@@ -157,6 +158,25 @@ func (r *Recorder) SyncPush(ctx context.Context, remote string) error {
 	return err
 }
 
+// SyncFetch pulls teammates' journals/pins/stash from remote into this clone's
+// local read namespaces — each clone's journal under its own
+// refs/twip/remotes/<remote>/journal/<clone-id> (so different authors and branches
+// stay separate and never collide), pins/stash flat (sha-keyed, idempotent). It is
+// the opt-in counterpart to push: twip no longer wires this into `git fetch`/`pull`,
+// so a teammate's logs appear only after an explicit `twip sync fetch`. Unlike
+// SyncPush this is user-invoked, so it surfaces errors instead of swallowing them,
+// and it only ever writes remote-tracking copies — never this clone's own journal.
+func (r *Recorder) SyncFetch(ctx context.Context, remote string) error {
+	if remote == "" {
+		return fmt.Errorf("no remote to fetch from")
+	}
+	// No --prune: the flat pin/stash refspecs would otherwise delete local-only
+	// pins/stash that were never pushed.
+	args := append([]string{"fetch", "--quiet", remote}, twipFetchRefspecs(remote)...)
+	_, err := gitutil.Run(ctx, r.RepoRoot, nil, nil, args...)
+	return err
+}
+
 // prePushHookPath resolves the hooks dir (honoring core.hooksPath and worktrees)
 // and returns the pre-push path under it.
 func (r *Recorder) prePushHookPath(ctx context.Context) (string, error) {
@@ -171,9 +191,9 @@ func (r *Recorder) prePushHookPath(ctx context.Context) (string, error) {
 	return filepath.Join(dir, "pre-push"), nil
 }
 
-// syncRemote picks the remote to sync with: origin if present, else the sole
+// SyncRemote picks the remote to sync with: origin if present, else the sole
 // remote, else none (sync stays dormant until an origin is added).
-func (r *Recorder) syncRemote(ctx context.Context) string {
+func (r *Recorder) SyncRemote(ctx context.Context) string {
 	out, err := gitutil.Out(ctx, r.RepoRoot, "remote")
 	if err != nil {
 		return ""
@@ -190,33 +210,49 @@ func (r *Recorder) syncRemote(ctx context.Context) string {
 	return ""
 }
 
-// ensureFetchRefspecs adds the twip fetch refspecs to remote.<remote>.fetch if
-// absent (alongside the remote's existing refspecs), returning those it added.
-// Journals fetch into the mirror namespace; pins/stash fetch flat (sha-keyed).
-func (r *Recorder) ensureFetchRefspecs(ctx context.Context, remote string) ([]string, error) {
-	key := "remote." + remote + ".fetch"
-	want := []string{
+// twipFetchRefspecs are the refspecs that bring teammates' twip refs into this
+// clone's read namespaces: each clone's journal into its own remote-tracking ref
+// under MirrorRefPrefix (so authors/branches stay separate and never collide),
+// pins/stash flat (sha-keyed, idempotent). Used by SyncFetch (to pull on demand)
+// and by removeFetchRefspecs (to strip the old auto-fetch wiring from a remote).
+func twipFetchRefspecs(remote string) []string {
+	return []string{
 		"+" + JournalRefPrefix + "*:" + MirrorRefPrefix + remote + "/journal/*",
 		"+" + PinRefPrefix + "*:" + PinRefPrefix + "*",
 		"+" + StashRefPrefix + "*:" + StashRefPrefix + "*",
 	}
-	have := map[string]bool{}
-	if out, err := gitutil.Out(ctx, r.RepoRoot, "config", "--get-all", key); err == nil {
-		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-			if line != "" {
-				have[strings.TrimSpace(line)] = true
-			}
+}
+
+// removeFetchRefspecs strips any twip-managed fetch refspecs from
+// remote.<remote>.fetch, leaving the remote's own refspecs intact. Auto-fetch of
+// teammates' journals is off by default now — `twip sync fetch` pulls them on
+// demand — so init removes the wiring older twip versions added. Returns the
+// refspecs removed; a no-op (nil) when the remote has none.
+func (r *Recorder) removeFetchRefspecs(ctx context.Context, remote string) ([]string, error) {
+	key := "remote." + remote + ".fetch"
+	out, err := gitutil.Out(ctx, r.RepoRoot, "config", "--get-all", key)
+	if err != nil {
+		return nil, nil // key unset: nothing twip could have added
+	}
+	present := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if v := strings.TrimSpace(line); v != "" {
+			present[v] = true
 		}
 	}
-	var added []string
-	for _, rs := range want {
-		if have[rs] {
+	var removed []string
+	for _, rs := range twipFetchRefspecs(remote) {
+		if !present[rs] {
 			continue
 		}
-		if _, err := gitutil.Run(ctx, r.RepoRoot, nil, nil, "config", "--add", key, rs); err != nil {
-			return added, err
+		// --fixed-value (git >= 2.30) removes by exact value, so the refspec's
+		// regex metacharacters (+, *) need no escaping and the remote's own
+		// refspecs are untouched.
+		if _, err := gitutil.Run(ctx, r.RepoRoot, nil, nil,
+			"config", "--unset-all", "--fixed-value", key, rs); err != nil {
+			return removed, err
 		}
-		added = append(added, rs)
+		removed = append(removed, rs)
 	}
-	return added, nil
+	return removed, nil
 }

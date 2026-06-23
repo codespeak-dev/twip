@@ -98,14 +98,17 @@ resolves, seq numbers are contiguous, transcript offsets join end-to-end, and su
 data-quality flags — non-zero exit on any divergence. The shim falls back to real git if twip is
 unavailable, so it can never break git.
 
-**Sharing across the team.** Sync rides on normal git, so there's nothing extra to run. `twip init`
-installs a best-effort `pre-push` hook (which calls `twip sync push`, pushing with `--no-verify` so it
-never re-runs your other pre-push checks) that mirrors your journal to the remote you push to, and
-adds a `remote.origin.fetch` refspec so a plain `git fetch`/`pull` brings teammates' journals down
-(into `refs/twip/remotes/<remote>/journal/*`). If a hook manager already owns `pre-push` (lefthook,
-husky, pre-commit), twip detects it, leaves it untouched, and prints the exact config to add —
-wiring `twip sync push` (and, with `--enforce`, `twip check pre-push`) into the manager. It's
-conflict-free by construction: each clone is the sole writer of its own
+**Sharing across the team.** Push rides on normal git: `twip init` installs a best-effort `pre-push`
+hook (which calls `twip sync push`, pushing with `--no-verify` so it never re-runs your other
+pre-push checks) that mirrors your journal to the remote you push to. If a hook manager already owns
+`pre-push` (lefthook, husky, pre-commit), twip detects it, leaves it untouched, and prints the exact
+config to add — wiring `twip sync push` (and, with `--enforce`, `twip check pre-push`) into the
+manager.
+
+Fetching teammates' journals is **opt-in** — a plain `git fetch`/`pull` does *not* pull them. Run
+`twip sync fetch [remote]` when you want them; it pulls each clone's journal into
+`refs/twip/remotes/<remote>/journal/<clone-id>` (authors/branches stay separate), and pins/stash
+flat. It's conflict-free by construction: each clone is the sole writer of its own
 `refs/twip/journal/<clone-id>`, so every push is a fast-forward and there is never a merge. The
 browser then lanes the whole team's timeline, each clone labeled by its author.
 

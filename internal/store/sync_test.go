@@ -94,7 +94,7 @@ func TestJournalRefs_DedupPrefersLocal(t *testing.T) {
 
 // TestSync_TwoClonesShareTimeline is the end-to-end proof: two clones with
 // distinct identities each record + push; the pre-push hook mirrors their
-// journals to the shared origin, and a normal fetch (via the installed refspec)
+// journals to the shared origin, and an explicit `twip sync fetch` (SyncFetch)
 // brings the teammate's journal into the read model — author-attributed, with
 // the local clone's own journal preferred over its mirror.
 func TestSync_TwoClonesShareTimeline(t *testing.T) {
@@ -125,8 +125,11 @@ func TestSync_TwoClonesShareTimeline(t *testing.T) {
 	// of origin's mirror — the dedup must then prefer local.
 	appendEvent(t, recD, dmitry, "sid-d", 1500)
 
-	// A normal fetch carries the twip refs via the refspec InstallSync configured.
-	git(t, dmitry, "fetch", "-q", "origin")
+	// Pull the teammate's journal explicitly: twip no longer auto-fetches on a
+	// normal `git fetch`/`pull` — `twip sync fetch` (SyncFetch) is the opt-in path.
+	if err := recD.SyncFetch(ctx, "origin"); err != nil {
+		t.Fatalf("SyncFetch: %v", err)
+	}
 
 	refs, err := recD.JournalRefs(ctx)
 	if err != nil {
@@ -282,6 +285,49 @@ func TestInstallSync_ForeignHookUntouched(t *testing.T) {
 	}
 }
 
+// TestInstallSync_RemovesAutoFetch pins the disable-by-default migration: a repo
+// carrying the legacy auto-fetch refspecs (what older twip versions added) has them
+// stripped on init, while the remote's own refspec is left intact — and a re-run
+// removes nothing.
+func TestInstallSync_RemovesAutoFetch(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	// `git remote add` seeds remote.origin.fetch with the remote's own refspec.
+	git(t, repo, "remote", "add", "origin", t.TempDir())
+	own := "+refs/heads/*:refs/remotes/origin/*"
+	for _, rs := range []string{
+		"+refs/twip/journal/*:refs/twip/remotes/origin/journal/*",
+		"+refs/twip/pin/*:refs/twip/pin/*",
+		"+refs/twip/stash/*:refs/twip/stash/*",
+	} {
+		git(t, repo, "config", "--add", "remote.origin.fetch", rs)
+	}
+
+	s, err := New(repo).InstallSync(ctx, "/x/twip", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.RemovedRefspecs) != 3 {
+		t.Errorf("RemovedRefspecs = %v, want the 3 legacy twip refspecs", s.RemovedRefspecs)
+	}
+	out, _ := gitutil.Out(ctx, repo, "config", "--get-all", "remote.origin.fetch")
+	if strings.Contains(out, "refs/twip/") {
+		t.Errorf("twip fetch refspecs not removed:\n%s", out)
+	}
+	if !strings.Contains(out, own) {
+		t.Errorf("removal clobbered the remote's own refspec:\n%s", out)
+	}
+
+	// Idempotent: a second run finds nothing to remove.
+	s2, err := New(repo).InstallSync(ctx, "/x/twip", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s2.RemovedRefspecs) != 0 {
+		t.Errorf("second InstallSync removed %v, want none", s2.RemovedRefspecs)
+	}
+}
+
 // TestSyncPush_SkipsHooks pins the double-push fix: the mirror push must use
 // --no-verify so it never fires the pre-push hook (which would re-run a hook
 // manager's other jobs), while still mirroring the journal.
@@ -363,8 +409,8 @@ func setupClone(t *testing.T, base, origin, dir, name, email string) string {
 	git(t, dest, "config", "commit.gpgsign", "false")
 	// The bundled hook now shells out to an installed twip binary (absent in this
 	// unit test); point it at a path that won't exist so the hook is a clean no-op.
-	// What we exercise here is the store side: the fetch refspec InstallSync
-	// configures, plus SyncPush (driven explicitly in commitAndPush).
+	// What we exercise here is the store side: SyncPush (driven explicitly in
+	// commitAndPush) and SyncFetch (driven explicitly where teammates' logs are read).
 	if _, err := New(dest).InstallSync(context.Background(), filepath.Join(base, "no-twip"), false); err != nil {
 		t.Fatalf("InstallSync(%s): %v", dir, err)
 	}
