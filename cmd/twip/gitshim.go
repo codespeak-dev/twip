@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ const (
 	envShimActive = "TWIP_SHIM_ACTIVE" // set => a shim is already capturing; pass through
 	envRealGit    = "TWIP_REAL_GIT"    // absolute path to the real git binary
 	envSyncPush   = "TWIP_SYNC_PUSH"   // set => inside the sync pre-push hook; pass through
+	envRecordSync = "TWIP_RECORD_SYNC" // set => record git ops inline, not in a detached process
 )
 
 // skipOps are read-only / noisy git subcommands the shim does NOT record (editors
@@ -164,25 +166,121 @@ func capture(ctx context.Context, rec *store.Recorder, repoRoot, op string, args
 	}
 
 	exitCode := runReal(ctx, os.Getenv(envRealGit), args)
-
 	afterHead, _ := gitutil.Head(ctx, repoRoot)
-	// A history-rewriting op (amend/rebase/reset/…) orphans the previous HEAD.
-	// Recording the sha isn't enough — pin the commit so GC can't reclaim it.
-	if beforeHead != "" && beforeHead != afterHead {
-		rec.PinCommit(ctx, beforeHead)
+
+	// Everything below is post-op bookkeeping: pin the orphaned pre-op HEAD (a
+	// history-rewriting op like amend/rebase/reset leaves it unreferenced) and append
+	// the journal event. Both write refs/twip/* and so can stall for seconds when the
+	// user's own gc/pack-refs holds a ref lock — but git has already run, so this must
+	// not delay the user's command. Hand it to a detached process and exit now; only
+	// fall back to inline if detaching fails (or TWIP_RECORD_SYNC forces it).
+	p := gitOpRecord{
+		RepoRoot: repoRoot,
+		UnixNano: time.Now().UnixNano(),
+		Op: store.GitOpMeta{
+			Op: op, Argv: args, BeforeHead: beforeHead, AfterHead: afterHead,
+			ExitCode: exitCode, Dirty: dirty, Stashed: stashed,
+		},
+		SnapTree: snap.Tree, SnapHead: snap.Head, SnapBranch: snap.Branch,
 	}
-	op2 := store.GitOpMeta{
-		Op: op, Argv: args, BeforeHead: beforeHead, AfterHead: afterHead,
-		ExitCode: exitCode, Dirty: dirty, Stashed: stashed,
+	if os.Getenv(envRecordSync) == "1" || spawnDetachedRecord(p) != nil {
+		recordGitOp(ctx, p)
 	}
-	if _, err := rec.AppendGitOp(ctx, op2, snap, gitutil.WorktreeName(ctx, repoRoot), time.Now()); err != nil {
+	os.Exit(exitCode)
+}
+
+// gitOpRecord is the post-op bookkeeping handed to a detached `twip git-record`
+// process so the user's git command returns immediately instead of blocking on the
+// journal append. Fields are JSON-serializable (passed via a temp file).
+type gitOpRecord struct {
+	RepoRoot   string
+	UnixNano   int64
+	Op         store.GitOpMeta
+	SnapTree   string
+	SnapHead   string
+	SnapBranch string
+}
+
+// recordGitOp pins the orphaned pre-op HEAD (if the op rewrote it) and appends the
+// git-op event. Best-effort: errors are reported but never fatal. Runs either inline
+// (fallback / TWIP_RECORD_SYNC) or inside the detached git-record process.
+func recordGitOp(ctx context.Context, p gitOpRecord) {
+	rec := store.New(p.RepoRoot)
+	if p.Op.BeforeHead != "" && p.Op.BeforeHead != p.Op.AfterHead {
+		rec.PinCommit(ctx, p.Op.BeforeHead)
+	}
+	snap := snapshot.Snapshot{Tree: p.SnapTree, Head: p.SnapHead, Branch: p.SnapBranch}
+	if _, err := rec.AppendGitOp(ctx, p.Op, snap, gitutil.WorktreeName(ctx, p.RepoRoot), time.Unix(0, p.UnixNano)); err != nil {
 		if gitutil.IsWritesBlocked(err) {
 			noteWritesBlocked()
 		} else {
 			fmt.Fprintln(os.Stderr, "twip git-shim: record failed:", err)
 		}
 	}
-	os.Exit(exitCode)
+}
+
+// spawnDetachedRecord starts a detached `twip git-record` to do the journal write,
+// returning immediately. The payload goes via a temp file, not a stdin pipe (whose
+// copy goroutine couldn't finish once this process exits). The child is put in its
+// own session (so a shell exit can't SIGHUP it) and its stdio is NOT inherited —
+// inheriting stdout would hold a pipe open that a caller capturing git's output
+// would block on until the recorder finished.
+func spawnDetachedRecord(p gitOpRecord) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	f, err := os.CreateTemp("", "twip-gitop-*.json")
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return err
+	}
+	cmd := exec.Command(self, "git-record", f.Name())
+	cmd.Env = os.Environ() // inherits TWIP_SHIM_ACTIVE + TWIP_REAL_GIT
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		os.Remove(f.Name())
+		return err
+	}
+	_ = cmd.Process.Release()
+	return nil
+}
+
+// newGitRecordCmd is the detached worker the shim spawns: it reads a gitOpRecord
+// from the temp file named by its argument, records the event, and removes the file.
+func newGitRecordCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "git-record <payload-file>",
+		Short:  "Record a git-op event from a payload file (internal; spawned by the shim)",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			data, err := os.ReadFile(args[0]) //nolint:gosec // path is our own temp file
+			_ = os.Remove(args[0])
+			if err != nil {
+				return nil
+			}
+			var p gitOpRecord
+			if err := json.Unmarshal(data, &p); err != nil || p.RepoRoot == "" {
+				return nil
+			}
+			recordGitOp(cmd.Context(), p)
+			return nil
+		},
+	}
 }
 
 // writesBlockedOnce guards noteWritesBlocked so a single git invocation that hits

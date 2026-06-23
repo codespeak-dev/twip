@@ -25,6 +25,7 @@ func newRootCmd() *cobra.Command {
 		newUninstallCmd(),
 		newHookCmd(),
 		newGitShimCmd(),
+		newGitRecordCmd(),
 		newShimCmd(),
 		newCheckCmd(),
 		newSyncCmd(),

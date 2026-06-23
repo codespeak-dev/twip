@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/codespeak-dev/twip/internal/audit"
 	"github.com/codespeak-dev/twip/internal/gitutil"
@@ -278,12 +279,53 @@ func runShim(t *testing.T, twip, realGit, repo string, gitArgs ...string) {
 	args := append([]string{"git-shim", "--real-git=" + realGit, "--"}, gitArgs...)
 	cmd := exec.Command(twip, args...)
 	cmd.Dir = repo
-	// Ensure we exercise the capture path, not the recursion fast-path.
-	cmd.Env = append(os.Environ(), "TWIP_SHIM_ACTIVE=")
+	// Exercise the capture path (not the recursion fast-path), and record inline so
+	// the event is on disk when the call returns — the default path detaches the
+	// append to a background process (covered by TestGitShim_DetachedRecord).
+	cmd.Env = append(os.Environ(), "TWIP_SHIM_ACTIVE=", "TWIP_RECORD_SYNC=1")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		if _, ok := err.(*exec.ExitError); !ok {
 			t.Fatalf("run shim %v: %v\n%s", gitArgs, err, out)
 		}
+	}
+}
+
+// TestGitShim_DetachedRecord exercises the default path: the shim returns without
+// waiting on the journal append, and a detached `twip git-record` process writes the
+// event shortly after. (runShim forces inline recording; this one does not.)
+func TestGitShim_DetachedRecord(t *testing.T) {
+	ctx := context.Background()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	twip := buildTwip(t)
+	repo := e2eInitRepo(t)
+	if _, err := store.New(repo).CloneID(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	args := []string{"git-shim", "--real-git=" + realGit, "--", "tag", "v1"}
+	cmd := exec.Command(twip, args...)
+	cmd.Dir = repo
+	cmd.Env = append(os.Environ(), "TWIP_SHIM_ACTIVE=") // no TWIP_RECORD_SYNC: detach
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if _, ok := err.(*exec.ExitError); !ok {
+			t.Fatalf("run shim: %v\n%s", err, out)
+		}
+	}
+
+	// The detached recorder writes the event shortly after the shim returns.
+	var n int
+	for i := 0; i < 200; i++ {
+		if ev, _ := store.New(repo).LoadAllEvents(ctx); len(ev) > 0 {
+			n = len(ev)
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n != 1 {
+		t.Errorf("detached recorder produced %d events, want 1", n)
 	}
 }
 
