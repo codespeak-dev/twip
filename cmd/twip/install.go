@@ -248,7 +248,11 @@ func symlinkBinary(dst, src string) (linked bool, err error) {
 		if p, e := filepath.EvalSymlinks(target); e == nil {
 			target = p
 		}
-		if target == src {
+		resolvedSrc := src
+		if p, e := filepath.EvalSymlinks(src); e == nil {
+			resolvedSrc = p
+		}
+		if target == resolvedSrc {
 			return false, nil // already linked at src
 		}
 	}
