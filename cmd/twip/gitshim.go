@@ -102,9 +102,21 @@ func gitShim(ctx context.Context, realGit string, args []string) error {
 	if os.Getenv(envShimActive) == "1" || os.Getenv(envSyncPush) == "1" {
 		return execReal(realGit, args)
 	}
-	// From here on, our nested git calls inherit these and short-circuit above.
+	// Mark nested git calls to pass through (and tell gitutil the real git so they
+	// skip the shim hop). Set before the passthrough below too: it's free, and it
+	// keeps a downstream shim — if realGit is itself one — from re-recording.
 	_ = os.Setenv(envShimActive, "1")
 	_ = os.Setenv(envRealGit, realGit)
+
+	// Classify the op from argv alone — no git subprocess — so the common
+	// read-only/noisy case passes straight through with just the exec of the real
+	// git. Resolving the repo root and enabled state are themselves git calls, so
+	// doing them only for potentially-recorded ops keeps a startup tool that runs
+	// many read-only git commands from paying twip's probing cost on every one.
+	op, sub := gitOpAndSub(args)
+	if skipOps[op] || readOnlySubcmds[op][sub] {
+		return execReal(realGit, args) // read-only/noisy op: pass through, no record
+	}
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -117,10 +129,6 @@ func gitShim(ctx context.Context, realGit string, args []string) error {
 	rec := store.New(repoRoot)
 	if enabled, _ := rec.Enabled(ctx); !enabled {
 		return execReal(realGit, args) // repo not twip-enabled: stay invisible
-	}
-	op, sub := gitOpAndSub(args)
-	if skipOps[op] || readOnlySubcmds[op][sub] {
-		return execReal(realGit, args) // read-only/noisy op: pass through, no record
 	}
 
 	// Recorded op: capture the pre-op state, run git, record the result. Capture is

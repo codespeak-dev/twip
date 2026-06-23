@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -20,6 +21,19 @@ import (
 // EmptyTree is git's well-known empty tree object, usable as a diff base to show
 // every path in a tree as added.
 const EmptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+// gitBin is the git binary twip's own plumbing execs. When the shim has exported
+// TWIP_REAL_GIT (the resolved real git), twip uses it directly so internal calls
+// skip the shim hop (sh -> twip -> git) — a 3x process reduction per call that the
+// recorded git-op path makes many of. Otherwise it falls back to PATH "git", whose
+// shim entry passes straight through (TWIP_SHIM_ACTIVE is forced below). The env
+// name must match the shim's envRealGit.
+func gitBin() string {
+	if g := os.Getenv("TWIP_REAL_GIT"); g != "" {
+		return g
+	}
+	return "git"
+}
 
 // IsWritesBlocked reports whether err is the environment denying a git object or
 // ref write — EPERM ("Operation not permitted") or EACCES ("Permission denied")
@@ -48,7 +62,7 @@ func IsWritesBlocked(err error) bool {
 // lock. So we force the shim's pass-through guard on for every internal call;
 // only the user's/agent's own git commands should ever be recorded.
 func Run(ctx context.Context, dir string, env []string, stdin []byte, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", gcOff(args)...)
+	cmd := exec.CommandContext(ctx, gitBin(), gcOff(args)...)
 	cmd.Dir = dir
 	cmd.Env = append(cmd.Environ(), "TWIP_SHIM_ACTIVE=1")
 	if len(env) > 0 {
@@ -212,7 +226,7 @@ type BatchReader struct {
 
 // NewBatchReader starts the cat-file process. Close it to release the process.
 func NewBatchReader(ctx context.Context, repoRoot string) (*BatchReader, error) {
-	cmd := exec.CommandContext(ctx, "git", gcOff([]string{"cat-file", "--batch"})...)
+	cmd := exec.CommandContext(ctx, gitBin(), gcOff([]string{"cat-file", "--batch"})...)
 	cmd.Dir = repoRoot
 	cmd.Env = append(cmd.Environ(), "TWIP_SHIM_ACTIVE=1")
 	stdin, err := cmd.StdinPipe()
