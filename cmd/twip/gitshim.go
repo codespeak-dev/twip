@@ -37,6 +37,7 @@ var skipOps = map[string]bool{
 	"help": true, "version": true, "var": true, "check-ignore": true,
 	"check-attr": true, "name-rev": true, "merge-base": true, "rev-list": true,
 	"count-objects": true, "fsck": true, "whatchanged": true, "annotate": true,
+	"write-tree": true,
 }
 
 // readOnlySubcmds maps a recorded op to the sub-subcommands that are read-only,
@@ -48,6 +49,7 @@ var skipOps = map[string]bool{
 var readOnlySubcmds = map[string]map[string]bool{
 	"worktree": {"": true, "list": true},
 	"stash":    {"list": true, "show": true},
+	"remote":   {"": true, "show": true, "get-url": true},
 }
 
 // destructiveOps can clobber dirty worktree state, so the shim snapshots the
