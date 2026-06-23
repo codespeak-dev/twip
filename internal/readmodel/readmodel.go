@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/codespeak-dev/twip/internal/agent"
 	"github.com/codespeak-dev/twip/internal/gitutil"
 	"github.com/codespeak-dev/twip/internal/store"
 )
@@ -49,7 +50,7 @@ func entryFor(ec store.EventCommit) Entry {
 			e.Detail += " · " + r.ToolUse.Detail
 		}
 	}
-	if r.Transcript != nil && r.Transcript.Quality != "ok" {
+	if r.Transcript != nil && r.Transcript.Quality != string(agent.QualityOK) {
 		e.Quality = r.Transcript.Quality
 	}
 	return e

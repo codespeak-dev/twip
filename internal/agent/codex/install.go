@@ -67,7 +67,10 @@ func (a *Agent) InstallHooks(_ context.Context, repoRoot string, force bool) (in
 
 	count := 0
 	for _, spec := range a.hookSpecs() {
-		matchers := decodeMatchers(hooks[spec.event])
+		matchers, err := decodeMatchers(hooks[spec.event])
+		if err != nil {
+			return 0, err
+		}
 		if force {
 			matchers = removeTwipHooks(matchers)
 		}
@@ -102,8 +105,11 @@ func (a *Agent) UninstallHooks(_ context.Context, repoRoot string) error {
 		return err
 	}
 	for _, spec := range a.hookSpecs() {
-		matchers := removeTwipHooks(decodeMatchers(hooks[spec.event]))
-		setMatchers(hooks, spec.event, matchers)
+		matchers, err := decodeMatchers(hooks[spec.event])
+		if err != nil {
+			return err
+		}
+		setMatchers(hooks, spec.event, removeTwipHooks(matchers))
 	}
 	return writeHooksFile(path, outer, hooks)
 }
@@ -157,13 +163,15 @@ func writeHooksFile(path string, outer, hooks map[string]json.RawMessage) error 
 	return nil
 }
 
-func decodeMatchers(raw json.RawMessage) []hookMatcher {
+func decodeMatchers(raw json.RawMessage) ([]hookMatcher, error) {
 	if len(raw) == 0 {
-		return nil
+		return nil, nil
 	}
 	var m []hookMatcher
-	_ = json.Unmarshal(raw, &m)
-	return m
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, fmt.Errorf("parse hook matchers: %w", err)
+	}
+	return m, nil
 }
 
 func setMatchers(hooks map[string]json.RawMessage, event string, matchers []hookMatcher) {

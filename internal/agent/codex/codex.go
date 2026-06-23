@@ -118,12 +118,14 @@ func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Read
 		if raw.TranscriptPath != nil {
 			// Single read: derive line count, preamble bytes, and fork parent ID
 			// together to avoid a race between separate CountLines and ReadDelta calls.
-			data, _ := os.ReadFile(*raw.TranscriptPath) //nolint:gosec
-			preamble, total, _ := agent.DeltaFrom(data, 0)
-			cur.Main = total
-			if forkedFrom := forkParent(data); forkedFrom != "" {
-				ev.ForkedFrom = forkedFrom
-				ev.Transcript = agent.Delta{Bytes: preamble, From: 0, To: total, Quality: agent.QualityOK}
+			// On read failure keep prior.Main so the next Stop doesn't re-read from 0.
+			if data, err := os.ReadFile(*raw.TranscriptPath); err == nil { //nolint:gosec
+				preamble, total, _ := agent.DeltaFrom(data, 0)
+				cur.Main = total
+				if forkedFrom := forkParent(data); forkedFrom != "" {
+					ev.ForkedFrom = forkedFrom
+					ev.Transcript = agent.Delta{Bytes: preamble, From: 0, To: total, Quality: agent.QualityOK}
+				}
 			}
 		}
 		ev.Cursor = cur
