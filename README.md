@@ -8,12 +8,13 @@ deleted. Browse it at `twip serve`.
 
 ```sh
 go install github.com/codespeak-dev/twip/cmd/twip@latest   # get the binary
-twip install                                               # once per machine: stable copy + git shim + PATH
+twip install                                               # once per machine: stable binary + git shim + PATH
 ```
 
-`twip install` copies twip to a stable `~/.twip/bin/twip`, installs the git shim there, and sources
-`~/.twip/env` from your shell rc so the shim is on `PATH` (rustup-style; `--no-modify-path` to skip
-the rc edit, `twip uninstall` to reverse it). Start a new shell, then in each repo you want recorded:
+`twip install` points a stable `~/.twip/bin/twip` at the binary (a symlink when twip is a `go install`
+target, a copy when the source is transient), installs the git shim there, and sources `~/.twip/env`
+from your shell rc so the shim is on `PATH` (rustup-style; `--no-modify-path` to skip the rc edit,
+`twip uninstall` to reverse it). Start a new shell, then in each repo you want recorded:
 
 ```sh
 twip init && git add .claude/settings.json && git commit -m "twip: record agent sessions"
@@ -22,6 +23,17 @@ twip init && git add .claude/settings.json && git commit -m "twip: record agent 
 Committed hooks are a no-op for anyone without twip. Optionally `twip init --enforce` also gates
 `git push` from the repo, blocking pushes that aren't being recorded (bypass once with
 `git push --no-verify`). Everyday commands: `twip log` / `show <event-id>` / `audit` / `serve`.
+
+### Updating
+
+```sh
+go install github.com/codespeak-dev/twip/cmd/twip@latest   # that's it
+```
+
+After the first `twip install`, `~/.twip/bin/twip` is a symlink to your `go install` target, so a
+plain `go install` updates the binary the shim, the hooks, and your shell all run — no re-run needed.
+Re-run `twip install` only if you change `GOBIN`/`GOPATH`, or installed via a version manager
+(mise/asdf/brew) or `go run`, where twip keeps an independent **copy** that doesn't auto-follow.
 
 ### Manual PATH setup (if a new shell can't find the shim)
 

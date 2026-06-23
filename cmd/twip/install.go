@@ -27,9 +27,12 @@ func newInstallCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install twip machine-wide: stable binary, git shim, and PATH wiring",
-		Long: "Copies the running twip to a stable ~/.twip/bin/twip, installs the git shim " +
-			"there, and sources ~/.twip/env from your shell rc so the shim is on PATH. Run " +
-			"once per machine; then `twip init` any repo. Undo with `twip uninstall`.\n\n" +
+		Long: "Points a stable ~/.twip/bin/twip at the running binary (a symlink when twip " +
+			"lives in a durable location like a `go install` target, so a later reinstall " +
+			"auto-propagates; a copy when the source is transient, e.g. a `go run` build or a " +
+			"version-manager dir), installs the git shim there, and sources ~/.twip/env from " +
+			"your shell rc so the shim is on PATH. Run once per machine; then `twip init` any " +
+			"repo. Undo with `twip uninstall`.\n\n" +
 			"Manual setup, if the PATH edit doesn't take effect (managed dotfiles, a shell " +
 			"whose rc isn't sourced, or a GUI app that ignores PATH):\n" +
 			"  - source ~/.twip/env from your shell's startup file by hand, e.g. add\n" +
@@ -57,16 +60,31 @@ func newInstallCmd() *cobra.Command {
 			envFile := filepath.Join(home, ".twip", "env")
 			twipDst := filepath.Join(dir, "twip")
 
-			// 1. Self-copy to the stable path so the shim/hooks survive a toolchain
-			//    upgrade or GC of the path twip was launched from.
-			copied, err := selfCopy(twipDst)
+			// 1. Provision the stable path the shim/hooks/pre-push hook invoke by
+			//    absolute path. Prefer a symlink to the install source so a later
+			//    `go install` that replaces it in place propagates everywhere with no
+			//    re-run; fall back to a copy when the source is transient (a `go run`
+			//    build cache, a version-manager dir) so the stable path survives its GC.
+			exe, err := os.Executable()
 			if err != nil {
 				return fmt.Errorf("install twip binary: %w", err)
 			}
-			if copied {
+			if p, e := filepath.EvalSymlinks(exe); e == nil {
+				exe = p
+			}
+			state, err := installBinary(twipDst, exe)
+			if err != nil {
+				return fmt.Errorf("install twip binary: %w", err)
+			}
+			switch state {
+			case installSymlinked:
+				cmd.Printf("Linked %s -> %s\n", twipDst, exe)
+				cmd.Println("  (a later `go install` that replaces the source updates twip everywhere — no re-run needed)")
+			case installCopied:
 				cmd.Printf("Copied twip to %s\n", twipDst)
-			} else {
-				cmd.Printf("twip already installed at %s\n", twipDst)
+				cmd.Printf("  (source %s looks transient; re-run `twip install` after upgrading twip)\n", exe)
+			case installUnchanged:
+				cmd.Printf("twip already current at %s\n", twipDst)
 			}
 
 			// 2. Install the shim pointing at the stable copy (now present in dir).
@@ -171,28 +189,98 @@ func newUninstallCmd() *cobra.Command {
 	return cmd
 }
 
-// selfCopy copies the running executable to dst atomically (temp + rename, mode
-// 0o755). It is a no-op when the running binary already IS dst (re-running
-// install from the installed copy), reported via the returned bool.
-func selfCopy(dst string) (copied bool, err error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return false, err
-	}
-	if p, e := filepath.EvalSymlinks(exe); e == nil {
-		exe = p
-	}
+// installState describes how installBinary provisioned the stable <dir>/twip.
+type installState int
+
+const (
+	installUnchanged installState = iota // already current (the running binary, or a link already pointing at it)
+	installSymlinked                     // symlinked the stable path at a durable source
+	installCopied                        // copied (the source is transient)
+)
+
+// installBinary provisions the stable binary at dst that the git shim, the agent
+// hooks, and the bundled pre-push hook invoke by absolute path. src is the resolved
+// running executable. When src is durable (a `go install` target, /usr/local/bin, a
+// hand-built path), dst becomes a symlink to it, so a later `go install` that
+// replaces src in place is picked up everywhere with no re-run. When src is transient
+// (a `go run` build cache, a version-manager's versioned install dir, the temp dir),
+// dst is an independent copy instead, so it survives src being garbage-collected.
+func installBinary(dst, src string) (installState, error) {
+	// Already running the stable binary itself, or via a link that already points at
+	// it: nothing to do. Covers a re-run from the installed copy or through the link.
 	resolvedDst := dst
 	if p, e := filepath.EvalSymlinks(dst); e == nil {
 		resolvedDst = p
 	}
-	if exe == resolvedDst {
+	if src == resolvedDst {
+		return installUnchanged, nil
+	}
+	if isTransientSource(src) {
+		copied, err := copyBinary(dst, src)
+		if err != nil {
+			return installUnchanged, err
+		}
+		if copied {
+			return installCopied, nil
+		}
+		return installUnchanged, nil
+	}
+	linked, err := symlinkBinary(dst, src)
+	if err != nil {
+		return installUnchanged, err
+	}
+	if linked {
+		return installSymlinked, nil
+	}
+	return installUnchanged, nil
+}
+
+// symlinkBinary makes dst an absolute symlink to src, replacing whatever is already
+// at dst (a stale link or an old copy) atomically: create the link under a temp name
+// in the same dir, then rename it over dst. It is a no-op when dst already links to
+// src.
+func symlinkBinary(dst, src string) (linked bool, err error) {
+	if cur, e := os.Readlink(dst); e == nil {
+		target := cur
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(dst), target)
+		}
+		if p, e := filepath.EvalSymlinks(target); e == nil {
+			target = p
+		}
+		if target == src {
+			return false, nil // already linked at src
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return false, err
+	}
+	tmp := fmt.Sprintf("%s.twip-link-%d", dst, os.Getpid())
+	_ = os.Remove(tmp)
+	if err := os.Symlink(src, tmp); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return false, err
+	}
+	return true, nil
+}
+
+// copyBinary copies src to dst atomically (temp + rename, mode 0o755). It is a no-op
+// when src already IS dst (resolving symlinks), reported via the returned bool.
+func copyBinary(dst, src string) (copied bool, err error) {
+	resolvedDst := dst
+	if p, e := filepath.EvalSymlinks(dst); e == nil {
+		resolvedDst = p
+	}
+	if src == resolvedDst {
 		return false, nil // already the installed copy
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return false, err
 	}
-	in, err := os.Open(exe) //nolint:gosec // copying our own binary
+	in, err := os.Open(src) //nolint:gosec // copying our own binary
 	if err != nil {
 		return false, err
 	}
@@ -218,6 +306,34 @@ func selfCopy(dst string) (copied bool, err error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// isTransientSource reports whether path may be garbage-collected or replaced out
+// from under a symlink — a `go run` build under the temp dir, or a version manager's
+// versioned install tree (mise/asdf/Homebrew Cellar). Durable locations (a `go
+// install` target, /usr/local/bin, a hand-built path) return false and are symlinked.
+func isTransientSource(path string) bool {
+	if p, e := filepath.EvalSymlinks(path); e == nil {
+		path = p
+	}
+	path = filepath.Clean(path)
+	if tmp, err := filepath.EvalSymlinks(os.TempDir()); err == nil {
+		if rel, err := filepath.Rel(tmp, path); err == nil && !strings.HasPrefix(rel, "..") {
+			return true // under the OS temp dir (covers `go run`'s build cache)
+		}
+	}
+	sep := string(filepath.Separator)
+	for _, seg := range []string{
+		sep + "go-build" + sep,                   // `go run` build cache
+		filepath.Join("mise", "installs") + sep,  // mise
+		filepath.Join(".asdf", "installs") + sep, // asdf
+		sep + "Cellar" + sep,                     // Homebrew
+	} {
+		if strings.Contains(path, seg) {
+			return true
+		}
+	}
+	return false
 }
 
 // writeEnvFile writes the POSIX-sh env file that prepends dir to PATH, guarded so
