@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codespeak-dev/twip/internal/agent"
 	"github.com/codespeak-dev/twip/internal/hookutil"
@@ -169,8 +170,106 @@ func TestSessionStart_BaselinesMainCursor(t *testing.T) {
 	if ev.Cursor.Main != 5 {
 		t.Errorf("Cursor.Main = %d, want 5", ev.Cursor.Main)
 	}
+	if ev.Transcript.From != 0 || ev.Transcript.To != 5 {
+		t.Errorf("Transcript = {From:%d To:%d}, want {From:0 To:5}", ev.Transcript.From, ev.Transcript.To)
+	}
+	if ev.Transcript.Quality != agent.QualityOK {
+		t.Errorf("Transcript.Quality = %v, want OK", ev.Transcript.Quality)
+	}
+	if len(ev.Transcript.Bytes) == 0 {
+		t.Error("Transcript.Bytes is empty, want startup transcript content")
+	}
 	if ev.Model != "gpt-5.5" {
 		t.Errorf("Model = %q", ev.Model)
+	}
+}
+
+func TestSessionStart_ResumedSessionCapturesOnlyNewLines(t *testing.T) {
+	path := writeTranscriptLines(t, 5)
+	payload := strings.Replace(sessionStartPayload, `"transcript_path": null`, `"transcript_path": `+jsonStr(path), 1)
+	ev := parse(t, hookSessionStart, payload, agent.Cursor{Main: 3})
+
+	if ev.Cursor.Main != 5 {
+		t.Errorf("Cursor.Main = %d, want 5", ev.Cursor.Main)
+	}
+	if ev.Transcript.From != 3 || ev.Transcript.To != 5 {
+		t.Errorf("Transcript = {From:%d To:%d}, want {From:3 To:5}", ev.Transcript.From, ev.Transcript.To)
+	}
+	if got, want := string(ev.Transcript.Bytes), "{\"line\":3}\n{\"line\":4}\n"; got != want {
+		t.Errorf("Transcript.Bytes = %q, want %q", got, want)
+	}
+}
+
+func TestSessionStart_FirstObservedSessionCapturesRecentSuffixAfterOldBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old-prefix.jsonl")
+	old := time.Now().AddDate(0, -2, 0).UTC().Format(time.RFC3339Nano)
+	recent := time.Now().UTC().Format(time.RFC3339Nano)
+	data := fmt.Sprintf(
+		`{"timestamp":%s,"type":"response_item"}`+"\n"+
+			`{"type":"session_meta","payload":{"timestamp":%s}}`+"\n"+
+			`{"timestamp":%s,"type":"turn_context"}`+"\n",
+		jsonStr(old), jsonStr(old), jsonStr(recent),
+	)
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload := strings.Replace(sessionStartPayload, `"transcript_path": null`, `"transcript_path": `+jsonStr(path), 1)
+	ev := parse(t, hookSessionStart, payload, agent.Cursor{})
+
+	if ev.Cursor.Main != 3 {
+		t.Errorf("Cursor.Main = %d, want 3", ev.Cursor.Main)
+	}
+	if ev.Transcript.From != 2 || ev.Transcript.To != 3 {
+		t.Errorf("Transcript = {From:%d To:%d}, want {From:2 To:3}", ev.Transcript.From, ev.Transcript.To)
+	}
+	if got, want := string(ev.Transcript.Bytes), fmt.Sprintf(`{"timestamp":%s,"type":"turn_context"}`+"\n", jsonStr(recent)); got != want {
+		t.Errorf("Transcript.Bytes = %q, want %q", got, want)
+	}
+}
+
+func TestSessionStart_FirstObservedSessionKeepsAmbiguousTailAfterOldBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ambiguous-tail.jsonl")
+	old := time.Now().AddDate(0, -2, 0).UTC().Format(time.RFC3339Nano)
+	data := fmt.Sprintf(
+		`{"timestamp":%s,"type":"response_item"}`+"\n"+
+			`{"type":"response_item","content":"no timestamp"}`+"\n",
+		jsonStr(old),
+	)
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload := strings.Replace(sessionStartPayload, `"transcript_path": null`, `"transcript_path": `+jsonStr(path), 1)
+	ev := parse(t, hookSessionStart, payload, agent.Cursor{})
+
+	if ev.Cursor.Main != 2 {
+		t.Errorf("Cursor.Main = %d, want 2", ev.Cursor.Main)
+	}
+	if ev.Transcript.From != 1 || ev.Transcript.To != 2 {
+		t.Errorf("Transcript = {From:%d To:%d}, want {From:1 To:2}", ev.Transcript.From, ev.Transcript.To)
+	}
+	if got, want := string(ev.Transcript.Bytes), `{"type":"response_item","content":"no timestamp"}`+"\n"; got != want {
+		t.Errorf("Transcript.Bytes = %q, want %q", got, want)
+	}
+}
+
+func TestSessionStart_FirstObservedSessionSkipsEntireOldTranscript(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old-transcript.jsonl")
+	old := time.Now().AddDate(0, -2, 0).UTC().Format(time.RFC3339Nano)
+	var data strings.Builder
+	for i := 0; i < 250; i++ {
+		fmt.Fprintf(&data, `{"timestamp":%s,"type":"response_item","i":%d}`+"\n", jsonStr(old), i)
+	}
+	if err := os.WriteFile(path, []byte(data.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload := strings.Replace(sessionStartPayload, `"transcript_path": null`, `"transcript_path": `+jsonStr(path), 1)
+	ev := parse(t, hookSessionStart, payload, agent.Cursor{})
+
+	if ev.Cursor.Main != 250 {
+		t.Errorf("Cursor.Main = %d, want 250", ev.Cursor.Main)
+	}
+	if len(ev.Transcript.Bytes) != 0 {
+		t.Errorf("Transcript.Bytes length = %d, want 0 for entirely old first-observed transcript", len(ev.Transcript.Bytes))
 	}
 }
 
@@ -579,8 +678,8 @@ func TestSessionStart_ForkPreambleStored(t *testing.T) {
 	}
 }
 
-func TestSessionStart_NonForkNoPreamble(t *testing.T) {
-	// A non-fork session must not set ForkedFrom or populate Transcript.
+func TestSessionStart_NonForkPreambleStored(t *testing.T) {
+	// A non-fork session still stores startup transcript bytes; only ForkedFrom is empty.
 	path := writeTranscriptLines(t, 5)
 	payload := strings.Replace(sessionStartPayload, `"transcript_path": null`, `"transcript_path": `+jsonStr(path), 1)
 	ev := parse(t, hookSessionStart, payload, agent.Cursor{})
@@ -591,8 +690,11 @@ func TestSessionStart_NonForkNoPreamble(t *testing.T) {
 	if ev.Cursor.Main != 5 {
 		t.Errorf("Cursor.Main = %d, want 5", ev.Cursor.Main)
 	}
-	if len(ev.Transcript.Bytes) != 0 {
-		t.Error("Transcript.Bytes should be empty for non-fork session")
+	if ev.Transcript.From != 0 || ev.Transcript.To != 5 {
+		t.Errorf("Transcript = {From:%d To:%d}, want {From:0 To:5}", ev.Transcript.From, ev.Transcript.To)
+	}
+	if len(ev.Transcript.Bytes) == 0 {
+		t.Error("Transcript.Bytes is empty, want startup transcript content")
 	}
 }
 

@@ -106,11 +106,24 @@ func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Read
 			// together to avoid a race between separate CountLines and ReadDelta calls.
 			// On read failure keep prior.Main so the next Stop doesn't re-read from 0.
 			if data, err := os.ReadFile(*raw.TranscriptPath); err == nil { //nolint:gosec
-				preamble, total, _ := agent.DeltaFrom(data, 0)
+				from := prior.Main
+				forkedFrom := forkParent(data)
+				// Forked sessions must capture from line 0 to preserve the full
+				// fork preamble; apply the old-history heuristic only for non-forks.
+				if from == 0 && forkedFrom == "" {
+					from = recentTranscriptSuffixStartLine(data, hookStart)
+				}
+				preamble, total, truncated := agent.DeltaFrom(data, from)
 				cur.Main = total
-				if forkedFrom := forkParent(data); forkedFrom != "" {
+				quality := agent.QualityOK
+				if truncated {
+					quality = agent.QualityTruncated
+				}
+				if forkedFrom != "" {
 					ev.ForkedFrom = forkedFrom
-					ev.Transcript = agent.Delta{Bytes: preamble, From: 0, To: total, Quality: agent.QualityOK}
+				}
+				if len(preamble) > 0 || truncated {
+					ev.Transcript = agent.Delta{Bytes: preamble, From: from, To: total, Quality: quality}
 				}
 			}
 		}
@@ -162,6 +175,87 @@ func forkParent(data []byte) string {
 		return ""
 	}
 	return entry.Payload.ForkedFromID
+}
+
+// recentTranscriptSuffixStartLine returns the line offset where the current
+// session's transcript suffix starts. It is a fallback for first-observed
+// sessions when the journal has no prior cursor.
+//
+// If the first line is recent (within three days) or has no parseable
+// timestamp, return 0 — capture everything. Otherwise the transcript begins
+// with old history: build a line-start index once and binary-search for the
+// first line that is recent or timestamp-ambiguous. Assumes timestamps are
+// monotonically non-decreasing, which holds for Codex append-only logs.
+func recentTranscriptSuffixStartLine(data []byte, now time.Time) int {
+	if len(data) == 0 {
+		return 0
+	}
+	cutoff := now.Add(-3 * 24 * time.Hour)
+
+	// Fast path: first line is recent or has no timestamp — capture all.
+	firstEnd := bytes.IndexByte(data, '\n')
+	firstLine := data
+	if firstEnd >= 0 {
+		firstLine = data[:firstEnd]
+	}
+	if ts, ok := transcriptLineTimestamp(firstLine); !ok || !ts.Before(cutoff) {
+		return 0
+	}
+
+	// First line is old. Build a byte-offset index of line starts once, then
+	// binary-search — each lookup is O(1) instead of re-scanning from the start.
+	starts := []int{0}
+	for i, b := range data {
+		if b == '\n' && i+1 < len(data) {
+			starts = append(starts, i+1)
+		}
+	}
+	lineAt := func(n int) []byte {
+		if n >= len(starts) {
+			return nil
+		}
+		s := starts[n]
+		if n+1 < len(starts) {
+			return data[s : starts[n+1]-1] // exclude the newline
+		}
+		return data[s:]
+	}
+
+	lo, hi := 1, len(starts)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		ts, ok := transcriptLineTimestamp(lineAt(mid))
+		if !ok || !ts.Before(cutoff) {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
+}
+
+func transcriptLineTimestamp(line []byte) (time.Time, bool) {
+	var entry struct {
+		Timestamp string `json:"timestamp"`
+		Payload   struct {
+			Timestamp string `json:"timestamp"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(line, &entry); err != nil {
+		return time.Time{}, false
+	}
+	raw := entry.Timestamp
+	if raw == "" {
+		raw = entry.Payload.Timestamp
+	}
+	if raw == "" {
+		return time.Time{}, false
+	}
+	ts, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts, true
 }
 
 // parseStop handles the Stop hook: wait for task_complete flush then read delta.

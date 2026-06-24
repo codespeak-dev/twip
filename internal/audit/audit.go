@@ -110,11 +110,13 @@ func Run(ctx context.Context, repoRoot string) (*Report, error) {
 		sc.seq = r.Seq
 
 		// Transcript offsets join end-to-end against the running main cursor.
-		// session-start may baseline that cursor above 0 (to skip resumed
-		// history), so the first delta's From is not necessarily 0.
+		// session-start may baseline From above 0 (old-history skip via
+		// recentTranscriptSuffixStartLine); accept any From on the first event.
 		if r.Transcript != nil {
 			if r.Transcript.From != sc.mainTo {
-				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("transcript discontinuity: from=%d, expected %d", r.Transcript.From, sc.mainTo))
+				if !(r.Kind == string(agent.KindSessionStart) && sc.mainTo == 0) {
+					add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("transcript discontinuity: from=%d, expected %d", r.Transcript.From, sc.mainTo))
+				}
 			}
 			if r.Cursor != nil && r.Transcript.To != r.Cursor.Main {
 				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("transcript to=%d disagrees with cursor.main=%d", r.Transcript.To, r.Cursor.Main))

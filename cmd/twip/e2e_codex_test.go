@@ -20,10 +20,10 @@ func TestE2E_Codex_RealisticHookSequence(t *testing.T) {
 	ctx := context.Background()
 	repo := e2eInitRepo(t)
 
-	// Codex transcript starts with one pre-existing line; session-start should
-	// baseline past it so we never re-capture it.
+	// Codex can append startup records before the SessionStart hook fires; those
+	// lines must be captured on the session-start event.
 	tr := filepath.Join(t.TempDir(), "session.jsonl")
-	e2eAppend(t, tr, `{"type":"summary","timestamp":"2026-06-10T00:00:00Z"}`)
+	e2eAppend(t, tr, `{"type":"summary","timestamp":"`+time.Now().UTC().Format(time.RFC3339)+`"}`)
 	sid := "cccccccc-dddd-eeee-ffff-000000000001"
 	turn1 := "turn0001-aaaa-bbbb-cccc-dddddddddddd"
 	turn2 := "turn0002-aaaa-bbbb-cccc-dddddddddddd"
@@ -92,9 +92,8 @@ func TestE2E_Codex_RealisticHookSequence(t *testing.T) {
 		t.Fatalf("audit failed: %+v", rep.Findings)
 	}
 
-	// Lossless: concatenating the main transcript deltas reproduces the transcript
-	// exactly from the session-start baseline to EOF — nothing dropped, nothing
-	// duplicated across turns.
+	// Lossless: concatenating the main transcript deltas reproduces the full
+	// transcript — nothing dropped, nothing duplicated across turns.
 	var reassembled []byte
 	for _, ec := range events {
 		b, _ := rec.Transcript(ctx, ec.Commit)
@@ -104,9 +103,8 @@ func TestE2E_Codex_RealisticHookSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTail := afterFirstLine(full) // skip the pre-existing summary line
-	if string(reassembled) != string(wantTail) {
-		t.Errorf("reassembled transcript deltas != captured tail\n got: %q\nwant: %q", reassembled, wantTail)
+	if string(reassembled) != string(full) {
+		t.Errorf("reassembled transcript deltas != full transcript\n got: %q\nwant: %q", reassembled, full)
 	}
 
 	// The subagent-stop event captured the sidechain bytes.

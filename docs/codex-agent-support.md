@@ -223,16 +223,28 @@ Example:
 Behavior:
 
 - Return `KindSessionStart`.
-- Read the transcript file once to get the line count and the preamble bytes
-  together (avoids a race between two separate reads).
-- Baseline `Cursor.Main` at the current transcript line count, matching Claude
-  resume behavior.
+- Read the transcript file once to get the line count, the new bytes since the
+  prior cursor, and the fork parent ID together (avoids a race between separate
+  reads).
+- Store `Event.Transcript` as the delta from the prior `Cursor.Main` to the
+  current transcript line count when any new lines are already present. This
+  captures Codex startup records that can be appended before the `SessionStart`
+  hook fires.
+- If there is no prior cursor (`Cursor.Main == 0`) and the session is not a
+  fork, check the first transcript line. If its timestamp is more than three
+  days older than the `SessionStart` hook time, binary-search for the first
+  line that is recent or timestamp-ambiguous and baseline `Cursor.Main` there,
+  storing only that suffix. This avoids re-storing old resumed history when the
+  journal has no prior event. Timestamp-ambiguous lines are kept as part of
+  the suffix. Forked sessions always capture from line 0 regardless of age.
+- Set `Cursor.Main` to the current transcript line count. On a resumed session,
+  the prior cursor keeps this delta to newly appended resume/startup lines.
 - Set `Model`.
 - If the first line is a `session_meta` entry with a non-empty `forked_from_id`:
   - Set `Event.ForkedFrom` to the parent session ID.
-  - Set `Event.Transcript` to the full preamble bytes (lines 0→`Cursor.Main`),
-    so the complete parent context is stored in the journal under the child's
-    session-start commit.
+  - The same session-start transcript delta stores the fork preamble bytes when
+    the prior cursor starts at 0, so the complete parent context is stored in
+    the journal under the child's session-start commit.
   - See [Session Forking](#session-forking) below.
 - Set `ForkedFrom` to the parent session ID if this is a forked session (see
   [Session Forking](#session-forking) below).
@@ -335,18 +347,26 @@ identifies the parent:
 
 ### Why the cursor baseline matters
 
-Because the transcript file already contains the parent's lines when the
-`SessionStart` hook fires, `Cursor.Main` is non-zero from the start. Without
-special handling, those lines would be silently skipped — they would not appear
-in any delta, making it impossible to reconstruct the full transcript from the
-journal.
+Because the transcript file can already contain lines when the `SessionStart`
+hook fires, `Cursor.Main` can be non-zero from the start. For forked sessions
+those lines are copied parent context; for fresh sessions they can be Codex
+startup records such as `session_meta`, `task_started`, and `turn_context`.
+Without special handling, those lines would be silently skipped — they would not
+appear in any delta, making it impossible to reconstruct the full transcript
+from the journal.
 
 ### What twip stores
 
-On `KindSessionStart` for a forked session, twip reads the transcript file once
-and stores the preamble (lines 0→`Cursor.Main`) as `Event.Transcript`. This
-lands in the journal under `meta/transcript.jsonl` on the session-start commit,
-alongside `meta/event.json` which carries `forked_from` (the parent session ID).
+On `KindSessionStart`, twip reads the transcript file once and stores any new
+lines since the prior cursor as `Event.Transcript`. For a brand-new session this
+is lines 0→`Cursor.Main`; for a resumed session this is only the new
+resume/startup lines appended after the last recorded cursor. This lands in the
+journal under `meta/transcript.jsonl` on the session-start commit. Forked
+sessions also carry `forked_from` (the parent session ID) in `meta/event.json`.
+
+When no prior cursor is found, twip captures as much of the transcript as
+possible, skipping only content that is clearly more than three days old. Lines
+without parseable timestamps are always kept.
 
 The result is that a forked session's journal contains its complete transcript:
 
@@ -359,8 +379,8 @@ The result is that a forked session's journal contains its complete transcript:
 Concatenating these in order reconstructs the full transcript, including the
 parent context that was in scope at fork time.
 
-Non-forked sessions produce an empty `Transcript` on session-start (no bytes,
-`ForkedFrom` empty).
+Non-forked sessions leave `ForkedFrom` empty, but still store any startup lines
+that are present at `SessionStart`.
 
 The parent session is recorded independently under its own events. The child
 session's deltas start from the fork point; the parent's history is not
@@ -520,9 +540,12 @@ line reads.
 Required unit tests:
 
 - `SessionID` returns `session_id` for every supported payload.
-- `SessionStart` baselines `Cursor.Main` to current transcript line count.
-- `SessionStart` stores the preamble bytes and sets `ForkedFrom` for forked sessions.
-- `SessionStart` sets no preamble and no `ForkedFrom` for non-forked sessions.
+- `SessionStart` advances `Cursor.Main` to current transcript line count.
+- `SessionStart` stores transcript bytes from the prior cursor to the current
+  line count, including non-fork startup records and fork preambles.
+- `SessionStart` stores only recent content (within three days) when no prior
+  cursor is available; lines without parseable timestamps are always kept.
+- `SessionStart` sets `ForkedFrom` only for forked sessions.
 - `UserPromptSubmit` captures `prompt`.
 - `PostToolUse` captures `Bash` detail and `apply_patch` detail without
   advancing cursors.

@@ -121,6 +121,48 @@ func TestAudit_BaselinedCursorPasses(t *testing.T) {
 	}
 }
 
+// TestAudit_SessionStartWithTranscriptBaselinePasses guards the case where
+// session-start carries a non-zero Transcript.From (recentTranscriptSuffixStartLine
+// skipped old history). The audit must not flag it as a discontinuity.
+func TestAudit_SessionStartWithTranscriptBaselinePasses(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := store.New(repo)
+	snap, _ := snapshot.Capture(ctx, repo)
+	sid := "transcript-baseline-sess"
+
+	prior, _ := rec.PriorSessionState(ctx, sid)
+	if _, err := rec.Append(ctx,
+		&agent.Event{
+			SessionID:  sid,
+			Kind:       agent.KindSessionStart,
+			Transcript: agent.Delta{Bytes: []byte("x\n"), From: 5, To: 6, Quality: agent.QualityOK},
+			Cursor:     agent.Cursor{Main: 6},
+		},
+		snap, "main", prior.Seq, time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	prior, _ = rec.PriorSessionState(ctx, sid)
+	if _, err := rec.Append(ctx,
+		&agent.Event{
+			SessionID:  sid,
+			Kind:       agent.KindStop,
+			Transcript: agent.Delta{Bytes: []byte("y\n"), From: 6, To: 7, Quality: agent.QualityOK},
+			Cursor:     agent.Cursor{Main: 7},
+		},
+		snap, "main", prior.Seq, time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := Run(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK() {
+		t.Errorf("session-start with Transcript.From=5 should pass audit; findings: %+v", rep.Findings)
+	}
+}
+
 // forgeEvent writes a hand-built event commit (bypassing store.Append's
 // invariants) so we can prove the audit catches corruption.
 func forgeEvent(t *testing.T, repo, sid string, rec store.Record, parent string, withWorktree bool) {
