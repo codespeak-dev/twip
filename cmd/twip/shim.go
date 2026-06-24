@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -136,13 +137,31 @@ func writeShim(dir, twipPath, realGit string) (string, error) {
 		return "", fmt.Errorf("create shim dir: %w", err)
 	}
 	shimPath := filepath.Join(dir, "git")
+	// Fast path: unambiguously read-only subcommands (exactly skipOps — see
+	// shimFastPathOps) are handed straight to the real git here, without launching
+	// twip, sparing the common read-only call twip's process-start cost. The match is
+	// on $1 alone and so is strict: a leading global flag (git -C/-c …) makes $1 start
+	// with "-", matches nothing, and falls through to twip's full classifier — so this
+	// never fast-paths an op twip would record. Empty pattern => omit the block (an
+	// empty `case` arm is a sh syntax error that would break git).
+	fast := ""
+	if pattern := strings.Join(shimFastPathOps(), "|"); pattern != "" {
+		fast = fmt.Sprintf(`# Read-only git ops go straight to the real git (no twip launch); twip would
+# pass these through unrecorded anyway. A leading global flag makes $1 start with
+# "-", matches nothing here, and falls through to twip below.
+case "$1" in
+%s)
+  exec %q "$@" ;;
+esac
+`, pattern, realGit)
+	}
 	// The fallback exec keeps git working even if twip is removed.
 	script := fmt.Sprintf(`#!/bin/sh
-if [ -x %q ]; then
+%sif [ -x %q ]; then
   exec %q git-shim --real-git=%q -- "$@"
 fi
 exec %q "$@"
-`, twipPath, twipPath, realGit, realGit)
+`, fast, twipPath, twipPath, realGit, realGit)
 	if err := os.WriteFile(shimPath, []byte(script), 0o755); err != nil { //nolint:gosec // intentional executable
 		return "", fmt.Errorf("write shim: %w", err)
 	}
