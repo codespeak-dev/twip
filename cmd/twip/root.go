@@ -30,6 +30,7 @@ func newRootCmd() *cobra.Command {
 		newCheckCmd(),
 		newSyncCmd(),
 		newAuditCmd(),
+		newRedactCmd(),
 		newLogCmd(),
 		newShowCmd(),
 		newServeCmd(),

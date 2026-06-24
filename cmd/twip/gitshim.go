@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,6 +39,27 @@ var skipOps = map[string]bool{
 	"check-attr": true, "name-rev": true, "merge-base": true, "rev-list": true,
 	"count-objects": true, "fsck": true, "whatchanged": true, "annotate": true,
 	"write-tree": true,
+}
+
+// shimFastPathOps are the subcommands the installed `git` wrapper script classifies
+// itself and execs straight to the real git, WITHOUT launching twip. It is derived
+// from skipOps (every non-empty entry) so the two can never drift: an op the wrapper
+// fast-paths is by construction one twip would have passed through unrecorded anyway,
+// so this records nothing extra — it only spares the common read-only call twip's
+// process-start cost. The bare-op ("") entry is excluded: it has no $1 token to match.
+// Returned sorted, for a stable, reviewable generated shim. Keep the wrapper's match
+// strict (on $1 only): a leading global flag makes $1 start with "-", matches nothing,
+// and falls through to twip's full classifier — so a recordable op is never fast-pathed.
+func shimFastPathOps() []string {
+	ops := make([]string, 0, len(skipOps))
+	for op := range skipOps {
+		if op == "" {
+			continue
+		}
+		ops = append(ops, op)
+	}
+	sort.Strings(ops)
+	return ops
 }
 
 // readOnlySubcmds maps a recorded op to the sub-subcommands that are read-only,
