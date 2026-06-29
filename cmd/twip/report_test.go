@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,29 @@ import (
 	"github.com/codespeak-dev/twip/internal/store"
 	"github.com/spf13/cobra"
 )
+
+// TestReadWithCancel checks the Ctrl-C fix: a blocked read returns ctx.Err() once the
+// context is cancelled, instead of hanging.
+func TestReadWithCancel(t *testing.T) {
+	// Completes normally when not cancelled.
+	if b, err := readWithCancel(context.Background(), func() ([]byte, error) { return []byte("hi"), nil }); err != nil || string(b) != "hi" {
+		t.Fatalf("uncancelled: got %q err=%v", b, err)
+	}
+
+	// Returns context.Canceled when the context is already cancelled and the read is
+	// still blocked (the goroutine is released afterward so it doesn't leak the test).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	release := make(chan struct{})
+	_, err := readWithCancel(ctx, func() ([]byte, error) { <-release; return nil, nil })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled read: want context.Canceled, got %v", err)
+	}
+	close(release)
+	if !isCancel(err) {
+		t.Errorf("isCancel(%v) = false, want true", err)
+	}
+}
 
 func sampleReport(full bool) reportData {
 	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
@@ -80,6 +105,58 @@ func TestRenderMarkdown_NoActivityNote(t *testing.T) {
 	d.NotEnabled = true
 	if md := renderMarkdown(d); !strings.Contains(md, "not enabled") {
 		t.Errorf("expected the not-enabled note:\n%s", md)
+	}
+}
+
+func TestRenderMarkdown_LogsSection(t *testing.T) {
+	d := sampleReport(false)
+	d.IncludeLogs = true
+	d.Logs = []logSnippet{
+		{Time: "2026-06-29T11:59:00Z", Kind: "stop", Session: "abcd1234", Seq: 2,
+			Content: `{"type":"user","content":"key ghp_TOKEN"}` + "\n" + `{"type":"assistant","content":"ok"}`},
+		{Time: "2026-06-29T11:59:00Z", Kind: "stop", Session: "abcd1234", Seq: 2, SidechainID: "deadbee",
+			Content: `{"type":"assistant","content":"subagent work"}`},
+	}
+	md := renderMarkdown(d)
+	for _, want := range []string{
+		"## Session log", "raw Claude transcript snippets", "can contain secrets",
+		"session abcd1234 · seq 2 · stop", "subagent deadbee",
+		"ghp_TOKEN", "subagent work", "```jsonl",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("logs report missing %q in:\n%s", want, md)
+		}
+	}
+}
+
+func TestRenderMarkdown_LogsHintWhenOff(t *testing.T) {
+	md := renderMarkdown(sampleReport(false)) // IncludeLogs=false, in a repo
+	if !strings.Contains(md, "Add `--logs`") {
+		t.Errorf("expected the --logs discovery hint:\n%s", md)
+	}
+	if strings.Contains(md, "## Session log") {
+		t.Error("session log section must be absent without --logs")
+	}
+}
+
+func TestMdFence(t *testing.T) {
+	if f := mdFence("no backticks here"); f != "```" {
+		t.Errorf("plain content fence = %q, want ```", f)
+	}
+	if f := mdFence("contains ``` a triple"); len(f) < 4 {
+		t.Errorf("fence %q must be longer than the inner ``` run", f)
+	}
+	if f := mdFence("contains ```` four"); len(f) < 5 {
+		t.Errorf("fence %q must exceed the inner ```` run", f)
+	}
+}
+
+func TestCapLines(t *testing.T) {
+	if s, tr := capLines("short", 100); tr || s != "short" {
+		t.Errorf("under cap: %q truncated=%v", s, tr)
+	}
+	if s, tr := capLines("line1\nline2\nline3", 8); !tr || s != "line1" {
+		t.Errorf("over cap should trim to a line boundary: %q truncated=%v", s, tr)
 	}
 }
 

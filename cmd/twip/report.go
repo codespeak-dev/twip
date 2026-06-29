@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -36,6 +37,7 @@ func newReportCmd() *cobra.Command {
 			o.sinceStr, _ = cmd.Flags().GetString("since")
 			o.outPath, _ = cmd.Flags().GetString("output")
 			o.full, _ = cmd.Flags().GetBool("full")
+			o.logs, _ = cmd.Flags().GetBool("logs")
 			o.allClones, _ = cmd.Flags().GetBool("all-clones")
 			return runReport(cmd, o)
 		},
@@ -45,14 +47,15 @@ func newReportCmd() *cobra.Command {
 	cmd.Flags().String("error-file", "", "read the error message / output from a file")
 	cmd.Flags().String("since", "1h", "how far back to include twip activity (e.g. 30m, 2h, 24h)")
 	cmd.Flags().StringP("output", "o", "", "write the report to a file (default: stdout)")
-	cmd.Flags().Bool("full", false, "include prompts, git command lines and tool detail (MAY CONTAIN SECRETS)")
+	cmd.Flags().Bool("full", false, "include prompts, git command lines and tool detail in the activity table (MAY CONTAIN SECRETS)")
+	cmd.Flags().Bool("logs", false, "append the raw Claude transcript snippets for the window (MAY CONTAIN SECRETS)")
 	cmd.Flags().Bool("all-clones", false, "include activity from every journal in the repo, not just this clone")
 	return cmd
 }
 
 type reportOpts struct {
 	message, errText, errFile, sinceStr, outPath string
-	full, allClones                              bool
+	full, logs, allClones                        bool
 	args                                         []string
 }
 
@@ -66,15 +69,21 @@ func runReport(cmd *cobra.Command, o reportOpts) error {
 	// single interactive stdin serves both without contending.
 	in := bufio.NewReader(cmd.InOrStdin())
 	desc, descFromStdin, err := resolveDescription(cmd, in, o)
+	if isCancel(err) {
+		return aborted(cmd)
+	}
 	if err != nil {
 		return err
 	}
 	errInfo, err := resolveErrorInfo(cmd, in, o, descFromStdin)
+	if isCancel(err) {
+		return aborted(cmd)
+	}
 	if err != nil {
 		return err
 	}
 
-	data := gatherReport(cmd.Context(), desc, errInfo, since, time.Now(), o.full, o.allClones)
+	data := gatherReport(cmd.Context(), desc, errInfo, since, time.Now(), o.full, o.logs, o.allClones)
 	md := renderMarkdown(data)
 
 	if o.outPath == "" {
@@ -101,8 +110,14 @@ func resolveDescription(cmd *cobra.Command, in *bufio.Reader, o reportOpts) (des
 	if isTerminal(os.Stdin) {
 		fmt.Fprint(cmd.ErrOrStderr(), "Describe the problem (one line): ")
 	}
-	line, _ := in.ReadString('\n')
-	if d := strings.TrimSpace(line); d != "" {
+	b, rerr := readWithCancel(cmd.Context(), func() ([]byte, error) {
+		line, e := in.ReadString('\n')
+		return []byte(line), e
+	})
+	if isCancel(rerr) {
+		return "", true, rerr
+	}
+	if d := strings.TrimSpace(string(b)); d != "" {
 		return d, true, nil
 	}
 	return "", true, fmt.Errorf("a description is required — pass it as an argument, with -m, or type it when prompted")
@@ -130,8 +145,46 @@ func resolveErrorInfo(cmd *cobra.Command, in *bufio.Reader, o reportOpts, descFr
 	if !piped {
 		fmt.Fprintln(cmd.ErrOrStderr(), "Paste any error/log output (optional), then press Ctrl-D:")
 	}
-	rest, _ := io.ReadAll(in)
+	rest, rerr := readWithCancel(cmd.Context(), func() ([]byte, error) { return io.ReadAll(in) })
+	if isCancel(rerr) {
+		return "", rerr
+	}
 	return strings.TrimSpace(string(rest)), nil
+}
+
+// readWithCancel runs a blocking stdin read in a goroutine and returns its result, or
+// ctx.Err() if the context is cancelled first (Ctrl-C). Needed because main turns
+// SIGINT into a context cancel, which a plain blocking read never observes — so an
+// interactive prompt would otherwise hang through Ctrl-C. The abandoned read goroutine
+// is harmless: a cancel leads straight to process exit.
+func readWithCancel(ctx context.Context, read func() ([]byte, error)) ([]byte, error) {
+	if ctx == nil { // cobra's Context() is nil for a command not run via ExecuteContext
+		ctx = context.Background()
+	}
+	type result struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() { b, err := read(); ch <- result{b, err} }()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		return r.b, r.err
+	}
+}
+
+// isCancel reports whether err is a context cancellation (a Ctrl-C / SIGINT abort).
+func isCancel(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// aborted prints a brief notice and returns nil so a Ctrl-C exits cleanly (no scary
+// error), rather than the report being written half-formed.
+func aborted(cmd *cobra.Command) error {
+	fmt.Fprintln(cmd.ErrOrStderr(), "\naborted")
+	return nil
 }
 
 func renderMarkdown(d reportData) string {
@@ -139,8 +192,15 @@ func renderMarkdown(d reportData) string {
 	p := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
 
 	p("# twip report\n\n")
-	if d.Full {
-		p("> ⚠ **Review before sharing.** `--full` was used, so the activity below may include prompts, git command lines and tool detail that **can contain secrets**.\n\n")
+	if d.Full || d.IncludeLogs {
+		var inc []string
+		if d.Full {
+			inc = append(inc, "prompts, git command lines and tool detail")
+		}
+		if d.IncludeLogs {
+			inc = append(inc, "raw Claude transcript snippets")
+		}
+		p("> ⚠ **Review before sharing.** This report includes %s, which **can contain secrets** (pasted keys, tool output).\n\n", strings.Join(inc, " and "))
 	} else {
 		p("> ⚠ **Review before sharing.** Activity below is metadata only (no prompt/transcript content or full git command lines), but double-check your description and pasted error for secrets.\n\n")
 	}
@@ -184,6 +244,29 @@ func renderMarkdown(d reportData) string {
 				e.Time, e.Kind, orDash(e.Session), orDash(e.Worktree), mdCell(e.Detail))
 		}
 	}
+
+	switch {
+	case d.IncludeLogs:
+		p("\n## Session log (last %s)\n\n", d.Since)
+		if len(d.Logs) == 0 {
+			p("_No Claude transcript content was recorded in this window._\n")
+			break
+		}
+		for _, s := range d.Logs {
+			label := fmt.Sprintf("session %s · seq %d · %s · %s", orDash(s.Session), s.Seq, s.Kind, s.Time)
+			if s.SidechainID != "" {
+				label += " · subagent " + s.SidechainID
+			}
+			fence := mdFence(s.Content)
+			p("### %s\n\n%sjsonl\n%s\n%s\n", label, fence, strings.TrimRight(s.Content, "\n"), fence)
+			if s.Truncated {
+				p("\n_(truncated — narrow `--since` for the full delta)_\n")
+			}
+			p("\n")
+		}
+	case !d.NoRepo && !d.NotEnabled:
+		p("\n_Activity above is metadata only. Add `--logs` to append the Claude transcript for this window (review it for secrets first)._\n")
+	}
 	return b.String()
 }
 
@@ -196,6 +279,7 @@ type reportData struct {
 	Description string
 	ErrorInfo   string
 	Full        bool
+	IncludeLogs bool
 
 	Version    string
 	Platform   string
@@ -209,16 +293,27 @@ type reportData struct {
 
 	Events     []reportEvent
 	KindCounts map[string]int
+	Logs       []logSnippet
 }
 
 type reportEvent struct {
 	Time, Kind, Session, Worktree, Detail string
 }
 
-func gatherReport(ctx context.Context, desc, errInfo string, since time.Duration, now time.Time, full, allClones bool) reportData {
+// logSnippet is one recorded transcript delta (main or a subagent sidechain) for an
+// event in the window — the raw Claude session log, included only with --logs.
+type logSnippet struct {
+	Time, Kind, Session, SidechainID string
+	Seq                              int
+	Content                          string
+	Truncated                        bool
+}
+
+func gatherReport(ctx context.Context, desc, errInfo string, since time.Duration, now time.Time, full, includeLogs, allClones bool) reportData {
 	cutoff := now.Add(-since)
 	d := reportData{
-		Generated: now, Since: since, Cutoff: cutoff, Description: desc, ErrorInfo: errInfo, Full: full,
+		Generated: now, Since: since, Cutoff: cutoff, Description: desc, ErrorInfo: errInfo,
+		Full: full, IncludeLogs: includeLogs,
 		Version: currentVersion(), Platform: runtime.GOOS + "/" + runtime.GOARCH,
 		KindCounts: map[string]int{},
 	}
@@ -263,16 +358,83 @@ func gatherReport(ctx context.Context, desc, errInfo string, since time.Duration
 	sort.Slice(kept, func(i, j int) bool { return kept[i].t.Before(kept[j].t) }) // chronological
 	for _, k := range kept {
 		r := k.ec.Record
+		ts := k.t.UTC().Format(time.RFC3339)
 		d.KindCounts[r.Kind]++
 		d.Events = append(d.Events, reportEvent{
-			Time:     k.t.UTC().Format(time.RFC3339),
+			Time:     ts,
 			Kind:     r.Kind,
 			Session:  short(r.SessionID),
 			Worktree: r.WorktreeID,
 			Detail:   eventDetail(r, full),
 		})
+		if includeLogs {
+			appendLogSnippets(ctx, rec, &d, k.ec, ts)
+		}
 	}
 	return d
+}
+
+// maxLogSnippetBytes caps each transcript delta included in the session log so one
+// large tool output can't bloat the report; the overflow is dropped with a note.
+const maxLogSnippetBytes = 64 << 10
+
+// appendLogSnippets adds an event's main transcript delta and any subagent sidechain
+// deltas to d.Logs (raw recorded bytes, truncated at a line boundary if oversized).
+func appendLogSnippets(ctx context.Context, rec *store.Recorder, d *reportData, ec store.EventCommit, ts string) {
+	r := ec.Record
+	add := func(content, sidechainID string) {
+		if content == "" {
+			return
+		}
+		c, trunc := capLines(content, maxLogSnippetBytes)
+		d.Logs = append(d.Logs, logSnippet{
+			Time: ts, Kind: r.Kind, Session: short(r.SessionID), Seq: r.Seq,
+			SidechainID: sidechainID, Content: c, Truncated: trunc,
+		})
+	}
+	if r.Transcript != nil {
+		if b, _ := rec.Transcript(ctx, ec.Commit); len(b) > 0 {
+			add(string(b), "")
+		}
+	}
+	for _, sc := range r.Sidechains {
+		if b, _ := rec.SidechainTranscript(ctx, ec.Commit, sc.ID); len(b) > 0 {
+			add(string(b), sc.ID)
+		}
+	}
+}
+
+// capLines truncates s to at most max bytes, backing off to the last newline so a
+// JSONL transcript is cut on a record boundary. Returns whether it truncated.
+func capLines(s string, max int) (string, bool) {
+	if len(s) <= max {
+		return s, false
+	}
+	cut := s[:max]
+	if i := strings.LastIndexByte(cut, '\n'); i > 0 {
+		cut = cut[:i]
+	}
+	return cut, true
+}
+
+// mdFence returns a backtick fence long enough to wrap content even if it itself
+// contains runs of backticks (so a transcript with ``` can't break the code block).
+func mdFence(content string) string {
+	longest, run := 0, 0
+	for _, r := range content {
+		if r == '`' {
+			if run++; run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	n := longest + 1
+	if n < 3 {
+		n = 3
+	}
+	return strings.Repeat("`", n)
 }
 
 // eventDetail renders a per-event detail string. Default is metadata only; full adds
