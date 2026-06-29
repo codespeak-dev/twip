@@ -81,27 +81,7 @@ func checkShimOnPath(out io.Writer, shimDir string) bool {
 		return false
 	}
 
-	// Walk PATH in order. first* = the git that actually runs (first on PATH);
-	// shimPos = position of the shim dir's git. Positions are 1-based to match
-	// `echo $PATH | tr : '\n' | cat -n`.
-	first, firstPos, shimPos := "", 0, 0
-	for i, dir := range filepath.SplitList(os.Getenv("PATH")) {
-		if dir == "" {
-			continue
-		}
-		clean := filepath.Clean(dir)
-		cand := filepath.Join(clean, "git")
-		fi, err := os.Stat(cand)
-		if err != nil || fi.IsDir() || fi.Mode()&0o111 == 0 {
-			continue
-		}
-		if first == "" {
-			first, firstPos = cand, i+1
-		}
-		if clean == shimDir && shimPos == 0 {
-			shimPos = i + 1
-		}
-	}
+	first, firstPos, shimPos := gitPathScan(shimDir)
 
 	switch {
 	case first == "":
@@ -123,6 +103,31 @@ func checkShimOnPath(out io.Writer, shimDir string) bool {
 		fmt.Fprintf(out, "        • VS Code Source Control: set \"git.path\": %q in settings.json\n", shimGit)
 		return false
 	}
+}
+
+// gitPathScan walks PATH in order and returns the git that would actually run (its
+// path + 1-based PATH position) and the 1-based position of the shim dir's git (0 if
+// the shim dir is not on PATH). Positions match `echo $PATH | tr : '\n' | cat -n`.
+func gitPathScan(shimDir string) (firstGit string, firstPos, shimPos int) {
+	shimDir = filepath.Clean(shimDir)
+	for i, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			continue
+		}
+		clean := filepath.Clean(dir)
+		cand := filepath.Join(clean, "git")
+		fi, err := os.Stat(cand)
+		if err != nil || fi.IsDir() || fi.Mode()&0o111 == 0 {
+			continue
+		}
+		if firstGit == "" {
+			firstGit, firstPos = cand, i+1
+		}
+		if clean == shimDir && shimPos == 0 {
+			shimPos = i + 1
+		}
+	}
+	return firstGit, firstPos, shimPos
 }
 
 // reportRepo notes whether the current repo (if any) is twip-enabled — informational,
