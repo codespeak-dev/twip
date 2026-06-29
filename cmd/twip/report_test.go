@@ -129,13 +129,44 @@ func TestRenderMarkdown_LogsSection(t *testing.T) {
 	}
 }
 
-func TestRenderMarkdown_LogsHintWhenOff(t *testing.T) {
-	md := renderMarkdown(sampleReport(false)) // IncludeLogs=false, in a repo
-	if !strings.Contains(md, "Add `--logs`") {
-		t.Errorf("expected the --logs discovery hint:\n%s", md)
+func TestRenderMarkdown_NoLogsNote(t *testing.T) {
+	md := renderMarkdown(sampleReport(false)) // IncludeLogs=false (i.e. --no-logs), in a repo
+	if !strings.Contains(md, "--no-logs") {
+		t.Errorf("expected the omitted-transcript note:\n%s", md)
 	}
 	if strings.Contains(md, "## Session log") {
-		t.Error("session log section must be absent without --logs")
+		t.Error("session log section must be absent when transcripts are omitted")
+	}
+}
+
+// TestReportCommand_LogsDefaultOn verifies transcripts are included by default (the
+// report carries the escalated secrets warning) and that --no-logs opts out (back to
+// the metadata-only warning, no session-log section). Asserts only the warning banner
+// and section presence, which are independent of repo state.
+func TestReportCommand_LogsDefaultOn(t *testing.T) {
+	run := func(args ...string) string {
+		cmd := newReportCmd()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetIn(strings.NewReader(""))
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+
+	if s := run("-m", "x"); !strings.Contains(s, "raw Claude transcript snippets") {
+		t.Errorf("default report should warn that transcripts are included:\n%s", s)
+	}
+
+	s := run("-m", "x", "--no-logs")
+	if !strings.Contains(s, "metadata only") {
+		t.Errorf("--no-logs should give the metadata-only warning:\n%s", s)
+	}
+	if strings.Contains(s, "## Session log") {
+		t.Errorf("--no-logs should omit the session-log section:\n%s", s)
 	}
 }
 

@@ -25,10 +25,10 @@ func newReportCmd() *cobra.Command {
 		Long: "Builds a Markdown report from a problem description, an optional pasted error/log, the " +
 			"local environment (twip version, platform, repo, git-shim status), and a summary of this " +
 			"clone's recent twip activity (default: the last hour, adjustable with --since).\n\n" +
-			"SECRET SAFETY: the report is meant to be shared, and twip records can contain secrets, so " +
-			"by default the activity section includes METADATA ONLY — no prompt or transcript content " +
-			"and no full git command lines. `--full` adds those (prompts, git argv, tool detail) and the " +
-			"report says so; review before sharing either way.",
+			"SECRET SAFETY: twip records can contain secrets and the report is meant to be shared. The " +
+			"activity table stays metadata only unless --full is given. The Claude transcript snippets for " +
+			"the window are INCLUDED BY DEFAULT (pass --no-logs to omit them) and CAN CONTAIN SECRETS " +
+			"(prompts, tool output); the report warns when they are present — review before sharing.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o := reportOpts{args: args}
 			o.message, _ = cmd.Flags().GetString("message")
@@ -37,8 +37,9 @@ func newReportCmd() *cobra.Command {
 			o.sinceStr, _ = cmd.Flags().GetString("since")
 			o.outPath, _ = cmd.Flags().GetString("output")
 			o.full, _ = cmd.Flags().GetBool("full")
-			o.logs, _ = cmd.Flags().GetBool("logs")
 			o.allClones, _ = cmd.Flags().GetBool("all-clones")
+			noLogs, _ := cmd.Flags().GetBool("no-logs")
+			o.logs = !noLogs // transcripts are included by default; --no-logs opts out
 			return runReport(cmd, o)
 		},
 	}
@@ -48,7 +49,7 @@ func newReportCmd() *cobra.Command {
 	cmd.Flags().String("since", "1h", "how far back to include twip activity (e.g. 30m, 2h, 24h)")
 	cmd.Flags().StringP("output", "o", "", "write the report to a file (default: stdout)")
 	cmd.Flags().Bool("full", false, "include prompts, git command lines and tool detail in the activity table (MAY CONTAIN SECRETS)")
-	cmd.Flags().Bool("logs", false, "append the raw Claude transcript snippets for the window (MAY CONTAIN SECRETS)")
+	cmd.Flags().Bool("no-logs", false, "omit the Claude transcript snippets (included by default for the window; they MAY CONTAIN SECRETS)")
 	cmd.Flags().Bool("all-clones", false, "include activity from every journal in the repo, not just this clone")
 	return cmd
 }
@@ -143,7 +144,11 @@ func resolveErrorInfo(cmd *cobra.Command, in *bufio.Reader, o reportOpts, descFr
 		return "", nil // terminal + non-interactive description: don't block on a paste
 	}
 	if !piped {
-		fmt.Fprintln(cmd.ErrOrStderr(), "Paste any error/log output (optional), then press Ctrl-D:")
+		// Finishing with Enter THEN Ctrl-D submits in one keypress: io.ReadAll needs a
+		// real EOF, which the terminal only delivers when Ctrl-D is pressed on an empty
+		// line. Without the trailing newline the first Ctrl-D just flushes the partial
+		// line (so you'd need a second) — standard canonical-mode behavior, like `cat`.
+		fmt.Fprintln(cmd.ErrOrStderr(), "Paste any error/log output (optional); finish with Enter, then Ctrl-D:")
 	}
 	rest, rerr := readWithCancel(cmd.Context(), func() ([]byte, error) { return io.ReadAll(in) })
 	if isCancel(rerr) {
@@ -265,7 +270,7 @@ func renderMarkdown(d reportData) string {
 			p("\n")
 		}
 	case !d.NoRepo && !d.NotEnabled:
-		p("\n_Activity above is metadata only. Add `--logs` to append the Claude transcript for this window (review it for secrets first)._\n")
+		p("\n_Claude transcript snippets omitted (`--no-logs`)._\n")
 	}
 	return b.String()
 }
