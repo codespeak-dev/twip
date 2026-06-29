@@ -105,3 +105,53 @@ func TestWriteShim_FastPathRoutesReadOnly(t *testing.T) {
 func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
+
+// TestEnsureRealGit_SkipsShimAndExports verifies the hook-path optimization (#6):
+// ensureRealGit resolves the real git on PATH while skipping the twip shim dir and
+// exports it as TWIP_REAL_GIT, so the hook's internal plumbing execs the real git
+// directly instead of hopping through the shim wrapper.
+func TestEnsureRealGit_SkipsShimAndExports(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// The shim lives at the default shim dir ($HOME/.twip/bin/git); ensureRealGit must
+	// skip it even though it appears first on PATH.
+	shimDir := filepath.Join(home, ".twip", "bin")
+	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExec(t, filepath.Join(shimDir, "git")) // the shim — must be skipped
+
+	// A real git lives in a separate dir later on PATH.
+	realDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	realGit := filepath.Join(realDir, "git")
+	writeExec(t, realGit)
+
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+realDir)
+	t.Setenv(envRealGit, "") // unset: simulate the hook process before resolution
+
+	ensureRealGit()
+
+	got := os.Getenv(envRealGit)
+	want, err := filepath.EvalSymlinks(realGit) // resolveRealGit resolves symlinks
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("TWIP_REAL_GIT = %q, want the real git %q (the shim should be skipped)", got, want)
+	}
+}
+
+// TestEnsureRealGit_NoOpWhenAlreadySet verifies ensureRealGit leaves an
+// already-resolved TWIP_REAL_GIT alone (e.g. when the shim set it before exec).
+func TestEnsureRealGit_NoOpWhenAlreadySet(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(envRealGit, "/preset/git")
+	ensureRealGit()
+	if got := os.Getenv(envRealGit); got != "/preset/git" {
+		t.Errorf("TWIP_REAL_GIT = %q, want it left as the preset /preset/git", got)
+	}
+}

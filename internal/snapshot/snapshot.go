@@ -43,6 +43,60 @@ func Capture(ctx context.Context, repoRoot string) (Snapshot, error) {
 	return Snapshot{Tree: tree, Head: head, Branch: branch}, nil
 }
 
+// Unchanged reports whether repoRoot's worktree is identical to baseTree — the
+// tree of the session's last recorded event — using the persistent stat-cache
+// index for a fast comparison that writes no objects and never touches the real
+// index or HEAD. The PostToolUse hook calls it to skip the full Capture (git
+// add -A + write-tree over the whole worktree) for the common tool call — every
+// read-only Bash — that changed nothing.
+//
+// It is deliberately conservative: it returns true ONLY when it is certain the
+// worktree still matches baseTree. Any ambiguity — no resolvable git dir, no
+// persistent index yet, a persistent index that has diverged from baseTree (another
+// worktree/session snapshot interleaved), a stat-dirty file, or any git error —
+// yields false, so the caller falls back to a full Capture whose own tree
+// comparison is authoritative. A false "changed" only costs a redundant snapshot; a
+// false "unchanged" would drop a real event, so the bias is always toward false.
+//
+// In particular a tracked file rewritten with identical content is stat-dirty and
+// reported changed (diff-index does not refresh the cached stat) — a false
+// "changed" that self-heals: the fall-through Capture re-stats the worktree, so the
+// next call sees a clean stat cache and skips again. This keeps Unchanged a pure
+// read (it never writes the index or takes a lock).
+func Unchanged(ctx context.Context, repoRoot, baseTree string) bool {
+	if baseTree == "" {
+		return false
+	}
+	gitDir, err := gitutil.GitDir(ctx, repoRoot)
+	if err != nil {
+		return false
+	}
+	idxPath := snapshotIndexPath(gitDir)
+	if !exists(idxPath) {
+		return false // no warm index to compare against yet
+	}
+	env := []string{"GIT_INDEX_FILE=" + idxPath}
+
+	// Modifications/deletions of files present in baseTree. diff-index compares the
+	// index's blob shas + stat cache against baseTree, so if the persistent index has
+	// diverged from baseTree it reports a difference and we conservatively fall
+	// through — a stale/foreign index can never produce a false "unchanged".
+	// --no-optional-locks keeps this a pure read (no index refresh or lock).
+	if _, err := gitutil.Run(ctx, repoRoot, env, nil,
+		"--no-optional-locks", "diff-index", "--quiet", baseTree); err != nil {
+		return false // exit non-zero: differences (or error) — not certainly unchanged
+	}
+	// New untracked-non-ignored files (absent from baseTree, hence from the index):
+	// diff-index never reports these. Reaching here means the index equals baseTree,
+	// so --others lists exactly the files new since baseTree.
+	out, err := gitutil.Run(ctx, repoRoot, env, nil,
+		"--no-optional-locks", "ls-files", "--others", "--exclude-standard")
+	if err != nil || strings.TrimSpace(string(out)) != "" {
+		return false
+	}
+	return true
+}
+
 // worktreeTree stages the whole worktree and writes a tree. It prefers a persistent
 // per-worktree index (kept under <git-dir>/twip) so files unchanged since the last
 // hook are not re-hashed — the dominant cost on a large or dirty worktree. A
@@ -57,7 +111,7 @@ func worktreeTree(ctx context.Context, repoRoot string) (string, error) {
 		return tempIndexTree(ctx, repoRoot, "")
 	}
 	twipDir := filepath.Join(gitDir, "twip")
-	idxPath := filepath.Join(twipDir, "snapshot-index")
+	idxPath := snapshotIndexPath(gitDir)
 
 	unlock, err := flock(filepath.Join(twipDir, "snapshot.lock"))
 	if err != nil {
@@ -239,6 +293,12 @@ func copyFile(src, dst string) error {
 	defer out.Close()
 	_, err = io.Copy(out, in)
 	return err
+}
+
+// snapshotIndexPath is the persistent per-worktree snapshot index under gitDir,
+// shared by Capture (which writes it) and Unchanged (which reads it).
+func snapshotIndexPath(gitDir string) string {
+	return filepath.Join(gitDir, "twip", "snapshot-index")
 }
 
 func exists(p string) bool {

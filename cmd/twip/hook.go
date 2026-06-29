@@ -36,9 +36,35 @@ func newHookCmd() *cobra.Command {
 	}
 }
 
+// ensureRealGit resolves the real git binary (skipping the twip shim on PATH) and
+// exports TWIP_REAL_GIT so twip's own plumbing (gitutil) execs it directly. A hook
+// is launched by the agent, not via the shim, so TWIP_REAL_GIT is otherwise unset
+// and every internal call — hash-object, mktree, commit-tree, update-ref,
+// cat-file — runs through the shim wrapper (sh -> twip git-shim -> real git),
+// paying two extra process spawns each; a recorded hook makes ~10+ such calls, so
+// it adds up on the session-start/stop path. Best-effort: if resolution fails the
+// env stays unset and gitutil falls back to PATH "git" (the shim), which still
+// works via its pass-through guard — only slower. A no-op when already set.
+func ensureRealGit() {
+	if os.Getenv(envRealGit) != "" {
+		return
+	}
+	dir, err := defaultShimDir()
+	if err != nil {
+		return
+	}
+	if realGit, err := resolveRealGit(dir); err == nil && realGit != "" {
+		_ = os.Setenv(envRealGit, realGit)
+	}
+}
+
 // runHook resolves the repo from the cwd and reads the payload, then hands off to
 // recordHook. Returns nil (no-op) when not inside a git repo.
 func runHook(ctx context.Context, agentName, event string, stdin io.Reader) error {
+	// Point twip's own git plumbing at the real git so it skips the shim hop on
+	// every internal call below (and inside recordHook's snapshot/append).
+	ensureRealGit()
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -93,14 +119,24 @@ func recordHook(ctx context.Context, repoRoot, agentName, event string, payload 
 	if ev.SessionID == "" {
 		ev.SessionID = sessionID
 	}
+	// An intermediate tool call is only worth an event if it actually changed the
+	// worktree. Most PostToolUse calls — every read-only Bash (git status, a test
+	// run, grep) — change nothing, yet snapshot.Capture (git add -A + write-tree over
+	// the whole worktree) is the most expensive step on this hook and runs under the
+	// held session lock. Skip it with a cheap diff against the session's last-event
+	// tree first; the check is conservative (only a definite "unchanged" skips), so a
+	// false "changed" merely falls through to the authoritative comparison below and
+	// never drops an event.
+	if ev.Kind == agent.KindToolUse && prior.Tree != "" && snapshot.Unchanged(ctx, repoRoot, prior.Tree) {
+		return nil
+	}
 	snap, err := snapshot.Capture(ctx, repoRoot)
 	if err != nil {
 		return err
 	}
-	// An intermediate tool call is only worth an event if it actually changed the
-	// worktree. Unchanged tree (same content sha as the session's last event) =>
-	// a read-only/no-op call (e.g. `git status` via Bash); skip it so it consumes
-	// no seq and adds no noise. Turn-boundary events are always recorded.
+	// Backstop the cheap check above: a tool call that left the tree identical to the
+	// session's last event (same content sha) is a no-op — skip it so it consumes no
+	// seq and adds no noise. Turn-boundary events are always recorded.
 	if ev.Kind == agent.KindToolUse && snap.Tree != "" && snap.Tree == prior.Tree {
 		return nil
 	}

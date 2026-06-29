@@ -340,16 +340,40 @@ func isTransientSource(path string) bool {
 	return false
 }
 
-// writeEnvFile writes the POSIX-sh env file that prepends dir to PATH, guarded so
-// re-sourcing never duplicates the entry. All future PATH logic lands here, never
-// the rc files again (the rustup env-file indirection).
+// envFileTemplate is the POSIX-sh env file body, with __TWIP_DIR__ replaced by the
+// shim dir. It force-fronts the dir on PATH: it strips any existing occurrence and
+// re-prepends, so the git shim reclaims the front even when another tool (Homebrew,
+// conda, nvm, macOS path_helper, an IDE) prepended ahead of an already-present entry
+// — the silent-shadowing failure that a plain "prepend if missing" can't recover
+// from. Implemented with pure POSIX parameter expansion (no `$PATH` word-splitting),
+// so it behaves identically in sh/bash/zsh and preserves PATH entries with spaces.
+const envFileTemplate = `# twip shell environment. Source this from your shell rc; edit twip, not this file.
+# Put the twip git shim FIRST on PATH so it shadows any other git, re-asserting the
+# front even if the dir is already present further down (Homebrew/conda/IDE prepends).
+_twip_dir='__TWIP_DIR__'
+if [ -n "$PATH" ]; then
+  _twip_rest=
+  _twip_tail=$PATH
+  while [ -n "$_twip_tail" ]; do
+    case $_twip_tail in
+      *:*) _twip_seg=${_twip_tail%%:*}; _twip_tail=${_twip_tail#*:} ;;
+      *)   _twip_seg=$_twip_tail; _twip_tail= ;;
+    esac
+    [ "$_twip_seg" = "$_twip_dir" ] && continue
+    _twip_rest=${_twip_rest:+$_twip_rest:}$_twip_seg
+  done
+  PATH=$_twip_rest
+fi
+PATH="$_twip_dir${PATH:+:$PATH}"
+export PATH
+unset _twip_dir _twip_rest _twip_tail _twip_seg
+`
+
+// writeEnvFile writes the POSIX-sh env file that force-fronts dir on PATH (see
+// envFileTemplate). All PATH logic lives here, never the rc files (the rustup
+// env-file indirection); the rc files only source this.
 func writeEnvFile(path, dir string) error {
-	content := fmt.Sprintf(`# twip shell environment. Source this from your shell rc; edit twip, not this file.
-case ":${PATH}:" in
-  *":%s:"*) ;;
-  *) export PATH="%s:$PATH" ;;
-esac
-`, dir, dir)
+	content := strings.ReplaceAll(envFileTemplate, "__TWIP_DIR__", dir)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -398,7 +422,10 @@ func modifyPath(cmd *cobra.Command, home, envFile, dir string, assumeYes bool) e
 	// fish does not use POSIX rc files; it auto-sources conf.d.
 	if dirExists(filepath.Join(home, ".config", "fish")) {
 		p := fishConfPath(home)
-		content := fmt.Sprintf("# twip (managed by `twip install`)\nfish_add_path %q\n", dir)
+		// --move force-fronts dir even when it's already in PATH; plain fish_add_path
+		// leaves an existing entry where it is — the same shadowing bug the POSIX env
+		// file avoids.
+		content := fmt.Sprintf("# twip (managed by `twip install`)\nfish_add_path --move %q\n", dir)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			return err
 		}

@@ -28,6 +28,7 @@ func newRootCmd() *cobra.Command {
 		newGitRecordCmd(),
 		newShimCmd(),
 		newCheckCmd(),
+		newDoctorCmd(),
 		newSyncCmd(),
 		newAuditCmd(),
 		newRedactCmd(),

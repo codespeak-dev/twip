@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -162,5 +163,71 @@ func TestRedactJournal(t *testing.T) {
 	}
 	if meta.authorName != "Alice" || meta.authorDate != "1700000100 +0000" {
 		t.Errorf("identity not preserved: name=%q date=%q", meta.authorName, meta.authorDate)
+	}
+}
+
+// TestRedactJournal_CoversMetaEventAndTranscript proves a prompt secret — which is
+// duplicated across meta/event.json (the JSON-encoded prompt field) and
+// meta/transcript.jsonl (the recorded turn) — is scrubbed from BOTH in a single pass
+// when both paths are flagged, and that the redacted meta/event.json is still valid
+// JSON parseable as a Record (the placeholder carries no JSON-special bytes). gitleaks
+// reports each file as its own finding (the redact scan walks the whole journal, both
+// meta blobs included), so redaction needs no per-file special casing — it just
+// handles every flagged path.
+func TestRedactJournal_CoversMetaEventAndTranscript(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	eventJSON := `{"schema":1,"kind":"user-prompt-submit","seq":1,"session_id":"abc","prompt":"auth with ` + fakeSecret + ` please"}`
+	c0 := buildJournalCommit(t, repo, "", "event 0 clean\n", "1700000000 +0000",
+		map[string]string{"meta/event.json": `{"kind":"clean"}`})
+	c1 := buildJournalCommit(t, repo, c0, "twip user-prompt-submit seq=1 session=abc\n", "1700000100 +0000",
+		map[string]string{
+			"meta/event.json":       eventJSON,
+			"meta/transcript.jsonl": `{"role":"user","content":"auth with ` + fakeSecret + ` please"}` + "\n",
+		})
+	ref := JournalRefPrefix + cloneID
+	if err := gitutil.UpdateRef(ctx, repo, ref, c1, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both meta paths flagged (exactly as gitleaks reports them), handled in one pass.
+	res, err := rec.RedactJournal(ctx, cloneID, []string{fakeSecret},
+		[]string{"meta/event.json", "meta/transcript.jsonl"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RedactedCommits != 1 {
+		t.Errorf("RedactedCommits = %d, want 1", res.RedactedCommits)
+	}
+	newTip, _ := gitutil.ResolveRef(ctx, repo, ref)
+
+	// The secret is gone from every object reachable from the new tip.
+	if reachableObjectsContain(t, repo, newTip, fakeSecret) {
+		t.Error("secret still reachable after redaction")
+	}
+	// meta/event.json was redacted AND is still valid JSON parseable as a Record.
+	evb, err := gitutil.CatFile(ctx, repo, newTip+":meta/event.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rr Record
+	if err := json.Unmarshal(evb, &rr); err != nil {
+		t.Fatalf("redacted event.json is no longer valid JSON: %v\n%s", err, evb)
+	}
+	if strings.Contains(rr.Prompt, fakeSecret) {
+		t.Errorf("event.json prompt still contains the secret: %q", rr.Prompt)
+	}
+	if !strings.Contains(rr.Prompt, redactPlaceholder) {
+		t.Errorf("event.json prompt missing the placeholder: %q", rr.Prompt)
+	}
+	// meta/transcript.jsonl was redacted in the same pass.
+	if tb, _ := gitutil.CatFile(ctx, repo, newTip+":meta/transcript.jsonl"); strings.Contains(string(tb), fakeSecret) {
+		t.Errorf("transcript.jsonl still contains the secret: %q", tb)
 	}
 }
