@@ -36,9 +36,13 @@ go install github.com/codespeak-dev/twip/cmd/twip@latest   # that's it
 ```
 
 After the first `twip install`, `~/.twip/bin/twip` is a symlink to your `go install` target, so a
-plain `go install` updates the binary the shim, the hooks, and your shell all run — no re-run needed.
-Re-run `twip install` only if you change `GOBIN`/`GOPATH`, or installed via a version manager
+plain `go install` updates the binary that the shim, the hooks, and your shell all run — no re-run
+needed. Re-run `twip install` only if you change `GOBIN`/`GOPATH`, or installed via a version manager
 (mise/asdf/brew) or `go run`, where twip keeps an independent **copy** that doesn't auto-follow.
+
+Or just run `twip update`: it does the `go install` and re-runs `twip install` for you, so the update
+propagates everywhere even when the stable binary is a copy rather than a symlink (`--version` to pin
+a version, `--dry-run` to preview). `twip doctor` reports when a newer version is available.
 
 ### Manual PATH setup (if a new shell can't find the shim)
 
@@ -63,6 +67,10 @@ export PATH="$HOME/.twip/bin:$PATH"
 Verify in a **new** shell: `which git` → `~/.twip/bin/git`, and `git --version` still works (the
 shim falls back to real git, so it can never break git). Install with `--no-modify-path` to do all
 of the above except the rc edit (and print the line to add).
+
+`twip doctor` checks this for you — it flags when another directory (Homebrew/conda/nvm or an IDE)
+shadows `~/.twip/bin` on `PATH`, the silent failure that stops git ops from being recorded, and also
+reports this repo's recording status and whether a newer twip is available.
 
 **GUI git (JetBrains, GitHub Desktop, …)** bypass `PATH` entirely. Point their "Path to Git
 executable" at `~/.twip/bin/git` (an absolute path) — the shim works without any `PATH` wiring.
@@ -117,12 +125,22 @@ flat. It's conflict-free by construction: each clone is the sole writer of its o
 `refs/twip/journal/<clone-id>`, so every push is a fast-forward and there is never a merge. The
 browser then lanes the whole team's timeline, each clone labeled by its author.
 
+**Redacting a leaked secret.** If a secret an agent touched lands in the journal — a transcript
+line, a prompt, or a worktree snapshot — and an all-refs secrets gate blocks your push, `twip redact`
+scans this clone's journal and rewrites it in place, replacing each flagged secret with a placeholder
+(the clean prefix is kept verbatim, so an already-pushed prefix stays a fast-forward). It scans with
+**betterleaks** by default; `--scanner gitleaks` uses gitleaks instead, and `--scanner auto` prefers
+betterleaks and falls back to gitleaks (each mode checks for its binary and, if missing, tells you how
+to get the other). A project `.gitleaks.toml`/`.betterleaks.toml` at the repo root is honored
+automatically, and `--dry-run` previews without rewriting. Redaction is *not* rotation — treat any
+exposed secret as compromised and rotate it.
+
 *Pending:* tripwire hook (detect shim bypass), graded commit↔session links.
 
 ## Layout
 
 ```
-cmd/twip/                CLI (cobra): init, install, hook, check, sync, audit, log, show, serve, version
+cmd/twip/                CLI (cobra): init, install, update, doctor, hook, check, sync, audit, redact, report, log, show, serve, version
 internal/agent/          agent-extension seam: lean Agent interface + registry + normalized Event
 internal/agent/claudecode/  Claude Code: hook parse/install, transcript flush + delta + sidechains
 internal/agent/codex/    Codex: hook parse/install, transcript flush + delta + sidechains
@@ -131,9 +149,15 @@ cmd/twip/shim.go         `twip shim install/uninstall` (writes the git wrapper +
 cmd/twip/install.go      `twip install/uninstall` (stable binary copy + shim + shell-rc PATH wiring)
 cmd/twip/check.go        `twip check pre-push` (the opt-in push gate)
 cmd/twip/sync.go         `twip sync push` (mirror refs/twip/* to a remote; one home for sync)
+cmd/twip/redact.go       `twip redact` (scan the journal with betterleaks/gitleaks; rewrite out flagged secrets)
+cmd/twip/doctor.go       `twip doctor` (PATH-shadow + recording-status + update diagnostics)
+cmd/twip/update.go       `twip update` (go install latest, then re-run twip install)
+cmd/twip/report.go       `twip report` (shareable Markdown bug report from recent activity)
 internal/snapshot/       temp-index git write-tree worktree capture
 internal/store/          append-only journal: one per-clone ref, CAS-append, schema, flock, read helpers
 internal/audit/          integrity audit
 internal/readmodel/      derived timeline + verified-link views
 internal/web/            server-rendered timeline UI (go:embed)
+internal/gitutil/        thin wrappers over git plumbing (run, resolve-ref, cat-file, hash-object, …)
+internal/hookutil/       shared agent-hook infrastructure: payload parse, formatting, JSON/command helpers
 ```
