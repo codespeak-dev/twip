@@ -79,6 +79,16 @@ func Run(ctx context.Context, repoRoot string) (*Report, error) {
 			if got, err := gitutil.Out(ctx, repoRoot, "rev-parse", ec.Commit+":worktree"); err != nil || got != r.WorktreeTree {
 				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("worktree/ subtree (%s) does not match recorded tree (%s)", got, r.WorktreeTree))
 			}
+		} else if got, err := gitutil.Out(ctx, repoRoot, "rev-parse", ec.Commit+":worktree"); err == nil {
+			// A snapshot-less event's worktree/ is a carry-forward of its parent's
+			// (kept identical so journal diffs stay empty for unchanged content); a
+			// carried subtree that differs would smuggle in content no event recorded.
+			// Absence is also fine: events before any snapshot, and pre-carry-forward
+			// journals, simply have no worktree/.
+			parent, perr := gitutil.Out(ctx, repoRoot, "rev-parse", ec.Commit+"^:worktree")
+			if perr != nil || parent != got {
+				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("carried worktree/ subtree (%s) does not match parent's (%s)", got, parent))
+			}
 		}
 
 		// Archived stash commits, and the pre-rewrite HEAD of a history-rewriting

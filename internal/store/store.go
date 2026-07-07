@@ -13,7 +13,13 @@
 //
 // Each event commit's tree holds the worktree snapshot under worktree/ and the
 // event record + transcript delta under meta/, both reachable by real git edges
-// (GC-safe). Records are only ever appended; nothing is deleted or rewritten.
+// (GC-safe). An event that captures no snapshot of its own (e.g. a clean git op)
+// carries the previous event's worktree/ subtree forward unchanged — consecutive
+// commits then share an identical subtree, so a diff scanner walking the journal
+// sees only real worktree changes, never a full-tree delete + re-add around a
+// snapshot-less event. Whether an event captured a snapshot is recorded in
+// event.json (worktree_tree), not by the subtree's presence. Records are only
+// ever appended; nothing is deleted or rewritten.
 package store
 
 import (
@@ -61,7 +67,8 @@ type SidechainMeta struct {
 
 // GitOpMeta records a git operation captured by the shim (a session-independent
 // event). Dirty reports whether the worktree was dirty at capture, in which case
-// a worktree/ snapshot of the pre-operation state is attached.
+// a fresh worktree/ snapshot of the pre-operation state is attached (a clean
+// op's commit instead carries the previous event's worktree/ forward).
 type GitOpMeta struct {
 	Op         string   `json:"op"`
 	Argv       []string `json:"argv"`
@@ -251,22 +258,24 @@ func (r *Recorder) Append(ctx context.Context, ev *agent.Event, snap snapshot.Sn
 		rec.ToolUse = &ToolUseMeta{Name: ev.Tool.Name, Detail: ev.Tool.Detail}
 	}
 
-	// Build the event's tree (meta/ + worktree/). This is independent of the
-	// journal tip, so we build it once and only re-commit on CAS retry.
-	topTree, err := r.buildEventTree(ctx, &rec, ev, snap)
+	// Build the event's meta/ subtree. It is independent of the journal tip, so it
+	// is built once; the top tree is assembled per CAS attempt inside
+	// commitAndAdvance (a carried worktree/ subtree depends on the tip).
+	metaTree, err := r.buildMetaTree(ctx, &rec, ev)
 	if err != nil {
 		return Record{}, err
 	}
 	msg := fmt.Sprintf("twip %s seq=%d session=%s", rec.Kind, rec.Seq, ev.SessionID)
-	if _, err := r.commitAndAdvance(ctx, cloneID, topTree, msg); err != nil {
+	if _, err := r.commitAndAdvance(ctx, cloneID, metaTree, snap.Tree, msg); err != nil {
 		return Record{}, err
 	}
 	return rec, nil
 }
 
 // AppendGitOp records a session-independent git operation. snap.Tree is empty for
-// a clean operation (nothing dirty to preserve), in which case no worktree/
-// subtree is attached and only the event metadata is recorded.
+// a clean operation (nothing dirty to preserve); only the event metadata is new,
+// and the commit carries the previous event's worktree/ subtree forward (see
+// commitAndAdvance).
 func (r *Recorder) AppendGitOp(ctx context.Context, op GitOpMeta, snap snapshot.Snapshot, worktreeID string, now time.Time) (Record, error) {
 	cloneID, err := r.CloneID(ctx)
 	if err != nil {
@@ -296,31 +305,29 @@ func (r *Recorder) AppendGitOp(ctx context.Context, op GitOpMeta, snap snapshot.
 	if err != nil {
 		return Record{}, err
 	}
-	topTree, err := r.topTree(ctx, metaTree, snap.Tree)
-	if err != nil {
-		return Record{}, err
-	}
 	msg := fmt.Sprintf("twip gitop %s", op.Op)
-	if _, err := r.commitAndAdvance(ctx, cloneID, topTree, msg); err != nil {
+	if _, err := r.commitAndAdvance(ctx, cloneID, metaTree, snap.Tree, msg); err != nil {
 		return Record{}, err
 	}
 	return rec, nil
 }
 
-// topTree assembles the event commit's top tree from the meta subtree and an
-// optional worktree snapshot subtree.
-func (r *Recorder) topTree(ctx context.Context, metaTree, worktreeTree string) (string, error) {
-	entries := []gitutil.TreeEntry{{Mode: "040000", Type: "tree", SHA: metaTree, Name: "meta"}}
-	if worktreeTree != "" {
-		entries = append(entries, gitutil.TreeEntry{Mode: "040000", Type: "tree", SHA: worktreeTree, Name: "worktree"})
-	}
-	return gitutil.MkTree(ctx, r.RepoRoot, entries)
-}
-
-// commitAndAdvance appends a built top tree to this clone's journal, serializing
-// writers with a short flock around a CAS loop. A lost CAS race re-parents the
-// same childless commit onto the new tip — never a merge.
-func (r *Recorder) commitAndAdvance(ctx context.Context, cloneID, topTree, msg string) (string, error) {
+// commitAndAdvance appends one event to this clone's journal: it assembles the
+// top tree (meta/ + worktree/), commits it onto the tip, and advances the ref,
+// serializing writers with a short flock around a CAS loop. A lost CAS race
+// re-builds the same childless event onto the new tip — never a merge.
+//
+// snapTree is the event's own worktree snapshot; when empty (an event that
+// captured none, e.g. a clean git op) the tip's worktree/ subtree is carried
+// forward instead. Consecutive commits then share an identical subtree, so a
+// diff scanner walking the journal (gitleaks/betterleaks) sees only real
+// worktree changes — never a full-tree delete + re-add around a snapshot-less
+// event. The carry adds no reachability and costs no space (the tree is already
+// reachable via the parent commit); event.json's worktree_tree field, not the
+// subtree's presence, records whether this event captured a snapshot. Because
+// the carried subtree comes from the tip, the top tree is assembled inside the
+// CAS loop, where the tip is current.
+func (r *Recorder) commitAndAdvance(ctx context.Context, cloneID, metaTree, snapTree, msg string) (string, error) {
 	ref := journalRef(cloneID)
 	release, err := lockKey(ctx, r.RepoRoot, "journal-"+cloneID)
 	if err != nil {
@@ -333,6 +340,20 @@ func (r *Recorder) commitAndAdvance(ctx context.Context, cloneID, topTree, msg s
 		if err != nil {
 			return "", err
 		}
+		worktree := snapTree
+		if worktree == "" && tip != "" {
+			// Resolves to "" when the tip has no worktree/ itself (a journal whose
+			// events so far never captured a snapshot): then this commit has none.
+			worktree, _ = gitutil.ResolveRef(ctx, r.RepoRoot, tip+":worktree")
+		}
+		entries := []gitutil.TreeEntry{{Mode: "040000", Type: "tree", SHA: metaTree, Name: "meta"}}
+		if worktree != "" {
+			entries = append(entries, gitutil.TreeEntry{Mode: "040000", Type: "tree", SHA: worktree, Name: "worktree"})
+		}
+		topTree, err := gitutil.MkTree(ctx, r.RepoRoot, entries)
+		if err != nil {
+			return "", err
+		}
 		commit, err := gitutil.CommitTree(ctx, r.RepoRoot, topTree, tip, msg)
 		if err != nil {
 			return "", err
@@ -340,17 +361,17 @@ func (r *Recorder) commitAndAdvance(ctx context.Context, cloneID, topTree, msg s
 		if err := gitutil.UpdateRef(ctx, r.RepoRoot, ref, commit, tip); err == nil {
 			return commit, nil
 		}
-		// Ref moved (or git's ref lock was briefly held): re-read tip and re-parent
-		// this same commit onto it. Light backoff to avoid thrashing.
+		// Ref moved (or git's ref lock was briefly held): re-read the tip and
+		// re-build onto it (a carried worktree/ may differ under the new tip).
+		// Light backoff to avoid thrashing.
 		time.Sleep(time.Duration(attempt+1) * 3 * time.Millisecond)
 	}
 	return "", fmt.Errorf("journal append: too many CAS retries on %s", ref)
 }
 
-// buildEventTree creates the meta/ (event.json + transcript + sidechains) and
-// worktree/ subtrees and returns the top tree sha, populating rec.Transcript /
-// rec.Sidechains as it goes.
-func (r *Recorder) buildEventTree(ctx context.Context, rec *Record, ev *agent.Event, snap snapshot.Snapshot) (string, error) {
+// buildMetaTree creates the meta/ subtree (event.json + transcript + sidechains)
+// and returns its sha, populating rec.Transcript / rec.Sidechains as it goes.
+func (r *Recorder) buildMetaTree(ctx context.Context, rec *Record, ev *agent.Event) (string, error) {
 	var metaEntries []gitutil.TreeEntry
 
 	if len(ev.Transcript.Bytes) > 0 || ev.Kind == agent.KindStop || ev.Kind == agent.KindSessionEnd {
@@ -397,13 +418,5 @@ func (r *Recorder) buildEventTree(ctx context.Context, rec *Record, ev *agent.Ev
 	}
 	metaEntries = append(metaEntries, gitutil.TreeEntry{Mode: "100644", Type: "blob", SHA: recSHA, Name: "event.json"})
 
-	metaTree, err := gitutil.MkTree(ctx, r.RepoRoot, metaEntries)
-	if err != nil {
-		return "", err
-	}
-	topEntries := []gitutil.TreeEntry{{Mode: "040000", Type: "tree", SHA: metaTree, Name: "meta"}}
-	if snap.Tree != "" {
-		topEntries = append(topEntries, gitutil.TreeEntry{Mode: "040000", Type: "tree", SHA: snap.Tree, Name: "worktree"})
-	}
-	return gitutil.MkTree(ctx, r.RepoRoot, topEntries)
+	return gitutil.MkTree(ctx, r.RepoRoot, metaEntries)
 }

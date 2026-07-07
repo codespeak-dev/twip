@@ -93,7 +93,11 @@ not via a sha buried in JSON):
 
 - `worktree/` — a full snapshot of the working tree, captured with a throwaway index + `git
   write-tree`: the literal on-disk state, no side effects on HEAD/index/worktree, and unchanged
-  trees cost nothing (git content-addressing dedupes them).
+  trees cost nothing (git content-addressing dedupes them). An event that captures no snapshot of
+  its own (e.g. a clean git op) carries the previous event's `worktree/` forward unchanged, so
+  consecutive commits share the subtree and a diff scanner walking the journal (gitleaks/
+  betterleaks) processes only real changes — never a full-tree delete + re-add. Whether an event
+  captured a snapshot is recorded in `event.json` (`worktree_tree`), not by the subtree's presence.
 - `meta/` — the event record (`event.json`), the turn's transcript delta (`transcript.jsonl`), and
   any subagent sidechain deltas.
 

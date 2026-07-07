@@ -159,6 +159,133 @@ func TestAppend_ChainsAndIsReadable(t *testing.T) {
 	}
 }
 
+// TestAppendGitOp_CarriesWorktreeForward proves a snapshot-less event shares its
+// parent's worktree/ subtree verbatim. Without the carry, the journal alternates
+// full tree -> nothing -> full tree, and every diff-based secrets scanner
+// (gitleaks/betterleaks) re-processes the entire worktree at each gitop instead
+// of just the real changes.
+func TestAppendGitOp_CarriesWorktreeForward(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+	sid := "carry-sess"
+
+	snap1, err := snapshot.Capture(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior, _ := rec.PriorSessionState(ctx, sid)
+	if _, err := rec.Append(ctx,
+		&agent.Event{SessionID: sid, Kind: agent.KindSessionStart, Cursor: agent.Cursor{Main: 0}},
+		snap1, "main", prior.Seq, time.Unix(1000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jref := JournalRefPrefix + cloneID
+	c1, _ := gitutil.ResolveRef(ctx, repo, jref)
+
+	// Clean git op: no snapshot of its own (empty snap.Tree).
+	op := GitOpMeta{Op: "push", Argv: []string{"push"}, ExitCode: 0}
+	r2, err := rec.AppendGitOp(ctx, op, snapshot.Snapshot{Head: snap1.Head, Branch: snap1.Branch}, "main", time.Unix(2000, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r2.WorktreeTree != "" {
+		t.Errorf("clean gitop record claims a snapshot: worktree_tree = %q", r2.WorktreeTree)
+	}
+	c2, _ := gitutil.ResolveRef(ctx, repo, jref)
+
+	w1, err := gitutil.Out(ctx, repo, "rev-parse", c1+":worktree")
+	if err != nil {
+		t.Fatalf("event 1 has no worktree/: %v", err)
+	}
+	w2, err := gitutil.Out(ctx, repo, "rev-parse", c2+":worktree")
+	if err != nil {
+		t.Fatalf("gitop commit did not carry worktree/ forward: %v", err)
+	}
+	if w1 != w2 {
+		t.Errorf("carried worktree/ = %s, want parent's %s", w2, w1)
+	}
+	// The commit-to-commit diff must not touch worktree/ at all.
+	diff, err := gitutil.Out(ctx, repo, "diff-tree", "-r", "--name-only", c1, c2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range strings.Fields(diff) {
+		if strings.HasPrefix(p, "worktree/") {
+			t.Errorf("gitop commit diff touches %s; carry-forward should keep worktree/ identical", p)
+		}
+	}
+
+	// A second snapshot-less gitop chains the carry.
+	if _, err := rec.AppendGitOp(ctx, op, snapshot.Snapshot{Head: snap1.Head, Branch: snap1.Branch}, "main", time.Unix(3000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	c3, _ := gitutil.ResolveRef(ctx, repo, jref)
+	if w3, _ := gitutil.Out(ctx, repo, "rev-parse", c3+":worktree"); w3 != w1 {
+		t.Errorf("second carried worktree/ = %s, want %s", w3, w1)
+	}
+
+	// The next real snapshot diffs incrementally against the carried tree: only
+	// the changed file appears, never a re-add of the unchanged ones.
+	writeFile(t, repo, "newfile.txt", "data\n")
+	snap2, err := snapshot.Capture(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior, _ = rec.PriorSessionState(ctx, sid)
+	if _, err := rec.Append(ctx,
+		&agent.Event{SessionID: sid, Kind: agent.KindStop, Cursor: agent.Cursor{Main: 1}},
+		snap2, "main", prior.Seq, time.Unix(4000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	c4, _ := gitutil.ResolveRef(ctx, repo, jref)
+	diff, err = gitutil.Out(ctx, repo, "diff-tree", "-r", "--name-only", c3, c4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var worktreePaths []string
+	for _, p := range strings.Fields(diff) {
+		if strings.HasPrefix(p, "worktree/") {
+			worktreePaths = append(worktreePaths, p)
+		}
+	}
+	if len(worktreePaths) != 1 || worktreePaths[0] != "worktree/newfile.txt" {
+		t.Errorf("snapshot after carried gitops should diff only the changed file, got %v", worktreePaths)
+	}
+}
+
+// TestAppendGitOp_NoPriorWorktree: the first event ever being snapshot-less means
+// there is nothing to carry — the commit simply has no worktree/ subtree.
+func TestAppendGitOp_NoPriorWorktree(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+
+	op := GitOpMeta{Op: "push", Argv: []string{"push"}, ExitCode: 0}
+	r1, err := rec.AppendGitOp(ctx, op, snapshot.Snapshot{}, "main", time.Unix(1000, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.WorktreeTree != "" {
+		t.Errorf("worktree_tree = %q, want empty", r1.WorktreeTree)
+	}
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tip, _ := gitutil.ResolveRef(ctx, repo, JournalRefPrefix+cloneID)
+	if out, err := gitutil.Out(ctx, repo, "rev-parse", tip+":worktree"); err == nil {
+		t.Errorf("first snapshot-less event should have no worktree/, got %s", out)
+	}
+	if rec2, err := rec.readRecord(ctx, tip); err != nil || rec2.Kind != "gitop" {
+		t.Errorf("record = %+v, err = %v", rec2, err)
+	}
+}
+
 // BenchmarkPriorSessionState exercises the SessionStart hot path on a journal of
 // many events. "tip" is the resume case (the session's newest event is at the
 // tip → early-exit reads ~1 record); "absent" is the worst case (session id not

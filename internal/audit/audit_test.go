@@ -164,8 +164,10 @@ func TestAudit_SessionStartWithTranscriptBaselinePasses(t *testing.T) {
 }
 
 // forgeEvent writes a hand-built event commit (bypassing store.Append's
-// invariants) so we can prove the audit catches corruption.
-func forgeEvent(t *testing.T, repo, sid string, rec store.Record, parent string, withWorktree bool) {
+// invariants) so we can prove the audit catches corruption. worktreeSHA, when
+// non-empty, is attached as the worktree/ subtree (independent of what the
+// record claims).
+func forgeEvent(t *testing.T, repo, sid string, rec store.Record, parent, worktreeSHA string) {
 	t.Helper()
 	ctx := context.Background()
 	recJSON, _ := json.MarshalIndent(rec, "", "  ")
@@ -180,8 +182,8 @@ func forgeEvent(t *testing.T, repo, sid string, rec store.Record, parent string,
 		t.Fatal(err)
 	}
 	entries := []gitutil.TreeEntry{{Mode: "040000", Type: "tree", SHA: metaTree, Name: "meta"}}
-	if withWorktree && rec.WorktreeTree != "" {
-		entries = append(entries, gitutil.TreeEntry{Mode: "040000", Type: "tree", SHA: rec.WorktreeTree, Name: "worktree"})
+	if worktreeSHA != "" {
+		entries = append(entries, gitutil.TreeEntry{Mode: "040000", Type: "tree", SHA: worktreeSHA, Name: "worktree"})
 	}
 	topTree, err := gitutil.MkTree(ctx, repo, entries)
 	if err != nil {
@@ -207,7 +209,7 @@ func TestAudit_SeqGapFails(t *testing.T) {
 	forgeEvent(t, repo, "s1", store.Record{
 		Schema: 1, SessionID: "s1", Seq: 5, Kind: "stop",
 		Cursor: &agent.Cursor{Main: 1},
-	}, tip, false)
+	}, tip, "")
 
 	rep, _ := Run(context.Background(), repo)
 	if rep.OK() {
@@ -227,7 +229,7 @@ func TestAudit_MissingWorktreeFails(t *testing.T) {
 		Schema: 1, SessionID: "s1", Seq: 3, Kind: "stop",
 		WorktreeTree: "0000000000000000000000000000000000000000",
 		Cursor:       &agent.Cursor{Main: 1},
-	}, tip, false)
+	}, tip, "")
 
 	rep, _ := Run(context.Background(), repo)
 	if rep.OK() {
@@ -235,6 +237,60 @@ func TestAudit_MissingWorktreeFails(t *testing.T) {
 	}
 	if !hasError(rep, "worktree") {
 		t.Errorf("expected a worktree finding; got %+v", rep.Findings)
+	}
+}
+
+// TestAudit_CarriedWorktreePasses: a snapshot-less gitop event carries its
+// parent's worktree/ subtree forward (so journal diffs stay empty); that is
+// clean by construction and must pass the audit.
+func TestAudit_CarriedWorktreePasses(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	recordTwoGoodEvents(t, repo, "s1")
+
+	rec := store.New(repo)
+	op := store.GitOpMeta{Op: "push", Argv: []string{"push"}, ExitCode: 0}
+	if _, err := rec.AppendGitOp(ctx, op, snapshot.Snapshot{}, "main", time.Unix(3, 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := Run(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK() {
+		t.Errorf("carried-worktree gitop should pass; findings: %+v", rep.Findings)
+	}
+	if rep.Events != 3 {
+		t.Errorf("events = %d, want 3", rep.Events)
+	}
+}
+
+// TestAudit_ForgedCarriedWorktreeFails: a snapshot-less event whose worktree/
+// differs from its parent's smuggles in content no event recorded — the audit
+// must flag it.
+func TestAudit_ForgedCarriedWorktreeFails(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	tip := recordTwoGoodEvents(t, repo, "s1")
+
+	// Any tree that differs from the parent's worktree/ will do; the commit's own
+	// meta tree is a handy existing one.
+	wrongTree, err := gitutil.Out(ctx, repo, "rev-parse", tip+":meta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgeEvent(t, repo, "", store.Record{
+		Schema: 1, Kind: "gitop", TS: "2026-01-01T00:00:00Z",
+		GitOp: &store.GitOpMeta{Op: "push"},
+	}, tip, wrongTree)
+
+	rep, _ := Run(ctx, repo)
+	if rep.OK() {
+		t.Fatal("expected audit to fail on a forged carried worktree/")
+	}
+	if !hasError(rep, "carried worktree") {
+		t.Errorf("expected a carried-worktree finding; got %+v", rep.Findings)
 	}
 }
 
