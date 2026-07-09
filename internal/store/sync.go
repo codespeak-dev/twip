@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/leaks"
 )
 
 // twip sync rides on normal git: a pre-push hook mirrors this clone's journal to
@@ -140,9 +142,20 @@ func (r *Recorder) InstallSync(ctx context.Context, twipPath string, enforce boo
 // command and the bundled hook both treat it as non-fatal so a push never blocks.
 // It is a no-op when already inside a mirror push (envSyncPush set), which stops
 // a foreign hook from recursing even without its own guard line.
+//
+// The mirror self-gates: before pushing, the twip data this push would newly
+// expose (the journal delta plus keep-refs the remote lacks) is scanned for
+// secrets, and on findings the mirror is withheld — the returned
+// *MirrorBlockedError tells the caller why and how to fix it. The gate lives
+// HERE, not in a hook, because every mirror path funnels through this function
+// (bundled hook, hook-manager jobs regardless of their ordering, a manual
+// `twip sync push`), so no wiring or hook configuration can route around it.
 func (r *Recorder) SyncPush(ctx context.Context, remote string) error {
 	if remote == "" || os.Getenv(envSyncPush) == "1" {
 		return nil
+	}
+	if err := r.gateMirrorPush(ctx, remote); err != nil {
+		return err // secrets in the delta: withhold the mirror, never the user's push
 	}
 	// --no-verify so this internal mirror push never fires the pre-push hook: it
 	// would otherwise re-run a hook manager's other pre-push jobs (tests, lint, …) a
@@ -156,6 +169,155 @@ func (r *Recorder) SyncPush(ctx context.Context, remote string) error {
 	}
 	_, err := gitutil.Run(ctx, r.RepoRoot, []string{envSyncPush + "=1"}, nil, args...)
 	return err
+}
+
+// envSkipLeakScan disables the pre-mirror secrets gate for one push — the
+// deliberate "I know, mirror it anyway" bypass. The gate already fails OPEN on
+// anything infrastructural (no scanner installed, unreachable remote, scanner
+// error), so this exists only for overriding a real finding.
+const envSkipLeakScan = "TWIP_SKIP_LEAK_SCAN"
+
+// MirrorBlockedError reports that the mirror's secrets gate withheld the push:
+// the twip data it would have newly exposed contains scanner findings. The
+// user's own push is unaffected — only the twip refs were held back.
+type MirrorBlockedError struct {
+	Scanner string   // which scanner flagged it
+	Where   string   // what was scanned (journal delta range / new keep-refs)
+	Count   int      // finding count
+	Rules   []string // distinct rule ids
+	Paths   []string // distinct flagged paths
+}
+
+func (e *MirrorBlockedError) Error() string {
+	return fmt.Sprintf("mirror withheld: %s found %d secret finding(s) in %s\n"+
+		"  rules: %v; paths: %v\n"+
+		"  your own push is unaffected — twip refs were NOT mirrored to the remote\n"+
+		"  fix: run `twip redact`, then push again (deliberate bypass: %s=1)",
+		e.Scanner, e.Count, e.Where, e.Rules, e.Paths, envSkipLeakScan)
+}
+
+// gateMirrorPush scans exactly what this mirror push would newly expose — the
+// journal commits the remote lacks, and any pin/stash keep-refs not yet on the
+// remote (a pinned pre-rewrite commit is precisely where an amended-away secret
+// lives) — and returns a *MirrorBlockedError on findings so SyncPush withholds
+// the mirror.
+//
+// Robustness contract: the gate NEVER blocks for infrastructure reasons.
+// Missing scanners (neither betterleaks nor gitleaks on PATH), an unreachable
+// remote, or a scanner failure all fail open with a stderr note where useful —
+// a missed scan is recoverable (the remote-side full scan backstops; `twip
+// redact` fixes later), while a wrongly-withheld mirror is silent backup loss.
+// `twip doctor` reports whether a scanner is available so the fail-open state
+// is visible, and TWIP_SKIP_LEAK_SCAN=1 is the deliberate bypass for a real
+// finding. A journal already diverged from the remote (an unpropagated redact)
+// is not scanned: that push is rejected non-fast-forward regardless, so
+// nothing is about to be exposed.
+func (r *Recorder) gateMirrorPush(ctx context.Context, remote string) error {
+	if os.Getenv(envSkipLeakScan) == "1" {
+		return nil
+	}
+	sc, err := leaks.ResolveScanner("auto", "", "")
+	if err != nil {
+		return nil // no scanner installed: fail open (doctor surfaces this state)
+	}
+	cloneID, err := r.CloneID(ctx)
+	if err != nil {
+		return nil
+	}
+	jref := journalRef(cloneID)
+	localTip, _ := gitutil.ResolveRef(ctx, r.RepoRoot, jref)
+	keepTips, err := r.keepRefTips(ctx)
+	if err != nil {
+		keepTips = nil
+	}
+	if localTip == "" && len(keepTips) == 0 {
+		return nil // nothing to mirror, nothing to gate
+	}
+
+	// One ls-remote scopes everything the refspecs would push.
+	out, err := gitutil.Out(ctx, r.RepoRoot, "ls-remote", remote,
+		jref, PinRefPrefix+"*", StashRefPrefix+"*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "twip: cannot reach %s to scope the mirror secrets scan; mirroring unscanned\n", remote)
+		return nil
+	}
+	remoteTip := ""
+	remoteHas := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		if f[1] == jref {
+			remoteTip = f[0]
+		} else {
+			remoteHas[f[1]] = true
+		}
+	}
+	cfg := leaks.ResolveConfig(r.RepoRoot, sc.Name)
+
+	// The journal delta: only the commits the remote lacks.
+	if localTip != "" && localTip != remoteTip {
+		rng := ""
+		switch {
+		case remoteTip == "":
+			rng = jref // never mirrored: all of it is new
+		case gitutil.IsAncestor(ctx, r.RepoRoot, remoteTip, localTip):
+			rng = remoteTip + ".." + jref
+		}
+		if rng != "" {
+			findings, err := sc.Scan(ctx, r.RepoRoot, rng, cfg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "twip: mirror secrets scan failed; mirroring unscanned: %v\n", err)
+				return nil
+			}
+			if len(findings) > 0 {
+				_, paths, rules := leaks.Distinct(findings)
+				return &MirrorBlockedError{Scanner: sc.Name, Where: "the journal delta (" + rng + ")",
+					Count: len(findings), Rules: rules, Paths: paths}
+			}
+		}
+	}
+
+	// Keep-refs the remote doesn't have yet: each preserves one (orphaned)
+	// commit, so scan just those commits.
+	var newShas []string
+	for ref, tip := range keepTips {
+		if !remoteHas[ref] {
+			newShas = append(newShas, tip)
+		}
+	}
+	if len(newShas) > 0 {
+		sort.Strings(newShas)
+		findings, err := sc.Scan(ctx, r.RepoRoot, "-m --no-walk=unsorted "+strings.Join(newShas, " "), cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "twip: keep-ref secrets scan failed; mirroring unscanned: %v\n", err)
+			return nil
+		}
+		if len(findings) > 0 {
+			_, paths, rules := leaks.Distinct(findings)
+			return &MirrorBlockedError{Scanner: sc.Name,
+				Where: fmt.Sprintf("%d keep-ref(s) not yet on the remote", len(newShas)),
+				Count: len(findings), Rules: rules, Paths: paths}
+		}
+	}
+	return nil
+}
+
+// keepRefTips maps each pin/stash keep-ref name to its tip sha.
+func (r *Recorder) keepRefTips(ctx context.Context) (map[string]string, error) {
+	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil,
+		"for-each-ref", "--format=%(refname) %(objectname)", PinRefPrefix, StashRefPrefix)
+	if err != nil {
+		return nil, err
+	}
+	tips := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if f := strings.Fields(line); len(f) == 2 {
+			tips[f[0]] = f[1]
+		}
+	}
+	return tips, nil
 }
 
 // SyncFetch pulls teammates' journals/pins/stash from remote into this clone's

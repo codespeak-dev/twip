@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/codespeak-dev/twip/internal/store"
@@ -19,10 +20,15 @@ func newSyncCmd() *cobra.Command {
 func newSyncPushCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "push <remote>",
-		Short: "Push this clone's journal/pins/stash refs to a remote (best-effort)",
+		Short: "Push this clone's journal/pins/stash refs to a remote (best-effort, self-gated)",
 		Long: "Mirrors refs/twip/{journal,pin,stash}/* to the given remote. Best-effort: " +
 			"a push failure is reported but never fails the command, so it is safe to wire " +
-			"into any pre-push hook (the bundled hook calls this for you).",
+			"into any pre-push hook (the bundled hook calls this for you).\n\n" +
+			"The mirror self-gates: when betterleaks or gitleaks is on PATH, the twip data this " +
+			"push would newly expose (journal commits the remote lacks, keep-refs not yet there) " +
+			"is scanned first, and on findings the mirror is withheld — fix with `twip redact`, " +
+			"bypass one push with TWIP_SKIP_LEAK_SCAN=1. With no scanner installed the mirror " +
+			"proceeds unscanned (`twip doctor` reports which state you're in).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -31,8 +37,14 @@ func newSyncPushCmd() *cobra.Command {
 				return err
 			}
 			if err := store.New(root).SyncPush(ctx, args[0]); err != nil {
-				// Never block a push: report and exit 0.
-				cmd.PrintErrf("twip: sync push failed: %v\n", err)
+				// Never block a push: report and exit 0. A withheld mirror is a
+				// deliberate gate outcome, not a failure — word it accordingly.
+				var blocked *store.MirrorBlockedError
+				if errors.As(err, &blocked) {
+					cmd.PrintErrf("twip: %v\n", err)
+				} else {
+					cmd.PrintErrf("twip: sync push failed: %v\n", err)
+				}
 			}
 			return nil
 		},

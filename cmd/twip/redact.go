@@ -1,31 +1,15 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/leaks"
 	"github.com/codespeak-dev/twip/internal/store"
 	"github.com/spf13/cobra"
 )
-
-// leakFinding is the subset of a scanner's JSON finding twip redaction needs: where
-// the secret is (Commit + File), what it is (Secret, raw — we scan WITHOUT --redact),
-// and which rule matched (for the summary). betterleaks and gitleaks emit the same
-// top-level fields (betterleaks is a gitleaks fork), so one struct serves both.
-type leakFinding struct {
-	RuleID string `json:"RuleID"`
-	File   string `json:"File"`
-	Commit string `json:"Commit"`
-	Secret string `json:"Secret"`
-}
 
 func newRedactCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -74,12 +58,12 @@ func newRedactCmd() *cobra.Command {
 			}
 			ref := store.JournalRefPrefix + cloneID
 
-			sc, err := resolveScanner(mode, blBin, glBin)
+			sc, err := leaks.ResolveScanner(mode, blBin, glBin)
 			if err != nil {
 				return err
 			}
 			if cfg == "" {
-				cfg = resolveConfig(root, sc.name)
+				cfg = leaks.ResolveConfig(root, sc.Name)
 			}
 
 			// One ls-remote serves double duty: it scopes the scan to the commits
@@ -111,23 +95,23 @@ func newRedactCmd() *cobra.Command {
 				scopeNote = "; new commits only — pass --all for full history"
 			}
 			if cfg != "" {
-				cmd.Printf("Scanning %s with %s (config: %s%s)\n", scanRange, sc.name, cfg, scopeNote)
+				cmd.Printf("Scanning %s with %s (config: %s%s)\n", scanRange, sc.Name, cfg, scopeNote)
 			} else {
-				cmd.Printf("Scanning %s with %s (default rules%s)\n", scanRange, sc.name, scopeNote)
+				cmd.Printf("Scanning %s with %s (default rules%s)\n", scanRange, sc.Name, scopeNote)
 			}
 
-			var findings []leakFinding
+			var findings []leaks.Finding
 			if !nothingNew {
-				if findings, err = sc.scan(ctx, root, scanRange, cfg); err != nil {
+				if findings, err = sc.Scan(ctx, root, scanRange, cfg); err != nil {
 					return err
 				}
 			}
 			// Keep-refs (pins + archived stash) live outside the journal chain; a
 			// secret there is cleared by dropping the ref, not by rewriting. Scan
 			// them only when any exist, bounded to orphaned commits.
-			var keepFindings []leakFinding
+			var keepFindings []leaks.Finding
 			if refs, _ := rec.KeepRefs(ctx); len(refs) > 0 {
-				if keepFindings, err = sc.scan(ctx, root, keepRefLogOpts, cfg); err != nil {
+				if keepFindings, err = sc.Scan(ctx, root, keepRefLogOpts, cfg); err != nil {
 					return err
 				}
 			}
@@ -150,9 +134,9 @@ func newRedactCmd() *cobra.Command {
 
 			var res store.RedactResult
 			if len(findings) > 0 {
-				secrets, paths, rules := distinctFindings(findings)
+				secrets, paths, rules := leaks.Distinct(findings)
 				cmd.Printf("%s flagged %d finding(s) in %s — rules: %v; paths: %v\n",
-					sc.name, len(findings), ref, rules, paths)
+					sc.Name, len(findings), ref, rules, paths)
 				if res, err = rec.RedactJournal(ctx, cloneID, secrets, paths, dryRun); err != nil {
 					return err
 				}
@@ -174,7 +158,7 @@ func newRedactCmd() *cobra.Command {
 					if scoped && gitutil.IsAncestor(ctx, root, remoteTip, res.NewTip) {
 						verifyRange = remoteTip + ".." + ref
 					}
-					if after, err := sc.scan(ctx, root, verifyRange, cfg); err == nil {
+					if after, err := sc.Scan(ctx, root, verifyRange, cfg); err == nil {
 						if len(after) == 0 {
 							cmd.Println("✓ journal re-scan clean.")
 						} else {
@@ -186,13 +170,13 @@ func newRedactCmd() *cobra.Command {
 
 			var droppedKeep []string
 			if len(keepFindings) > 0 {
-				_, kpaths, krules := distinctFindings(keepFindings)
-				toDrop, err := rec.KeepRefsRetaining(ctx, distinctCommits(keepFindings))
+				_, kpaths, krules := leaks.Distinct(keepFindings)
+				toDrop, err := rec.KeepRefsRetaining(ctx, leaks.DistinctCommits(keepFindings))
 				if err != nil {
 					return err
 				}
 				cmd.Printf("%s flagged %d finding(s) in pinned/stash keep-refs — rules: %v; paths: %v\n",
-					sc.name, len(keepFindings), krules, kpaths)
+					sc.Name, len(keepFindings), krules, kpaths)
 				if dryRun {
 					for _, kr := range toDrop {
 						cmd.Printf("[dry-run] would delete %s (deliberately destroying the preserved object)\n", kr)
@@ -282,116 +266,6 @@ func newRedactCmd() *cobra.Command {
 	return cmd
 }
 
-// scanner is the secrets scanner twip redaction drives: a display name and the
-// resolved binary path. betterleaks and gitleaks share the `detect` subcommand, flag
-// set, and JSON finding schema (betterleaks is a gitleaks fork), so a single scan path
-// serves both — only the binary and the messaging differ.
-type scanner struct {
-	name string // "betterleaks" or "gitleaks"
-	bin  string // resolved binary path
-}
-
-// resolveScanner picks the secrets scanner per the --scanner mode and resolves its
-// binary. betterleaks is the default; "gitleaks" forces the classic scanner; "auto"
-// prefers betterleaks and falls back to gitleaks (erroring only if neither is
-// present). Each explicit mode reports which dependency is missing — and how to reach
-// the other scanner — rather than failing opaquely.
-func resolveScanner(mode, betterleaksBin, gitleaksBin string) (scanner, error) {
-	switch mode {
-	case "", "betterleaks":
-		bin, err := lookScanner("betterleaks", betterleaksBin, "gitleaks")
-		return scanner{"betterleaks", bin}, err
-	case "gitleaks":
-		bin, err := lookScanner("gitleaks", gitleaksBin, "betterleaks")
-		return scanner{"gitleaks", bin}, err
-	case "auto":
-		if bin, err := lookScanner("betterleaks", betterleaksBin, ""); err == nil {
-			return scanner{"betterleaks", bin}, nil
-		}
-		if bin, err := lookScanner("gitleaks", gitleaksBin, ""); err == nil {
-			return scanner{"gitleaks", bin}, nil
-		}
-		return scanner{}, fmt.Errorf("--scanner auto: neither betterleaks nor gitleaks found on PATH " +
-			"(install one, or pass --betterleaks/--gitleaks <path>)")
-	default:
-		return scanner{}, fmt.Errorf("unknown --scanner %q (want: betterleaks, gitleaks, or auto)", mode)
-	}
-}
-
-// lookScanner resolves a scanner binary: the explicit --<name> path if given, else the
-// name on PATH. When it is missing the error names the tool to install and, if alt is
-// set, the --scanner value that selects the other tool.
-func lookScanner(name, explicit, alt string) (string, error) {
-	if explicit != "" {
-		return explicit, nil
-	}
-	p, err := exec.LookPath(name)
-	if err == nil {
-		return p, nil
-	}
-	if alt != "" {
-		return "", fmt.Errorf("%s not found on PATH (install it, pass --%s <path>, or run with --scanner %s)", name, name, alt)
-	}
-	return "", fmt.Errorf("%s not found on PATH (install it, or pass --%s <path>)", name, name)
-}
-
-// resolveConfig finds a project scanner config at the repo root, honoring the dotted
-// and bare filenames both tools recognize. betterleaks prefers its own config but still
-// falls back to a shared .gitleaks.toml; gitleaks reads only the gitleaks names.
-// Returns "" when none is present, in which case the scanner uses its built-in rules.
-func resolveConfig(root, scannerName string) string {
-	names := []string{".gitleaks.toml", "gitleaks.toml"}
-	if scannerName == "betterleaks" {
-		names = append([]string{".betterleaks.toml", "betterleaks.toml"}, names...)
-	}
-	for _, name := range names {
-		if p := filepath.Join(root, name); fileExists(p) {
-			return p
-		}
-	}
-	return ""
-}
-
-// scan runs the scanner against a single ref's history and returns its findings. Both
-// tools exit 1 when leaks are found — the expected success case here, not an error.
-// TWIP_SHIM_ACTIVE is set so the scanner's own `git` calls (if the shim is on PATH)
-// pass straight through instead of being recorded.
-func (s scanner) scan(ctx context.Context, root, ref, cfg string) ([]leakFinding, error) {
-	report, err := os.CreateTemp("", "twip-leaks-*.json")
-	if err != nil {
-		return nil, err
-	}
-	reportPath := report.Name()
-	report.Close()
-	defer os.Remove(reportPath)
-
-	args := []string{"detect", "--source", root,
-		"--report-format", "json", "--report-path", reportPath,
-		"--log-opts", ref}
-	if cfg != "" {
-		args = append(args, "--config", cfg)
-	}
-	c := exec.CommandContext(ctx, s.bin, args...)
-	c.Env = append(os.Environ(), "TWIP_SHIM_ACTIVE=1")
-	var stderr bytes.Buffer
-	c.Stderr = &stderr
-	if err := c.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
-			return nil, fmt.Errorf("%s: %w: %s", s.name, err, stderr.String())
-		}
-		// exit code 1 => leaks found; fall through and read the report.
-	}
-	data, err := os.ReadFile(reportPath)
-	if err != nil || len(bytes.TrimSpace(data)) == 0 {
-		return nil, nil // no report / empty => no findings
-	}
-	var findings []leakFinding
-	if err := json.Unmarshal(data, &findings); err != nil {
-		return nil, fmt.Errorf("parse %s report: %w", s.name, err)
-	}
-	return findings, nil
-}
-
 // completePendingPropagation finishes a propagation an earlier local-only
 // redaction recorded. Returns false when nothing was pending.
 func completePendingPropagation(cmd *cobra.Command, ctx context.Context, rec *store.Recorder, cloneID string) (bool, error) {
@@ -449,41 +323,3 @@ func unionStrings(a, b []string) []string {
 // history — not twip's to fix — never show up here). -m diffs merge commits
 // (stash entries are merges), making their tree content visible to the scanner.
 const keepRefLogOpts = "-m --glob=refs/twip/pin/* --glob=refs/twip/stash/* --not --branches --tags --remotes"
-
-// distinctCommits collapses findings into the distinct commit shas they were
-// attributed to (used to locate which keep-refs retain them).
-func distinctCommits(fs []leakFinding) []string {
-	seen := map[string]bool{}
-	var commits []string
-	for _, f := range fs {
-		if f.Commit != "" && !seen[f.Commit] {
-			seen[f.Commit] = true
-			commits = append(commits, f.Commit)
-		}
-	}
-	sort.Strings(commits)
-	return commits
-}
-
-// distinctFindings collapses findings into the distinct secret strings to remove, the
-// distinct tree paths they were found in, and the distinct rule ids (for the summary).
-func distinctFindings(fs []leakFinding) (secrets, paths, rules []string) {
-	sSet, pSet, rSet := map[string]bool{}, map[string]bool{}, map[string]bool{}
-	for _, f := range fs {
-		if f.Secret != "" && !sSet[f.Secret] {
-			sSet[f.Secret] = true
-			secrets = append(secrets, f.Secret)
-		}
-		if f.File != "" && !pSet[f.File] {
-			pSet[f.File] = true
-			paths = append(paths, f.File)
-		}
-		if f.RuleID != "" && !rSet[f.RuleID] {
-			rSet[f.RuleID] = true
-			rules = append(rules, f.RuleID)
-		}
-	}
-	sort.Strings(paths)
-	sort.Strings(rules)
-	return secrets, paths, rules
-}

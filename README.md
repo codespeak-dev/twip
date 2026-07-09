@@ -117,7 +117,13 @@ unavailable, so it can never break git.
 
 **Sharing across the team.** Push rides on normal git: `twip init` installs a best-effort `pre-push`
 hook (which calls `twip sync push`, pushing with `--no-verify` so it never re-runs your other
-pre-push checks) that mirrors your journal to the remote you push to. If a hook manager already owns
+pre-push checks) that mirrors your journal to the remote you push to. The mirror **self-gates**:
+when betterleaks or gitleaks is on PATH, the twip data a push would newly expose (journal commits
+the remote lacks, keep-refs not yet there) is scanned first, and on findings the mirror is withheld
+with a fix-it message (`twip redact`) while your own push proceeds untouched — no hook wiring or
+ordering can route around it, since the gate lives inside the mirror itself. Without a scanner the
+mirror proceeds unscanned (`twip doctor` shows which state you're in); `TWIP_SKIP_LEAK_SCAN=1`
+deliberately bypasses one push. If a hook manager already owns
 `pre-push` (lefthook, husky, pre-commit), twip detects it, leaves it untouched, and prints the exact
 config to add — wiring `twip sync push` (and, with `--enforce`, `twip check pre-push`) into the
 manager.
@@ -152,7 +158,7 @@ cmd/twip/gitshim.go      the `git` shim capture path (pre-destruction snapshot, 
 cmd/twip/shim.go         `twip shim install/uninstall` (writes the git wrapper + PATH guidance)
 cmd/twip/install.go      `twip install/uninstall` (stable binary copy + shim + shell-rc PATH wiring)
 cmd/twip/check.go        `twip check pre-push` (the opt-in push gate)
-cmd/twip/sync.go         `twip sync push` (mirror refs/twip/* to a remote; one home for sync)
+cmd/twip/sync.go         `twip sync push` (self-gated mirror of refs/twip/* to a remote; one home for sync)
 cmd/twip/redact.go       `twip redact` (scan journal + pin/stash keep-refs with betterleaks/gitleaks; rewrite/drop flagged secrets locally; --propagate replaces the remote copy)
 cmd/twip/doctor.go       `twip doctor` (PATH-shadow + recording-status + update diagnostics)
 cmd/twip/update.go       `twip update` (go install latest, then re-run twip install)

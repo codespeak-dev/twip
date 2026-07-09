@@ -214,18 +214,12 @@ func (r *Recorder) KeepRefs(ctx context.Context) ([]string, error) {
 // a flagged pinned/stashed object unreachable — the deliberate trade of that
 // object's preservation for its destruction.
 func (r *Recorder) KeepRefsRetaining(ctx context.Context, commits []string) ([]string, error) {
-	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil,
-		"for-each-ref", "--format=%(refname) %(objectname)", PinRefPrefix, StashRefPrefix)
+	tips, err := r.keepRefTips(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var refs []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		ref, tip := fields[0], fields[1]
+	for ref, tip := range tips {
 		for _, c := range commits {
 			if c == tip || gitutil.IsAncestor(ctx, r.RepoRoot, c, tip) {
 				refs = append(refs, ref)

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codespeak-dev/twip/internal/leaks"
 	"github.com/codespeak-dev/twip/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -154,6 +155,18 @@ func checkJournalSync(ctx context.Context, out io.Writer, offline bool) bool {
 	if enabled, _ := rec.Enabled(ctx); !enabled {
 		fmt.Fprintln(out, "  • twip not enabled in this repo")
 		return true
+	}
+	// The mirror's secrets gate fails open without a scanner — make that state
+	// visible here rather than letting it pass silently. Informational, not a
+	// problem: fail-open is the designed behavior.
+	if sc, err := leaks.ResolveScanner("auto", "", ""); err == nil {
+		if v := sc.Version(ctx); v != "" {
+			fmt.Fprintf(out, "  ✓ mirror secrets gate active: %s (%s)\n", sc.Name, v)
+		} else {
+			fmt.Fprintf(out, "  ✓ mirror secrets gate active: %s (version unknown — check the binary if pushes misbehave)\n", sc.Name)
+		}
+	} else {
+		fmt.Fprintln(out, "  ⚠ no secrets scanner (betterleaks or gitleaks) on PATH — twip data mirrors unscanned; only a remote-side scan can catch journal secrets")
 	}
 	if p := rec.LoadPendingPropagation(ctx); p != nil {
 		fmt.Fprintf(out, "  ✗ a redaction from %s is not propagated — the remote still holds the pre-redaction journal, and mirror pushes are failing silently\n", p.TS)
