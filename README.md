@@ -153,7 +153,7 @@ cmd/twip/shim.go         `twip shim install/uninstall` (writes the git wrapper +
 cmd/twip/install.go      `twip install/uninstall` (stable binary copy + shim + shell-rc PATH wiring)
 cmd/twip/check.go        `twip check pre-push` (the opt-in push gate)
 cmd/twip/sync.go         `twip sync push` (mirror refs/twip/* to a remote; one home for sync)
-cmd/twip/redact.go       `twip redact` (scan the journal with betterleaks/gitleaks; rewrite out flagged secrets)
+cmd/twip/redact.go       `twip redact` (scan journal + pin/stash keep-refs with betterleaks/gitleaks; rewrite/drop flagged secrets locally; --propagate replaces the remote copy)
 cmd/twip/doctor.go       `twip doctor` (PATH-shadow + recording-status + update diagnostics)
 cmd/twip/update.go       `twip update` (go install latest, then re-run twip install)
 cmd/twip/report.go       `twip report` (shareable Markdown bug report from recent activity)

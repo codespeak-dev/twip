@@ -26,9 +26,11 @@ func newDoctorCmd() *cobra.Command {
 		Short: "Diagnose twip health: git-shim PATH shadowing and available updates",
 		Long: "Checks that the twip git shim actually shadows the real git on your PATH — a " +
 			"common silent failure when Homebrew/conda/nvm or an IDE prepend their own dirs ahead " +
-			"of ~/.twip/bin, so git ops stop being recorded with no error. Also reports this repo's " +
-			"recording status and whether a newer twip is available to `go install`. Exits non-zero " +
-			"if it finds a problem.",
+			"of ~/.twip/bin, so git ops stop being recorded with no error. Also checks that this " +
+			"clone's journal can still fast-forward onto the sync remote (a local `twip redact` of " +
+			"pushed history strands the mirror silently — the fix is `twip redact --propagate`), " +
+			"reports the repo's recording status, and whether a newer twip is available to " +
+			"`go install`. Exits non-zero if it finds a problem.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			dir, _ := cmd.Flags().GetString("dir")
@@ -50,6 +52,11 @@ func newDoctorCmd() *cobra.Command {
 
 			fmt.Fprintln(out, "\nthis repo")
 			reportRepo(cmd.Context(), out)
+
+			fmt.Fprintln(out, "\njournal sync")
+			if !checkJournalSync(cmd.Context(), out, offline) {
+				problems++
+			}
 
 			fmt.Fprintln(out, "\nversion")
 			checkVersion(cmd.Context(), out, offline)
@@ -128,6 +135,61 @@ func gitPathScan(shimDir string) (firstGit string, firstPos, shimPos int) {
 		}
 	}
 	return firstGit, firstPos, shimPos
+}
+
+// checkJournalSync surfaces the stranded-journal state: after a local rewrite of
+// pushed history (`twip redact` without --propagate), the remote's copy can no
+// longer fast-forward, so the pre-push mirror fails silently on every push and
+// the journal quietly stops backing up. Doctor is where that silence becomes
+// visible. Two probes: the pending-propagation marker a local-only redaction
+// records (works offline), and a live divergence check against the sync remote
+// (skipped with --offline). Both suggest `twip redact --propagate`.
+func checkJournalSync(ctx context.Context, out io.Writer, offline bool) bool {
+	root, err := repoRoot(ctx)
+	if err != nil {
+		fmt.Fprintln(out, "  • not inside a git repository")
+		return true
+	}
+	rec := store.New(root)
+	if enabled, _ := rec.Enabled(ctx); !enabled {
+		fmt.Fprintln(out, "  • twip not enabled in this repo")
+		return true
+	}
+	if p := rec.LoadPendingPropagation(ctx); p != nil {
+		fmt.Fprintf(out, "  ✗ a redaction from %s is not propagated — the remote still holds the pre-redaction journal, and mirror pushes are failing silently\n", p.TS)
+		fmt.Fprintln(out, "      fix: run `twip redact --propagate` (lease-guarded force-push of the redacted journal)")
+		return false
+	}
+	remote := rec.SyncRemote(ctx)
+	if remote == "" {
+		fmt.Fprintln(out, "  • no sync remote configured")
+		return true
+	}
+	if offline {
+		fmt.Fprintln(out, "  • divergence check skipped: --offline")
+		return true
+	}
+	diverged, localTip, remoteTip, err := rec.JournalDiverged(ctx, remote)
+	switch {
+	case err != nil:
+		fmt.Fprintf(out, "  ? could not compare the journal with %s: %v\n", remote, err)
+		return true // unreachable remote is not a local problem
+	case localTip == "":
+		fmt.Fprintln(out, "  • no journal recorded yet")
+		return true
+	case diverged:
+		fmt.Fprintf(out, "  ✗ journal diverged from %s (local %s, remote %s) — mirror pushes are failing silently\n",
+			remote, short(localTip), short(remoteTip))
+		fmt.Fprintln(out, "      if this follows a local `twip redact`, run `twip redact --propagate` to replace the remote copy;")
+		fmt.Fprintln(out, "      otherwise investigate — another machine may be writing this clone's journal (copied clone?)")
+		return false
+	case remoteTip == "":
+		fmt.Fprintf(out, "  ✓ journal not pushed to %s yet (the next push mirrors it)\n", remote)
+		return true
+	default:
+		fmt.Fprintf(out, "  ✓ journal fast-forwards to %s\n", remote)
+		return true
+	}
 }
 
 // reportRepo notes whether the current repo (if any) is twip-enabled — informational,

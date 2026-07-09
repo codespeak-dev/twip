@@ -203,6 +203,14 @@ func CatFile(ctx context.Context, repoRoot, spec string) ([]byte, error) {
 	return Run(ctx, repoRoot, nil, nil, "cat-file", "-p", spec)
 }
 
+// IsAncestor reports whether ancestor is an ancestor of (or equal to)
+// descendant. False on any error (unknown shas included), so callers treating
+// true as permission to act stay conservative.
+func IsAncestor(ctx context.Context, repoRoot, ancestor, descendant string) bool {
+	_, err := Run(ctx, repoRoot, nil, nil, "merge-base", "--is-ancestor", ancestor, descendant)
+	return err == nil
+}
+
 // ObjectExists reports whether an object (sha or rev:path spec) is present.
 func ObjectExists(ctx context.Context, repoRoot, spec string) bool {
 	_, err := Run(ctx, repoRoot, nil, nil, "cat-file", "-e", spec)

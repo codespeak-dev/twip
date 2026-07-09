@@ -3,9 +3,13 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/codespeak-dev/twip/internal/gitutil"
 )
@@ -24,6 +28,7 @@ type RedactResult struct {
 	NewTip           string   // journal tip after the rewrite ("" on dry-run)
 	EarliestAffected string   // oldest original commit that contained a secret
 	AlreadyPushed    bool     // EarliestAffected is reachable from origin's mirror (local redaction can't undo that)
+	DroppedMirrors   []string // own-journal mirror refs deleted because they retained the pre-redaction chain (would-drop on dry-run)
 	DryRun           bool
 }
 
@@ -100,6 +105,13 @@ func (r *Recorder) RedactJournal(ctx context.Context, cloneID string, secrets, p
 		if err != nil {
 			return res, err
 		}
+		// Redacting a worktree/ blob changes the worktree subtree's sha; the
+		// event record's worktree_tree must follow it or every later audit
+		// reports the snapshot as corrupt.
+		newTree, err = r.syncRecordedWorktree(ctx, newTree)
+		if err != nil {
+			return res, err
+		}
 		meta, err := r.readCommitMeta(ctx, c)
 		if err != nil {
 			return res, err
@@ -116,13 +128,225 @@ func (r *Recorder) RedactJournal(ctx context.Context, cloneID string, secrets, p
 		return res, nil
 	}
 	res.AlreadyPushed = r.earliestAffectedPushed(ctx, cloneID, res.EarliestAffected)
+	// Own-journal mirror refs that retain any rewritten commit would keep the
+	// pre-redaction chain (secret bytes included) reachable and gc-protected on
+	// this machine forever; drop them. A mirror pointing into the clean prefix
+	// is kept — it retains nothing the new chain doesn't.
+	stale := r.staleOwnMirrors(ctx, cloneID, res.EarliestAffected)
 	if dryRun {
+		res.DroppedMirrors = stale // would-drop
 		return res, nil
 	}
 	if err := gitutil.UpdateRef(ctx, r.RepoRoot, ref, newParent, oldTip); err != nil {
 		return res, fmt.Errorf("update journal ref %s: %w", ref, err)
 	}
 	res.NewTip = newParent
+	res.DroppedMirrors = r.DeleteRefs(ctx, stale)
+	return res, nil
+}
+
+// syncRecordedWorktree keeps a rewritten event tree self-consistent: if its
+// meta/event.json records a worktree_tree that no longer matches the actual
+// worktree/ subtree (because a snapshot blob was redacted), the recorded sha is
+// replaced with the new one and the tree rebuilt. The patch is a byte-level sha
+// substitution, not a JSON re-marshal, so redacted content, formatting, and any
+// fields this twip version doesn't know about all survive verbatim. Trees
+// without a record, without a recorded snapshot (carried events), or already
+// consistent pass through unchanged.
+func (r *Recorder) syncRecordedWorktree(ctx context.Context, tree string) (string, error) {
+	evb, err := gitutil.CatFile(ctx, r.RepoRoot, tree+":meta/event.json")
+	if err != nil {
+		return tree, nil // no event record (foreign/synthetic commit): nothing to fix
+	}
+	var rec Record
+	if json.Unmarshal(evb, &rec) != nil || rec.WorktreeTree == "" {
+		return tree, nil
+	}
+	actual, _ := gitutil.ResolveRef(ctx, r.RepoRoot, tree+":worktree")
+	if actual == "" || actual == rec.WorktreeTree {
+		return tree, nil
+	}
+	patched := bytes.ReplaceAll(evb, []byte(rec.WorktreeTree), []byte(actual))
+	return r.rebuildTree(ctx, tree, map[string][]byte{"meta/event.json": patched})
+}
+
+// staleOwnMirrors lists this clone's own-journal mirror refs (any remote) whose
+// tip retains the earliest rewritten commit — i.e. the refs that would keep the
+// pre-redaction chain alive locally after the rewrite.
+func (r *Recorder) staleOwnMirrors(ctx context.Context, cloneID, earliestAffected string) []string {
+	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil,
+		"for-each-ref", "--format=%(refname) %(objectname)", MirrorRefPrefix)
+	if err != nil {
+		return nil
+	}
+	var stale []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		ref, tip := fields[0], fields[1]
+		if id, ok := cloneIDFromRef(ref); !ok || id != cloneID {
+			continue
+		}
+		if gitutil.IsAncestor(ctx, r.RepoRoot, earliestAffected, tip) {
+			stale = append(stale, ref)
+		}
+	}
+	return stale
+}
+
+// KeepRefs lists twip's object-preservation refs: pinned pre-rewrite commits
+// and archived stash entries. These are NOT part of the journal chain, so a
+// journal rewrite can never redact them — a secret there is cleared by
+// deleting the keep-ref instead (DeleteRefs).
+func (r *Recorder) KeepRefs(ctx context.Context) ([]string, error) {
+	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil,
+		"for-each-ref", "--format=%(refname)", PinRefPrefix, StashRefPrefix)
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(string(out)), nil
+}
+
+// KeepRefsRetaining returns the keep-refs whose tip retains any of the flagged
+// commits (the tip itself or a descendant of one). Deleting them is what makes
+// a flagged pinned/stashed object unreachable — the deliberate trade of that
+// object's preservation for its destruction.
+func (r *Recorder) KeepRefsRetaining(ctx context.Context, commits []string) ([]string, error) {
+	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil,
+		"for-each-ref", "--format=%(refname) %(objectname)", PinRefPrefix, StashRefPrefix)
+	if err != nil {
+		return nil, err
+	}
+	var refs []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		ref, tip := fields[0], fields[1]
+		for _, c := range commits {
+			if c == tip || gitutil.IsAncestor(ctx, r.RepoRoot, c, tip) {
+				refs = append(refs, ref)
+				break
+			}
+		}
+	}
+	sort.Strings(refs)
+	return refs, nil
+}
+
+// DeleteRefs deletes the given refs (best-effort, idempotent) and returns the
+// ones actually deleted.
+func (r *Recorder) DeleteRefs(ctx context.Context, refs []string) []string {
+	var deleted []string
+	for _, ref := range refs {
+		if _, err := gitutil.Run(ctx, r.RepoRoot, nil, nil, "update-ref", "-d", ref); err == nil {
+			deleted = append(deleted, ref)
+		}
+	}
+	return deleted
+}
+
+// PropagateResult reports what PropagateRedaction changed on the remote.
+type PropagateResult struct {
+	Remote        string
+	JournalPushed bool     // redacted chain replaced the remote's copy (lease-guarded force)
+	RemoteTip     string   // remote journal tip observed before pushing
+	DeletedRefs   []string // keep-refs deleted on the remote
+	FailedRefs    []string // keep-ref deletions the remote refused (e.g. receive.denyDeletes)
+	Skipped       string   // why the journal push was unnecessary/refused ("" when pushed)
+	Settled       bool     // the journal side needs nothing further (pushed, or a benign skip)
+}
+
+// PropagateRedaction pushes a local redaction's effects to the sync remote: the
+// redacted journal replaces the remote's (pre-redaction) copy under a
+// lease-guarded force, and dropped keep-refs are deleted remotely. Without
+// this, the remote retains the secrets (every full scan re-flags them) and the
+// journal's fast-forward-only mirror push is stranded forever.
+//
+// Forcing the journal ref is safe by twip's core invariant — each clone is the
+// SOLE writer of its own journal — and the lease pins the exact remote tip we
+// observed, so even a same-clone race loses cleanly. The force is refused
+// unless the observed remote tip is verifiably the pre-redaction state: part of
+// oldTip's ancestry (immediate propagation, while those objects still exist),
+// or exactly expectedRemoteTip (deferred propagation — the tip recorded when
+// the redaction ran, after the old chain may have been gc'd). A remote holding
+// anything else (a copied clone-id writing the same ref) is surfaced, never
+// clobbered. The pushes are --no-verify and marked with envSyncPush so the
+// pre-push hook can neither recurse nor re-fire.
+func (r *Recorder) PropagateRedaction(ctx context.Context, remote, cloneID, oldTip, expectedRemoteTip string, dropRefs []string) (PropagateResult, error) {
+	res := PropagateResult{Remote: remote}
+	if remote == "" {
+		res.Skipped = "no sync remote configured"
+		return res, nil
+	}
+	ref := journalRef(cloneID)
+	localTip, err := gitutil.ResolveRef(ctx, r.RepoRoot, ref)
+	if err != nil {
+		return res, err
+	}
+	out, err := gitutil.Out(ctx, r.RepoRoot, "ls-remote", remote, ref)
+	if err != nil {
+		return res, fmt.Errorf("ls-remote %s: %w", remote, err)
+	}
+	if f := strings.Fields(out); len(f) > 0 {
+		res.RemoteTip = f[0]
+	}
+
+	env := []string{envSyncPush + "=1"}
+	anchored := (oldTip != "" && gitutil.IsAncestor(ctx, r.RepoRoot, res.RemoteTip, oldTip)) ||
+		(expectedRemoteTip != "" && res.RemoteTip == expectedRemoteTip)
+	switch {
+	case localTip == "" || res.RemoteTip == "":
+		res.Skipped, res.Settled = "journal not on the remote yet", true
+	case res.RemoteTip == localTip:
+		res.Skipped, res.Settled = "remote already matches", true
+	case gitutil.IsAncestor(ctx, r.RepoRoot, res.RemoteTip, localTip):
+		res.Skipped, res.Settled = "remote holds a clean prefix; the next push fast-forwards it", true
+	case !anchored:
+		res.Skipped = "remote tip is not the recorded pre-redaction state; refusing to force"
+	default:
+		if _, err := gitutil.Run(ctx, r.RepoRoot, env, nil, "push", "--no-verify", "--quiet",
+			"--force-with-lease="+ref+":"+res.RemoteTip, remote, localTip+":"+ref); err != nil {
+			return res, fmt.Errorf("force-push redacted journal: %w", err)
+		}
+		res.JournalPushed, res.Settled = true, true
+		// Track the just-pushed state so the next AlreadyPushed check is accurate.
+		mirror := MirrorRefPrefix + remote + "/journal/" + cloneID
+		_, _ = gitutil.Run(ctx, r.RepoRoot, nil, nil, "update-ref", mirror, localTip)
+	}
+
+	if len(dropRefs) > 0 {
+		// Delete only what the remote actually has — deleting an absent ref errors.
+		lsArgs := append([]string{"ls-remote", remote}, dropRefs...)
+		out, err := gitutil.Out(ctx, r.RepoRoot, lsArgs...)
+		if err != nil {
+			return res, fmt.Errorf("ls-remote %s: %w", remote, err)
+		}
+		present := map[string]bool{}
+		for _, line := range strings.Split(out, "\n") {
+			if f := strings.Fields(line); len(f) == 2 {
+				present[f[1]] = true
+			}
+		}
+		var toDelete []string
+		pushArgs := []string{"push", "--no-verify", "--quiet", remote}
+		for _, dr := range dropRefs {
+			if present[dr] {
+				toDelete = append(toDelete, dr)
+				pushArgs = append(pushArgs, ":"+dr)
+			}
+		}
+		if len(toDelete) > 0 {
+			if _, err := gitutil.Run(ctx, r.RepoRoot, env, nil, pushArgs...); err != nil {
+				res.FailedRefs = toDelete // e.g. receive.denyDeletes; surfaced, not fatal
+			} else {
+				res.DeletedRefs = toDelete
+			}
+		}
+	}
 	return res, nil
 }
 
@@ -142,9 +366,10 @@ func redactBytes(content []byte, secrets []string) ([]byte, bool) {
 	return out, changed
 }
 
-// rebuildTree loads commit's tree into a throwaway index, overwrites the changed
-// blobs at their (mode-preserving) paths, and writes a new tree. Using an index lets
-// git rebuild arbitrarily nested paths (e.g. worktree/src/config.ts) for us.
+// rebuildTree loads a tree-ish's tree (a commit or a bare tree sha) into a
+// throwaway index, overwrites the changed blobs at their (mode-preserving)
+// paths, and writes a new tree. Using an index lets git rebuild arbitrarily
+// nested paths (e.g. worktree/src/config.ts) for us.
 func (r *Recorder) rebuildTree(ctx context.Context, commit string, changes map[string][]byte) (string, error) {
 	idxf, err := os.CreateTemp("", "twip-redact-idx-*")
 	if err != nil {
@@ -253,6 +478,103 @@ func (r *Recorder) commitTreePreserving(ctx context.Context, tree, parent string
 	return strings.TrimSpace(string(out)), nil
 }
 
+// PendingPropagation records a redaction whose remote side is still owed: the
+// remote retains the pre-redaction journal (and possibly keep-refs deleted only
+// locally). It is a plain file of shas — NOT refs — so recording it keeps no
+// secret objects reachable; gc still reclaims the pre-redaction chain locally.
+// RemoteTip is the durable safety anchor for a deferred propagation: the remote
+// tip observed when the redaction ran, which a later lease-guarded force-push
+// verifies is still what it is replacing.
+type PendingPropagation struct {
+	CloneID   string   `json:"clone_id"`
+	OldTip    string   `json:"old_tip,omitempty"`    // pre-redaction local tip (anchor while its objects survive)
+	RemoteTip string   `json:"remote_tip,omitempty"` // remote tip observed at redaction time (durable anchor)
+	DropRefs  []string `json:"drop_refs,omitempty"`  // keep-refs deleted locally, still owed remote deletion
+	TS        string   `json:"ts,omitempty"`
+}
+
+// pendingPropagationPath lives under the git common dir beside the clone-id, so
+// linked worktrees of the clone share one pending state.
+func (r *Recorder) pendingPropagationPath(ctx context.Context) (string, error) {
+	commonDir, err := gitutil.CommonDir(ctx, r.RepoRoot)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(commonDir, "twip", "pending-propagation.json"), nil
+}
+
+// SavePendingPropagation records (or replaces) the clone's owed propagation.
+func (r *Recorder) SavePendingPropagation(ctx context.Context, p *PendingPropagation) error {
+	path, err := r.pendingPropagationPath(ctx)
+	if err != nil {
+		return err
+	}
+	if p.TS == "" {
+		p.TS = time.Now().UTC().Format(time.RFC3339)
+	}
+	b, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
+}
+
+// LoadPendingPropagation returns the owed propagation, or nil when there is
+// none (or the marker is unreadable — best-effort by design).
+func (r *Recorder) LoadPendingPropagation(ctx context.Context) *PendingPropagation {
+	path, err := r.pendingPropagationPath(ctx)
+	if err != nil {
+		return nil
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // our own marker under the git dir
+	if err != nil {
+		return nil
+	}
+	var p PendingPropagation
+	if json.Unmarshal(b, &p) != nil {
+		return nil
+	}
+	return &p
+}
+
+// ClearPendingPropagation removes the marker (best-effort, idempotent).
+func (r *Recorder) ClearPendingPropagation(ctx context.Context) {
+	if path, err := r.pendingPropagationPath(ctx); err == nil {
+		_ = os.Remove(path)
+	}
+}
+
+// JournalDiverged reports whether the remote's copy of this clone's journal can
+// no longer be fast-forwarded from the local one — the stranded state a local
+// rewrite of pushed history (twip redact without propagation) leaves behind:
+// every mirror push fails and the best-effort hook swallows it, so the journal
+// quietly stops backing up. localTip/remoteTip are returned for reporting.
+func (r *Recorder) JournalDiverged(ctx context.Context, remote string) (diverged bool, localTip, remoteTip string, err error) {
+	cloneID, err := r.CloneID(ctx)
+	if err != nil {
+		return false, "", "", err
+	}
+	ref := journalRef(cloneID)
+	localTip, _ = gitutil.ResolveRef(ctx, r.RepoRoot, ref)
+	if localTip == "" {
+		return false, "", "", nil // no journal yet: nothing to strand
+	}
+	out, err := gitutil.Out(ctx, r.RepoRoot, "ls-remote", remote, ref)
+	if err != nil {
+		return false, localTip, "", err
+	}
+	if f := strings.Fields(out); len(f) > 0 {
+		remoteTip = f[0]
+	}
+	if remoteTip == "" || remoteTip == localTip {
+		return false, localTip, remoteTip, nil
+	}
+	return !gitutil.IsAncestor(ctx, r.RepoRoot, remoteTip, localTip), localTip, remoteTip, nil
+}
+
 // earliestAffectedPushed reports whether the earliest rewritten commit is already
 // reachable from origin's mirror of this journal — in which case the remote retains
 // the un-redacted copy and local redaction alone can't undo it. Best-effort.
@@ -265,6 +587,5 @@ func (r *Recorder) earliestAffectedPushed(ctx context.Context, cloneID, earliest
 	if tip == "" {
 		return false
 	}
-	_, err := gitutil.Run(ctx, r.RepoRoot, nil, nil, "merge-base", "--is-ancestor", earliest, tip)
-	return err == nil // exit 0 => earliest is an ancestor of the mirror tip
+	return gitutil.IsAncestor(ctx, r.RepoRoot, earliest, tip)
 }

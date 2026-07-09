@@ -294,6 +294,59 @@ func TestAudit_ForgedCarriedWorktreeFails(t *testing.T) {
 	}
 }
 
+// TestAudit_CleanAfterRedaction guards the redact/audit contract: redacting a
+// secret out of a worktree snapshot rewrites that snapshot's blobs (and so its
+// tree sha), and the rewritten event.json must record the NEW tree — otherwise
+// every redaction of snapshot content leaves a permanent "worktree/ subtree
+// does not match recorded tree" audit failure. A carried (snapshot-less) gitop
+// event after the snapshot must also stay consistent with its rewritten parent.
+func TestAudit_CleanAfterRedaction(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := store.New(repo)
+	sid := "redact-sess"
+	const secret = "ghp_9Z8y7X6w5V4u3T2s1R0q9P8o7N6m5L4k3J2"
+
+	if err := os.WriteFile(filepath.Join(repo, "leak.env"), []byte("TOKEN="+secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := snapshot.Capture(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior, _ := rec.PriorSessionState(ctx, sid)
+	if _, err := rec.Append(ctx,
+		&agent.Event{SessionID: sid, Kind: agent.KindSessionStart, Cursor: agent.Cursor{Main: 0}},
+		snap, "main", prior.Seq, time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	// A clean gitop carries the (secret-bearing) snapshot forward.
+	if _, err := rec.AppendGitOp(ctx, store.GitOpMeta{Op: "push", Argv: []string{"push"}},
+		snapshot.Snapshot{}, "main", time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := rec.RedactJournal(ctx, cloneID, []string{secret}, []string{"worktree/leak.env"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RedactedCommits == 0 {
+		t.Fatal("redaction found nothing to rewrite")
+	}
+
+	rep, err := Run(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK() {
+		t.Errorf("audit should pass after redaction; findings: %+v", rep.Findings)
+	}
+}
+
 func hasError(rep *Report, substr string) bool {
 	for _, f := range rep.Findings {
 		if f.Severity == SeverityError && containsFold(f.Message, substr) {
