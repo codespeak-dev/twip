@@ -35,6 +35,48 @@ func gitBin() string {
 	return "git"
 }
 
+// repoRedirectEnv lists the caller environment variables that relocate parts of
+// a git repository: where objects are written, which index is staged, where the
+// ref store lives. twip's own plumbing must never inherit them. They arrive from
+// whatever process invoked the shim or hook — an IDE checkpointer driving a
+// shadow object store, a receive-pack quarantine exported to hooks — and because
+// they redirect OBJECT writes but not REF writes, an inherited redirect splits
+// an append in two: the journal commit lands in a store that later vanishes
+// while update-ref advances the real ref, leaving refs/twip/journal/* dangling
+// and failing every later fetch's connectivity check. (In-process validation
+// can't catch it: to the writing process the object IS visible, through the
+// same redirect.) twip resolves its repo once from the cwd and runs every
+// internal command with cmd.Dir at that root; plain discovery from there is the
+// only location input it trusts. Callers that need a redirect twip controls —
+// the snapshot/redact private index — pass it explicitly via Run's env argument,
+// which is applied after the scrub.
+var repoRedirectEnv = map[string]bool{
+	"GIT_DIR":                          true,
+	"GIT_WORK_TREE":                    true,
+	"GIT_COMMON_DIR":                   true,
+	"GIT_OBJECT_DIRECTORY":             true,
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
+	"GIT_QUARANTINE_PATH":              true,
+	"GIT_INDEX_FILE":                   true,
+	"GIT_NAMESPACE":                    true,
+}
+
+// scrubEnv returns env without the repoRedirectEnv variables. It builds the
+// per-child environment and must stay that way — scrubbing the twip process's
+// own env (os.Unsetenv) would strip the redirect out from under the USER's git
+// too (the shim's runReal/execReal inherit the process env), silently changing
+// what their command does.
+func scrubEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if i := strings.IndexByte(kv, '='); i >= 0 && repoRedirectEnv[kv[:i]] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 // IsWritesBlocked reports whether err is the environment denying a git object or
 // ref write — EPERM ("Operation not permitted") or EACCES ("Permission denied")
 // raised by a child git. This is the signature of a per-command sandbox that
@@ -60,11 +102,14 @@ func IsWritesBlocked(err error) bool {
 // intercept and re-record them — and worse, deadlock: a shimmed commit-tree
 // invoked while we hold the journal lock would block trying to take that same
 // lock. So we force the shim's pass-through guard on for every internal call;
-// only the user's/agent's own git commands should ever be recorded.
+// only the user's/agent's own git commands should ever be recorded. The caller's
+// repo-location env is scrubbed for the same reason it's guarded against the
+// shim: internal calls must act on the repo twip resolved, not on whatever
+// store the invoking process had redirected git to (see repoRedirectEnv).
 func Run(ctx context.Context, dir string, env []string, stdin []byte, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, gitBin(), gcOff(args)...)
 	cmd.Dir = dir
-	cmd.Env = append(cmd.Environ(), "TWIP_SHIM_ACTIVE=1")
+	cmd.Env = append(scrubEnv(cmd.Environ()), "TWIP_SHIM_ACTIVE=1")
 	if len(env) > 0 {
 		cmd.Env = append(cmd.Env, env...)
 	}
@@ -236,7 +281,7 @@ type BatchReader struct {
 func NewBatchReader(ctx context.Context, repoRoot string) (*BatchReader, error) {
 	cmd := exec.CommandContext(ctx, gitBin(), gcOff([]string{"cat-file", "--batch"})...)
 	cmd.Dir = repoRoot
-	cmd.Env = append(cmd.Environ(), "TWIP_SHIM_ACTIVE=1")
+	cmd.Env = append(scrubEnv(cmd.Environ()), "TWIP_SHIM_ACTIVE=1")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("cat-file --batch stdin: %w", err)
