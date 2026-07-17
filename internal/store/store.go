@@ -26,6 +26,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/codespeak-dev/twip/internal/agent"
@@ -203,8 +205,15 @@ func (r *Recorder) PriorSessionState(ctx context.Context, sessionID string) (Ses
 		return SessionState{}, err
 	}
 	commits, err := r.commitShas(ctx, journalRef(cloneID), false, backScanLimit) // tip-first, bounded
-	if err != nil || len(commits) == 0 {
-		return SessionState{}, err
+	if err != nil {
+		// An unreadable journal (dangling head) must not fail the agent hook that
+		// blocks session start: degrade to "new session" (a re-baseline the audit
+		// surfaces) and note it. The next append re-anchors the journal.
+		fmt.Fprintln(os.Stderr, "twip:", err)
+		return SessionState{}, nil
+	}
+	if len(commits) == 0 {
+		return SessionState{}, nil
 	}
 	br, err := gitutil.NewBatchReader(ctx, r.RepoRoot)
 	if err != nil {
@@ -312,6 +321,12 @@ func (r *Recorder) AppendGitOp(ctx context.Context, op GitOpMeta, snap snapshot.
 	return rec, nil
 }
 
+// RecoveredFromTrailer is the commit-message trailer commitAndAdvance stamps on
+// an event appended over a dangling journal head (§recovery below), recording
+// the unresolvable sha the journal was re-anchored away from. It makes the
+// timeline break explicit and auditable instead of silent.
+const RecoveredFromTrailer = "twip-recovered-from:"
+
 // commitAndAdvance appends one event to this clone's journal: it assembles the
 // top tree (meta/ + worktree/), commits it onto the tip, and advances the ref,
 // serializing writers with a short flock around a CAS loop. A lost CAS race
@@ -327,6 +342,19 @@ func (r *Recorder) AppendGitOp(ctx context.Context, op GitOpMeta, snap snapshot.
 // subtree's presence, records whether this event captured a snapshot. Because
 // the carried subtree comes from the tip, the top tree is assembled inside the
 // CAS loop, where the tip is current.
+//
+// Recovery: a journal head whose commit object no longer exists (an external
+// pruner/sandbox lost twip's objects underneath the ref) would otherwise make
+// every future append fail at commit-tree — journaling dies, and the dangling
+// ref breaks the USER's repo too (`git fetch`/`gc` fail their connectivity
+// check with "bad object refs/twip/journal/…"). update-ref refuses nonexistent
+// objects, so twip can never CREATE that state — but it must survive it: when
+// the tip does not resolve to a commit, re-anchor the journal instead of
+// chaining onto the ghost — onto a mirror of this clone's journal when one is
+// resolvable locally (history continuity with the remote copy), else as a new
+// root commit — and stamp the commit message with RecoveredFromTrailer so the
+// break is auditable. The CAS still asserts against the dangling value (a
+// value-level compare), so a concurrent recovery can't double-apply.
 func (r *Recorder) commitAndAdvance(ctx context.Context, cloneID, metaTree, snapTree, msg string) (string, error) {
 	ref := journalRef(cloneID)
 	release, err := lockKey(ctx, r.RepoRoot, "journal-"+cloneID)
@@ -335,16 +363,28 @@ func (r *Recorder) commitAndAdvance(ctx context.Context, cloneID, metaTree, snap
 	}
 	defer release()
 
+	warnedDangling := false
 	for attempt := 0; attempt < casRetries; attempt++ {
 		tip, err := gitutil.ResolveRef(ctx, r.RepoRoot, ref)
 		if err != nil {
 			return "", err
 		}
+		parent, commitMsg := tip, msg
+		if tip != "" && !gitutil.ObjectExists(ctx, r.RepoRoot, tip+"^{commit}") {
+			parent = r.recoveryParent(ctx, cloneID)
+			commitMsg = msg + "\n\n" + RecoveredFromTrailer + " " + tip
+			if !warnedDangling {
+				warnedDangling = true
+				fmt.Fprintf(os.Stderr,
+					"twip: journal head %s does not resolve to a commit (objects lost underneath the ref); re-anchoring the journal — earlier events up to that head are gone\n",
+					tip)
+			}
+		}
 		worktree := snapTree
-		if worktree == "" && tip != "" {
-			// Resolves to "" when the tip has no worktree/ itself (a journal whose
+		if worktree == "" && parent != "" {
+			// Resolves to "" when the parent has no worktree/ itself (a journal whose
 			// events so far never captured a snapshot): then this commit has none.
-			worktree, _ = gitutil.ResolveRef(ctx, r.RepoRoot, tip+":worktree")
+			worktree, _ = gitutil.ResolveRef(ctx, r.RepoRoot, parent+":worktree")
 		}
 		entries := []gitutil.TreeEntry{{Mode: "040000", Type: "tree", SHA: metaTree, Name: "meta"}}
 		if worktree != "" {
@@ -354,7 +394,7 @@ func (r *Recorder) commitAndAdvance(ctx context.Context, cloneID, metaTree, snap
 		if err != nil {
 			return "", err
 		}
-		commit, err := gitutil.CommitTree(ctx, r.RepoRoot, topTree, tip, msg)
+		commit, err := gitutil.CommitTree(ctx, r.RepoRoot, topTree, parent, commitMsg)
 		if err != nil {
 			return "", err
 		}
@@ -367,6 +407,34 @@ func (r *Recorder) commitAndAdvance(ctx context.Context, cloneID, metaTree, snap
 		time.Sleep(time.Duration(attempt+1) * 3 * time.Millisecond)
 	}
 	return "", fmt.Errorf("journal append: too many CAS retries on %s", ref)
+}
+
+// recoveryParent picks the parent for an append that found the journal head
+// dangling: the newest mirror of this clone's own journal
+// (refs/twip/remotes/<remote>/journal/<clone-id>) whose commit object is
+// present locally — re-anchoring there keeps history contiguous with the
+// remote's copy. When no usable mirror exists the append starts a new root
+// ("" parent).
+func (r *Recorder) recoveryParent(ctx context.Context, cloneID string) string {
+	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil,
+		"for-each-ref", "--format=%(refname)", MirrorRefPrefix)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		ref := strings.TrimSpace(line)
+		if ref == "" || !strings.HasSuffix(ref, "/journal/"+cloneID) {
+			continue
+		}
+		tip, err := gitutil.ResolveRef(ctx, r.RepoRoot, ref)
+		if err != nil || tip == "" {
+			continue
+		}
+		if gitutil.ObjectExists(ctx, r.RepoRoot, tip+"^{commit}") {
+			return tip
+		}
+	}
+	return ""
 }
 
 // buildMetaTree creates the meta/ subtree (event.json + transcript + sidechains)
