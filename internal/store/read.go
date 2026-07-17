@@ -159,7 +159,10 @@ func (r *Recorder) SidechainTranscript(ctx context.Context, commit, agentID stri
 // order (oldest first); reverse=false yields tip first. maxCount>0 caps the walk to
 // that many commits from the tip (rev-list -n), bounding a tip-first back-scan;
 // maxCount<=0 lists them all. A missing ref yields no shas (and no error) — the
-// journal simply has no events yet.
+// journal simply has no events yet. A ref that EXISTS but cannot be walked (its
+// head object was lost underneath it) is corruption and returns an error: it must
+// never read as an empty journal, or `twip log`/`twip audit` would report a
+// destroyed timeline as healthy.
 func (r *Recorder) commitShas(ctx context.Context, ref string, reverse bool, maxCount int) ([]string, error) {
 	args := []string{"rev-list"}
 	if maxCount > 0 {
@@ -171,6 +174,11 @@ func (r *Recorder) commitShas(ctx context.Context, ref string, reverse bool, max
 	args = append(args, ref)
 	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil, args...)
 	if err != nil {
+		if tip, _ := gitutil.ResolveRef(ctx, r.RepoRoot, ref); tip != "" {
+			return nil, fmt.Errorf(
+				"journal %s is unreadable: head %s does not resolve to a commit (objects lost) — the next recorded git op re-anchors it; see `twip doctor`",
+				ref, shortSHA(tip))
+		}
 		return nil, nil //nolint:nilerr // missing ref => no events yet
 	}
 	return strings.Fields(string(out)), nil
@@ -201,6 +209,22 @@ func (r *Recorder) eventsForRef(ctx context.Context, ref string, reverse bool) (
 		events = append(events, EventCommit{Commit: commit, Clone: clone, Record: rec})
 	}
 	return events, nil
+}
+
+// JournalHead reports this clone's own journal head: the sha the ref holds and
+// whether that sha resolves to a commit object. tip is "" when the journal has
+// no ref yet. healthy is false exactly in the dangling-head state (objects lost
+// underneath the ref) that breaks `git fetch`/`gc` and journal reads.
+func (r *Recorder) JournalHead(ctx context.Context) (tip string, healthy bool, err error) {
+	cloneID, err := r.CloneID(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	tip, err = gitutil.ResolveRef(ctx, r.RepoRoot, journalRef(cloneID))
+	if err != nil || tip == "" {
+		return "", err == nil, err
+	}
+	return tip, gitutil.ObjectExists(ctx, r.RepoRoot, tip+"^{commit}"), nil
 }
 
 // CloneAuthor returns the commit author of a clone's journal tip — a

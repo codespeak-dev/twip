@@ -168,6 +168,17 @@ func checkJournalSync(ctx context.Context, out io.Writer, offline bool) bool {
 	} else {
 		fmt.Fprintln(out, "  ⚠ no secrets scanner (betterleaks or gitleaks) on PATH — twip data mirrors unscanned; only a remote-side scan can catch journal secrets")
 	}
+	// A dangling journal head (the ref's commit object was lost underneath it —
+	// external prune/sandbox) breaks more than twip: the user's own `git fetch`,
+	// `pull`, and `gc` fail their connectivity check with "bad object
+	// refs/twip/journal/…". Diagnose it by name before the divergence probe,
+	// which would otherwise report it as mere divergence.
+	if tip, healthy, err := rec.JournalHead(ctx); err == nil && tip != "" && !healthy {
+		fmt.Fprintf(out, "  ✗ journal head %s does not resolve to a commit — its objects were lost underneath the ref (external prune or sandboxed write); `git fetch`/`gc` in this clone fail with \"bad object\" until it is repaired\n", short(tip))
+		fmt.Fprintln(out, "      fix: any recorded git op re-anchors the journal automatically (events up to the lost head are gone);")
+		fmt.Fprintln(out, "      to keep continuity with the remote copy, run `twip sync fetch` first so re-anchoring can attach to the mirror")
+		return false
+	}
 	if p := rec.LoadPendingPropagation(ctx); p != nil {
 		fmt.Fprintf(out, "  ✗ a redaction from %s is not propagated — the remote still holds the pre-redaction journal, and mirror pushes are failing silently\n", p.TS)
 		fmt.Fprintln(out, "      fix: run `twip redact --propagate` (lease-guarded force-push of the redacted journal)")
