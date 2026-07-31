@@ -36,35 +36,10 @@ func newHookCmd() *cobra.Command {
 	}
 }
 
-// ensureRealGit resolves the real git binary (skipping the twip shim on PATH) and
-// exports TWIP_REAL_GIT so twip's own plumbing (gitutil) execs it directly. A hook
-// is launched by the agent, not via the shim, so TWIP_REAL_GIT is otherwise unset
-// and every internal call — hash-object, mktree, commit-tree, update-ref,
-// cat-file — runs through the shim wrapper (sh -> twip git-shim -> real git),
-// paying two extra process spawns each; a recorded hook makes ~10+ such calls, so
-// it adds up on the session-start/stop path. Best-effort: if resolution fails the
-// env stays unset and gitutil falls back to PATH "git" (the shim), which still
-// works via its pass-through guard — only slower. A no-op when already set.
-func ensureRealGit() {
-	if os.Getenv(envRealGit) != "" {
-		return
-	}
-	dir, err := defaultShimDir()
-	if err != nil {
-		return
-	}
-	if realGit, err := resolveRealGit(dir); err == nil && realGit != "" {
-		_ = os.Setenv(envRealGit, realGit)
-	}
-}
-
 // runHook resolves the repo from the cwd and reads the payload, then hands off to
-// recordHook. Returns nil (no-op) when not inside a git repo.
+// recordHook. Returns nil (no-op) when not inside a git repo. The root command's
+// PersistentPreRun has already pointed twip's git plumbing at the real git.
 func runHook(ctx context.Context, agentName, event string, stdin io.Reader) error {
-	// Point twip's own git plumbing at the real git so it skips the shim hop on
-	// every internal call below (and inside recordHook's snapshot/append).
-	ensureRealGit()
-
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err

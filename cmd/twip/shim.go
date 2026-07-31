@@ -168,6 +168,34 @@ exec %q "$@"
 	return shimPath, nil
 }
 
+// ensureRealGit resolves the real git binary (skipping the twip shim on PATH) and
+// exports TWIP_REAL_GIT so twip's own plumbing (gitutil) execs it directly. Every
+// internal call — hash-object, mktree, commit-tree, update-ref, cat-file — would
+// otherwise run through the shim wrapper (sh -> twip git-shim -> real git),
+// paying two extra process spawns each. That is ~3.5x per call here, and twip's
+// own plumbing can never take the wrapper's read-only fast path: gcOff prepends
+// `-c gc.auto=0`, so $1 is a flag and matches nothing there. It compounds with
+// call volume — a recorded hook makes ~10+ calls, `redact` makes ~10 per
+// rewritten journal commit — so the root command resolves it once up front.
+//
+// Only processes twip did not launch itself need this: the shim and the hooks it
+// installs export TWIP_REAL_GIT before exec'ing twip, so it is a no-op there. A
+// shell-invoked `twip` has nothing to inherit. Best-effort: if resolution fails
+// the env stays unset and gitutil falls back to PATH "git" (the shim), which
+// still works via its pass-through guard — only slower.
+func ensureRealGit() {
+	if os.Getenv(envRealGit) != "" {
+		return
+	}
+	dir, err := defaultShimDir()
+	if err != nil {
+		return
+	}
+	if realGit, err := resolveRealGit(dir); err == nil && realGit != "" {
+		_ = os.Setenv(envRealGit, realGit)
+	}
+}
+
 // resolveRealGit finds the first real git on PATH, skipping the twip shim dir so
 // the shim never points at itself. In the global install the shim is always on
 // PATH, so skipping (rather than erroring) keeps `twip install`/`shim install`

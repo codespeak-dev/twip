@@ -94,6 +94,9 @@ func newGitShimCmd() *cobra.Command {
 		Short:              "Intercept a git invocation, capturing destructive ops before they run",
 		Hidden:             true,
 		DisableFlagParsing: true, // the trailing git args have their own flags
+		// --real-git already tells us the real git (and gitShim exports it), so skip
+		// the root's PATH walk on the path every user git command takes.
+		Annotations: map[string]string{annotSkipRealGit: "1"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			realGit, gitArgs := parseShimArgs(args)
 			return gitShim(cmd.Context(), realGit, gitArgs)

@@ -155,3 +155,67 @@ func TestEnsureRealGit_NoOpWhenAlreadySet(t *testing.T) {
 		t.Errorf("TWIP_REAL_GIT = %q, want it left as the preset /preset/git", got)
 	}
 }
+
+// fakeGitOnPath installs a shim git at the default shim dir ($HOME/.twip/bin) and
+// a real git in a later PATH entry, returning the path ensureRealGit should
+// resolve to. TWIP_REAL_GIT is cleared via t.Setenv, which also restores the
+// original on cleanup — so a test driving ensureRealGit's os.Setenv can't leak a
+// fake git path into later tests.
+func fakeGitOnPath(t *testing.T) (wantRealGit string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shimDir := filepath.Join(home, ".twip", "bin")
+	realDir := filepath.Join(t.TempDir(), "bin")
+	for _, d := range []string{shimDir, realDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeExec(t, filepath.Join(shimDir, "git")) // the shim — must be skipped
+	realGit := filepath.Join(realDir, "git")
+	writeExec(t, realGit)
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+realDir)
+	t.Setenv(envRealGit, "") // unset: simulate a shell-invoked twip
+
+	want, err := filepath.EvalSymlinks(realGit) // resolveRealGit resolves symlinks
+	if err != nil {
+		t.Fatal(err)
+	}
+	return want
+}
+
+// TestRootExportsRealGit: a shell-invoked `twip` inherits no TWIP_REAL_GIT, so the
+// root command must resolve it before the subcommand runs — otherwise every
+// internal git call hops through the shim wrapper (~3.5x per call, and commands
+// like redact make ~10 per rewritten journal commit).
+func TestRootExportsRealGit(t *testing.T) {
+	want := fakeGitOnPath(t)
+
+	// `version` touches no repo, so this exercises the root hook and nothing else.
+	if out, err := runTwip(t, "version"); err != nil {
+		t.Fatalf("twip version: %v\n%s", err, out)
+	}
+	if got := os.Getenv(envRealGit); got != want {
+		t.Errorf("TWIP_REAL_GIT = %q, want the real git %q resolved by the root command", got, want)
+	}
+}
+
+// TestRootSkipsRealGitForShim: git-shim is the path EVERY user git command takes
+// and already knows the real git from --real-git, so the root must not make it pay
+// a PATH walk. Drives PersistentPreRun directly rather than executing the command,
+// which would exec git and replace the test process.
+func TestRootSkipsRealGitForShim(t *testing.T) {
+	fakeGitOnPath(t)
+
+	root := newRootCmd()
+	shimCmd, _, err := root.Find([]string{"git-shim"})
+	if err != nil {
+		t.Fatalf("find git-shim: %v", err)
+	}
+	root.PersistentPreRun(shimCmd, nil)
+
+	if got := os.Getenv(envRealGit); got != "" {
+		t.Errorf("TWIP_REAL_GIT = %q, want it left unset for git-shim (it supplies its own)", got)
+	}
+}
