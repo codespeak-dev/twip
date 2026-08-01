@@ -262,58 +262,89 @@ func ObjectExists(ctx context.Context, repoRoot, spec string) bool {
 	return err == nil
 }
 
-// BatchReader reads object contents through a single long-lived
-// `git cat-file --batch` process, so reading N objects costs one process spawn
-// instead of N. Specs are sent one at a time and the response read back before
-// the next is sent (request/response), so a caller scanning tip-first can stop
-// early — via Close — without paying to read the rest of the journal. It is not
-// safe for concurrent use; drive it from one goroutine and Close when done.
+// batchProc is the shared plumbing behind BatchReader and BatchChecker: one
+// long-lived `git cat-file --batch…` process, so handling N objects costs one
+// process spawn instead of N. Specs are sent one at a time and the response read
+// back before the next is sent (request/response), so a caller scanning tip-first
+// can stop early — via Close — without paying to read the rest of the journal. It
+// is not safe for concurrent use; drive it from one goroutine and Close when done.
 //
 // Like the rest of gitutil it forces TWIP_SHIM_ACTIVE=1 so the installed git
 // shim passes the call straight through instead of trying to record it.
-type BatchReader struct {
+type batchProc struct {
+	mode   string // the cat-file flag, for error messages
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout *bufio.Reader
 }
 
-// NewBatchReader starts the cat-file process. Close it to release the process.
-func NewBatchReader(ctx context.Context, repoRoot string) (*BatchReader, error) {
-	cmd := exec.CommandContext(ctx, gitBin(), gcOff([]string{"cat-file", "--batch"})...)
+// startBatch launches `git cat-file <mode>` wired for request/response.
+func startBatch(ctx context.Context, repoRoot, mode string) (*batchProc, error) {
+	cmd := exec.CommandContext(ctx, gitBin(), gcOff([]string{"cat-file", mode})...)
 	cmd.Dir = repoRoot
 	cmd.Env = append(scrubEnv(cmd.Environ()), "TWIP_SHIM_ACTIVE=1")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, fmt.Errorf("cat-file --batch stdin: %w", err)
+		return nil, fmt.Errorf("cat-file %s stdin: %w", mode, err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("cat-file --batch stdout: %w", err)
+		return nil, fmt.Errorf("cat-file %s stdout: %w", mode, err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start cat-file --batch: %w", err)
+		return nil, fmt.Errorf("start cat-file %s: %w", mode, err)
 	}
-	return &BatchReader{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
+	return &batchProc{mode: mode, cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
+}
+
+// header sends one spec and reads back its response header, which both --batch
+// and --batch-check emit identically as "<oid> <type> <size>". found is false
+// (with nil error) when git reports the object missing ("<spec> missing"), and
+// the process stays usable for the next request.
+func (b *batchProc) header(spec string) (fields []string, found bool, err error) {
+	if _, err := io.WriteString(b.stdin, spec+"\n"); err != nil {
+		return nil, false, fmt.Errorf("cat-file %s write %q: %w", b.mode, spec, err)
+	}
+	line, err := b.stdout.ReadString('\n')
+	if err != nil {
+		return nil, false, fmt.Errorf("cat-file %s header for %q: %w", b.mode, spec, err)
+	}
+	fields = strings.Fields(line)
+	if len(fields) >= 2 && fields[len(fields)-1] == "missing" {
+		return nil, false, nil
+	}
+	if len(fields) != 3 {
+		return nil, false, fmt.Errorf("cat-file %s: unexpected header %q", b.mode, strings.TrimSpace(line))
+	}
+	return fields, true, nil
+}
+
+// Close ends the cat-file process. Closing stdin sends it EOF, which it treats
+// as end-of-input and exits; Wait then reaps it. Safe to call after an early
+// stop (the request/response protocol leaves no unread output pending).
+func (b *batchProc) Close() error {
+	_ = b.stdin.Close()
+	return b.cmd.Wait()
+}
+
+// BatchReader reads object contents through one `git cat-file --batch` process.
+type BatchReader struct{ *batchProc }
+
+// NewBatchReader starts the cat-file process. Close it to release the process.
+func NewBatchReader(ctx context.Context, repoRoot string) (*BatchReader, error) {
+	p, err := startBatch(ctx, repoRoot, "--batch")
+	if err != nil {
+		return nil, err
+	}
+	return &BatchReader{p}, nil
 }
 
 // Read returns the bytes of one object spec (e.g. "<sha>:meta/event.json").
 // found is false (with nil error) when git reports the object missing.
 func (b *BatchReader) Read(spec string) (data []byte, found bool, err error) {
-	if _, err := io.WriteString(b.stdin, spec+"\n"); err != nil {
-		return nil, false, fmt.Errorf("cat-file --batch write %q: %w", spec, err)
-	}
-	// Per-object header is "<oid> <type> <size>"; a missing object yields
-	// "<spec> missing".
-	header, err := b.stdout.ReadString('\n')
-	if err != nil {
-		return nil, false, fmt.Errorf("cat-file --batch header for %q: %w", spec, err)
-	}
-	fields := strings.Fields(header)
-	if len(fields) >= 2 && fields[len(fields)-1] == "missing" {
-		return nil, false, nil
-	}
-	if len(fields) != 3 {
-		return nil, false, fmt.Errorf("cat-file --batch: unexpected header %q", strings.TrimSpace(header))
+	fields, found, err := b.header(spec)
+	if err != nil || !found {
+		return nil, found, err
 	}
 	size, err := strconv.Atoi(fields[2])
 	if err != nil {
@@ -330,12 +361,31 @@ func (b *BatchReader) Read(spec string) (data []byte, found bool, err error) {
 	return data, true, nil
 }
 
-// Close ends the cat-file process. Closing stdin sends it EOF, which it treats
-// as end-of-input and exits; Wait then reaps it. Safe to call after an early
-// stop (the request/response protocol leaves no unread output pending).
-func (b *BatchReader) Close() error {
-	_ = b.stdin.Close()
-	return b.cmd.Wait()
+// BatchChecker resolves object specs to their identity — oid and type — WITHOUT
+// transferring content, through one `git cat-file --batch-check` process. Use it
+// to collapse many rev:path specs onto the distinct objects behind them, so the
+// content of a blob shared by many commits is read once rather than once per
+// commit (see Recorder.redactionPlan).
+type BatchChecker struct{ *batchProc }
+
+// NewBatchChecker starts the cat-file process. Close it to release the process.
+func NewBatchChecker(ctx context.Context, repoRoot string) (*BatchChecker, error) {
+	p, err := startBatch(ctx, repoRoot, "--batch-check")
+	if err != nil {
+		return nil, err
+	}
+	return &BatchChecker{p}, nil
+}
+
+// Check resolves one object spec (e.g. "<commit>:meta/transcript.jsonl") to the
+// oid and type of the object it names. found is false (with nil error) when the
+// spec resolves to nothing — e.g. a path absent from that commit's tree.
+func (b *BatchChecker) Check(spec string) (oid, objType string, found bool, err error) {
+	fields, found, err := b.header(spec)
+	if err != nil || !found {
+		return "", "", found, err
+	}
+	return fields[0], fields[1], true, nil
 }
 
 // StashEntries returns the commit shas of the current stash stack (newest first),

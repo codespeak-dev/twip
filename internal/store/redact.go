@@ -72,18 +72,18 @@ func (r *Recorder) RedactJournal(ctx context.Context, cloneID string, secrets, p
 	if err != nil {
 		return res, err
 	}
+	plan, err := r.redactionPlan(ctx, ordered, paths, secrets, dryRun)
+	if err != nil {
+		return res, err
+	}
 
 	newParent := "" // tracks the rewritten parent; for the unaffected prefix it stays the original sha
 	started := false
 	for _, c := range ordered {
-		changes := map[string][]byte{}
+		changes := map[string]string{} // path -> redacted blob sha
 		for _, p := range paths {
-			content, err := gitutil.CatFile(ctx, r.RepoRoot, c+":"+p)
-			if err != nil {
-				continue // path absent in this commit
-			}
-			if red, changed := redactBytes(content, secrets); changed {
-				changes[p] = red
+			if b := plan.blobs[plan.at[c+":"+p]]; b != nil {
+				changes[p] = b.newSHA
 			}
 		}
 		if !started {
@@ -145,6 +145,98 @@ func (r *Recorder) RedactJournal(ctx context.Context, cloneID string, secrets, p
 	return res, nil
 }
 
+// redactedBlob is one distinct blob's redaction, computed once and reused for
+// every commit whose tree points at that blob.
+type redactedBlob struct {
+	newSHA string // the written redacted blob ("" on a dry run, which writes nothing)
+}
+
+// redactionPlan maps the journal onto the distinct blobs behind it: at["<commit>:<path>"]
+// is the blob sitting at that path in that commit, and blobs[oid] is non-nil only
+// for the blobs that redacting actually changes. A commit is therefore affected
+// iff one of its paths resolves to a blob present in blobs.
+type redactionPlan struct {
+	at    map[string]string        // "<commit>:<path>" -> blob oid
+	blobs map[string]*redactedBlob // blob oid -> its redaction (absent when unaffected)
+}
+
+// redactionPlan builds that map in TWO git processes total, regardless of history
+// length: one `cat-file --batch-check` resolving every (commit, path) pair to a
+// blob oid, then one `cat-file --batch` reading each DISTINCT blob once. The naive
+// shape — `cat-file -p <commit>:<path>` per pair — costs a process spawn per pair,
+// which is what made redaction take minutes on a long journal: the scan is scoped
+// to the commits the remote lacks, but locating the secret bytes must still walk
+// the whole chain (a blob persisting unchanged across commits has to be redacted
+// in all of them, or it reappears as a diff-add and is re-flagged). Deduplicating
+// by oid is what makes that walk cheap — journal commits carry most blobs forward
+// unchanged, so the distinct-blob count is far below pairs.
+//
+// The redacted bytes are hashed here too (skipped on a dry run, which must write
+// nothing), so a blob shared by many commits is hashed once rather than per commit.
+func (r *Recorder) redactionPlan(ctx context.Context, commits, paths, secrets []string, dryRun bool) (redactionPlan, error) {
+	plan := redactionPlan{
+		at:    make(map[string]string, len(commits)*len(paths)),
+		blobs: map[string]*redactedBlob{},
+	}
+
+	bc, err := gitutil.NewBatchChecker(ctx, r.RepoRoot)
+	if err != nil {
+		return plan, err
+	}
+	var distinct []string // insertion-ordered, so the read pass is deterministic
+	seen := map[string]bool{}
+	for _, c := range commits {
+		for _, p := range paths {
+			spec := c + ":" + p
+			oid, objType, found, err := bc.Check(spec)
+			if err != nil {
+				_ = bc.Close()
+				return plan, fmt.Errorf("resolve %s: %w", spec, err)
+			}
+			// Absent from this commit's tree, or not a blob (a flagged path is
+			// always a file; anything else has no bytes to string-replace).
+			if !found || objType != "blob" {
+				continue
+			}
+			plan.at[spec] = oid
+			if !seen[oid] {
+				seen[oid] = true
+				distinct = append(distinct, oid)
+			}
+		}
+	}
+	if err := bc.Close(); err != nil {
+		return plan, fmt.Errorf("resolve journal paths: %w", err)
+	}
+
+	br, err := gitutil.NewBatchReader(ctx, r.RepoRoot)
+	if err != nil {
+		return plan, err
+	}
+	defer func() { _ = br.Close() }()
+	for _, oid := range distinct {
+		content, found, err := br.Read(oid)
+		if err != nil {
+			return plan, fmt.Errorf("read blob %s: %w", oid, err)
+		}
+		if !found {
+			continue
+		}
+		red, changed := redactBytes(content, secrets)
+		if !changed {
+			continue
+		}
+		rb := &redactedBlob{}
+		if !dryRun {
+			if rb.newSHA, err = gitutil.HashObject(ctx, r.RepoRoot, red); err != nil {
+				return plan, err
+			}
+		}
+		plan.blobs[oid] = rb
+	}
+	return plan, nil
+}
+
 // syncRecordedWorktree keeps a rewritten event tree self-consistent: if its
 // meta/event.json records a worktree_tree that no longer matches the actual
 // worktree/ subtree (because a snapshot blob was redacted), the recorded sha is
@@ -167,7 +259,11 @@ func (r *Recorder) syncRecordedWorktree(ctx context.Context, tree string) (strin
 		return tree, nil
 	}
 	patched := bytes.ReplaceAll(evb, []byte(rec.WorktreeTree), []byte(actual))
-	return r.rebuildTree(ctx, tree, map[string][]byte{"meta/event.json": patched})
+	sha, err := gitutil.HashObject(ctx, r.RepoRoot, patched)
+	if err != nil {
+		return "", err
+	}
+	return r.rebuildTree(ctx, tree, map[string]string{"meta/event.json": sha})
 }
 
 // staleOwnMirrors lists this clone's own-journal mirror refs (any remote) whose
@@ -361,10 +457,11 @@ func redactBytes(content []byte, secrets []string) ([]byte, bool) {
 }
 
 // rebuildTree loads a tree-ish's tree (a commit or a bare tree sha) into a
-// throwaway index, overwrites the changed blobs at their (mode-preserving)
-// paths, and writes a new tree. Using an index lets git rebuild arbitrarily
-// nested paths (e.g. worktree/src/config.ts) for us.
-func (r *Recorder) rebuildTree(ctx context.Context, commit string, changes map[string][]byte) (string, error) {
+// throwaway index, points the changed paths at their replacement blobs (already
+// hashed by the caller, so a blob shared across commits is written once), and
+// writes a new tree. Using an index lets git rebuild arbitrarily nested paths
+// (e.g. worktree/src/config.ts) for us.
+func (r *Recorder) rebuildTree(ctx context.Context, commit string, changes map[string]string) (string, error) {
 	idxf, err := os.CreateTemp("", "twip-redact-idx-*")
 	if err != nil {
 		return "", err
@@ -377,12 +474,8 @@ func (r *Recorder) rebuildTree(ctx context.Context, commit string, changes map[s
 	if _, err := gitutil.Run(ctx, r.RepoRoot, env, nil, "read-tree", commit+"^{tree}"); err != nil {
 		return "", fmt.Errorf("read-tree %s: %w", commit, err)
 	}
-	for path, content := range changes {
+	for path, sha := range changes {
 		mode, err := r.treeEntryMode(ctx, commit, path)
-		if err != nil {
-			return "", err
-		}
-		sha, err := gitutil.HashObject(ctx, r.RepoRoot, content)
 		if err != nil {
 			return "", err
 		}

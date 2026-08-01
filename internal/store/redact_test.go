@@ -650,3 +650,58 @@ func TestRedactJournal_CoversMetaEventAndTranscript(t *testing.T) {
 		t.Errorf("transcript.jsonl still contains the secret: %q", tb)
 	}
 }
+
+// TestRedactJournal_DryRunWritesNoObjects: redactionPlan hashes each distinct
+// redacted blob up front (so a blob carried across commits is written once), which
+// must stay conditional on dryRun — a --dry-run has to leave the object store
+// untouched, not seed it with the redacted blobs it merely previewed.
+func TestRedactJournal_DryRunWritesNoObjects(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secretLine := "TOKEN=" + fakeSecret + "\n"
+	c0 := buildJournalCommit(t, repo, "", "e0\n", "1700000000 +0000",
+		map[string]string{"meta/transcript.jsonl": secretLine})
+	ref := JournalRefPrefix + cloneID
+	if err := gitutil.UpdateRef(ctx, repo, ref, c0, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// The sha the redacted content WOULD get, computed without writing it (no -w).
+	want, err := gitutil.Run(ctx, repo, nil,
+		[]byte(strings.Replace(secretLine, fakeSecret, redactPlaceholder, 1)),
+		"hash-object", "--stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	redactedSHA := strings.TrimSpace(string(want))
+	if gitutil.ObjectExists(ctx, repo, redactedSHA) {
+		t.Fatalf("precondition: %s already present", redactedSHA)
+	}
+
+	res, err := rec.RedactJournal(ctx, cloneID, []string{fakeSecret},
+		[]string{"meta/transcript.jsonl"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RedactedCommits != 1 {
+		t.Errorf("dry-run RedactedCommits = %d, want 1 (it must still report the finding)", res.RedactedCommits)
+	}
+	if gitutil.ObjectExists(ctx, repo, redactedSHA) {
+		t.Errorf("dry-run wrote the redacted blob %s into the object store", redactedSHA)
+	}
+
+	// The real run does write it, and the ref moves onto it.
+	if _, err := rec.RedactJournal(ctx, cloneID, []string{fakeSecret},
+		[]string{"meta/transcript.jsonl"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if !gitutil.ObjectExists(ctx, repo, redactedSHA) {
+		t.Errorf("real run did not write the redacted blob %s", redactedSHA)
+	}
+}
