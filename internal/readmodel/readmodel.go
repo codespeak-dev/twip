@@ -206,28 +206,56 @@ func changedFiles(ctx context.Context, repoRoot, base, tree string) []FileChange
 		if len(parts) != 2 {
 			continue
 		}
-		status, path := strings.TrimSpace(parts[0]), parts[1]
-		fc := FileChange{Status: status, Path: path}
-		switch status {
-		case "D":
-			fc.InHead = !objectAtPathExists(ctx, repoRoot, "HEAD", path)
-		default:
-			snap := blobAt(ctx, repoRoot, tree, path)
-			fc.InHead = snap != "" && snap == blobAt(ctx, repoRoot, "HEAD", path)
+		changes = append(changes, FileChange{Status: strings.TrimSpace(parts[0]), Path: parts[1]})
+	}
+	if len(changes) == 0 {
+		return nil
+	}
+
+	// Resolve every path in the snapshot and at HEAD through ONE
+	// `cat-file --batch-check` process. Per-path rev-parse/cat-file calls cost a
+	// process spawn each (two per changed path), so one event touching a large
+	// refactor would spend seconds in process startup rendering a single view.
+	specs := make([]string, 0, len(changes)*2)
+	for _, fc := range changes {
+		specs = append(specs, tree+":"+fc.Path, "HEAD:"+fc.Path)
+	}
+	at := resolvePaths(ctx, repoRoot, specs)
+	for i, fc := range changes {
+		if fc.Status == "D" {
+			changes[i].InHead = at["HEAD:"+fc.Path] == ""
+			continue
 		}
-		changes = append(changes, fc)
+		snap := at[tree+":"+fc.Path]
+		changes[i].InHead = snap != "" && snap == at["HEAD:"+fc.Path]
 	}
 	return changes
 }
 
-func blobAt(ctx context.Context, repoRoot, rev, path string) string {
-	sha, err := gitutil.Out(ctx, repoRoot, "rev-parse", "--verify", "-q", rev+":"+path)
+// resolvePaths maps each spec to the oid it names ("" when it resolves to
+// nothing), through a single git process. Best-effort: on any failure the
+// unresolved specs stay empty, which reads as "not present" — the same conclusion
+// the per-path lookups drew from their own errors.
+func resolvePaths(ctx context.Context, repoRoot string, specs []string) map[string]string {
+	at := make(map[string]string, len(specs))
+	bc, err := gitutil.NewBatchChecker(ctx, repoRoot)
 	if err != nil {
-		return ""
+		return at
 	}
-	return sha
-}
-
-func objectAtPathExists(ctx context.Context, repoRoot, rev, path string) bool {
-	return gitutil.ObjectExists(ctx, repoRoot, rev+":"+path)
+	defer func() { _ = bc.Close() }()
+	for _, spec := range specs {
+		if _, done := at[spec]; done {
+			continue
+		}
+		oid, _, found, err := bc.Check(spec)
+		if err != nil {
+			return at // the process is no longer usable; the rest stay absent
+		}
+		if found {
+			at[spec] = oid
+		} else {
+			at[spec] = ""
+		}
+	}
+	return at
 }

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -703,5 +704,292 @@ func TestRedactJournal_DryRunWritesNoObjects(t *testing.T) {
 	}
 	if !gitutil.ObjectExists(ctx, repo, redactedSHA) {
 		t.Errorf("real run did not write the redacted blob %s", redactedSHA)
+	}
+}
+
+// TestKeepRefsRetaining_EmptyAndUnknownCommits guards the load-bearing edge of
+// switching to `for-each-ref --contains`: that command with NO --contains lists
+// every ref, and these results drive ref DELETION — so an empty (or entirely
+// unresolvable) flagged-commit list must yield NOTHING, not every keep-ref. An
+// unknown sha must also stay non-fatal, as the old per-pair ancestry check was.
+func TestKeepRefsRetaining_EmptyAndUnknownCommits(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+
+	blob, err := gitutil.HashObject(ctx, repo, []byte("nothing secret\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := gitutil.MkTree(ctx, repo, []gitutil.TreeEntry{
+		{Mode: "100644", Type: "blob", SHA: blob, Name: "f.txt"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := gitutil.CommitTree(ctx, repo, tree, "", "pinned\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.PinCommit(ctx, orphan)
+	if refs, _ := rec.KeepRefs(ctx); len(refs) != 1 {
+		t.Fatalf("precondition: want 1 keep-ref, got %v", refs)
+	}
+
+	const unknown = "e1d1f1a1b1c1d1e1f1a1b1c1d1e1f1a1b1c1d1e1" // well-formed, absent
+	for _, tc := range []struct {
+		name    string
+		commits []string
+	}{
+		{"nil", nil},
+		{"empty slice", []string{}},
+		{"only empty strings", []string{"", ""}},
+		{"only an unknown sha", []string{unknown}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := rec.KeepRefsRetaining(ctx, tc.commits)
+			if err != nil {
+				t.Fatalf("KeepRefsRetaining(%v) errored: %v (an unresolvable commit must stay non-fatal)", tc.commits, err)
+			}
+			if len(got) != 0 {
+				t.Errorf("KeepRefsRetaining(%v) = %v, want none — this drives deletion", tc.commits, got)
+			}
+		})
+	}
+
+	// A real commit mixed with an unknown one still finds the real one's keep-ref.
+	got, err := rec.KeepRefsRetaining(ctx, []string{unknown, orphan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Errorf("KeepRefsRetaining(unknown+real) = %v, want the one real keep-ref", got)
+	}
+}
+
+// TestDeleteRefs_FallsBackPastAbsentRef: DeleteRefs batches into one atomic
+// `update-ref --stdin`, so a single already-absent ref would fail the whole
+// transaction. It must fall back to per-ref deletion and still report — and
+// actually perform — the deletions that were possible.
+func TestDeleteRefs_FallsBackPastAbsentRef(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+
+	head, _ := gitutil.Out(ctx, repo, "rev-parse", "HEAD")
+	live := []string{"refs/twip/pin/aaa", "refs/twip/pin/bbb"}
+	for _, ref := range live {
+		if err := gitutil.UpdateRef(ctx, repo, ref, head, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Absent ref sandwiched between two live ones kills the atomic batch.
+	deleted := rec.DeleteRefs(ctx, []string{live[0], "refs/twip/pin/never-existed", live[1]})
+	if len(deleted) != 2 {
+		t.Errorf("DeleteRefs = %v, want the 2 refs that existed", deleted)
+	}
+	for _, ref := range live {
+		if tip, _ := gitutil.ResolveRef(ctx, repo, ref); tip != "" {
+			t.Errorf("%s survived deletion (tip %s)", ref, tip)
+		}
+	}
+
+	// All-present is the batch path: everything deleted, nothing left behind.
+	for _, ref := range live {
+		if err := gitutil.UpdateRef(ctx, repo, ref, head, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if deleted := rec.DeleteRefs(ctx, live); len(deleted) != 2 {
+		t.Errorf("batch DeleteRefs = %v, want both", deleted)
+	}
+	for _, ref := range live {
+		if tip, _ := gitutil.ResolveRef(ctx, repo, ref); tip != "" {
+			t.Errorf("%s survived the batch deletion", ref)
+		}
+	}
+	if got := rec.DeleteRefs(ctx, nil); got != nil {
+		t.Errorf("DeleteRefs(nil) = %v, want nil", got)
+	}
+}
+
+// TestRedactJournal_ReparentedTailPreservesIdentity: a secret in an OLD commit
+// forces every later commit to be re-parented. Those commits carry no redacted
+// bytes, so the rewrite reuses their trees instead of rebuilding them — and their
+// identity must still survive byte-for-byte. Messages with trailing blank lines
+// are the sharp edge: `git log --format=%B` strips them, so the batched metadata
+// read must parse raw commit objects instead.
+func TestRedactJournal_ReparentedTailPreservesIdentity(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Awkward message shapes, including trailing blank lines and no trailing newline.
+	msgs := []string{
+		"clean prefix\n",
+		"secret here\n\nwith a body\n",
+		"trailing blanks\n\n\n",
+		"no trailing newline",
+		"multi\n\npara\n\ngraph\n",
+	}
+	trees := make([]string, len(msgs))
+	shas := make([]string, len(msgs))
+	parent := ""
+	for i, msg := range msgs {
+		files := map[string]string{"meta/event.json": fmt.Sprintf(`{"seq":%d}`, i)}
+		if i == 1 {
+			files["meta/transcript.jsonl"] = "TOKEN=" + fakeSecret + "\n"
+		} else {
+			files["meta/transcript.jsonl"] = fmt.Sprintf("clean line %d\n", i)
+		}
+		parent = buildJournalCommit(t, repo, parent, msg, fmt.Sprintf("%d +0000", 1700000000+i), files)
+		shas[i] = parent
+		trees[i], _ = gitutil.ResolveRef(ctx, repo, parent+"^{tree}")
+	}
+	ref := JournalRefPrefix + cloneID
+	if err := gitutil.UpdateRef(ctx, repo, ref, parent, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := rec.RedactJournal(ctx, cloneID, []string{fakeSecret},
+		[]string{"meta/transcript.jsonl"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Commit 0 is the clean prefix; 1 carries the secret; 2..4 are pure re-parents.
+	if res.RewrittenCommits != 4 || res.RedactedCommits != 1 {
+		t.Errorf("counts = rewritten %d redacted %d, want 4/1", res.RewrittenCommits, res.RedactedCommits)
+	}
+	if res.EarliestAffected != shas[1] {
+		t.Errorf("EarliestAffected = %s, want commit 1 %s", res.EarliestAffected, shas[1])
+	}
+
+	got, err := rec.commitShas(ctx, ref, true, 0) // oldest first
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(msgs) {
+		t.Fatalf("commit count = %d, want %d", len(got), len(msgs))
+	}
+	if got[0] != shas[0] {
+		t.Errorf("clean prefix rewritten: %s, want %s", got[0], shas[0])
+	}
+	for i := range msgs {
+		meta, err := rec.readCommitMeta(ctx, got[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if meta.message != msgs[i] {
+			t.Errorf("commit %d message = %q, want %q (verbatim)", i, meta.message, msgs[i])
+		}
+		if want := fmt.Sprintf("%d +0000", 1700000000+i); meta.authorDate != want {
+			t.Errorf("commit %d authorDate = %q, want %q", i, meta.authorDate, want)
+		}
+		if meta.authorName != "Alice" {
+			t.Errorf("commit %d authorName = %q, want Alice", i, meta.authorName)
+		}
+		// Re-parented commits (2..4) carry no redaction, so their trees must be
+		// the ORIGINAL trees — reused, not rebuilt into something new.
+		if i >= 2 && meta.tree != trees[i] {
+			t.Errorf("commit %d tree = %s, want the original %s reused", i, meta.tree, trees[i])
+		}
+	}
+	if reachableObjectsContain(t, repo, res.NewTip, fakeSecret) {
+		t.Error("secret still reachable after redaction")
+	}
+}
+
+// TestRedactJournal_ReportsPreExistingStaleWorktreeRecord: a re-parented commit
+// whose event record already disagreed with its own snapshot keeps that record
+// verbatim — a worktree_tree is recorded provenance, and rewriting it to match
+// whatever the tree holds would make a real corruption finding vanish. The
+// divergence must instead be REPORTED, so a user whose audit stays red after a
+// redaction can tell it was red beforehand too.
+func TestRedactJournal_ReportsPreExistingStaleWorktreeRecord(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A tree to record as worktree_tree that is NOT the commit's own subtree.
+	otherBlob, err := gitutil.HashObject(ctx, repo, []byte("elsewhere\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherTree, err := gitutil.MkTree(ctx, repo, []gitutil.TreeEntry{
+		{Mode: "100644", Type: "blob", SHA: otherBlob, Name: "y.ts"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c0 := buildJournalCommit(t, repo, "", "e0\n", "1700000000 +0000",
+		map[string]string{"meta/event.json": `{"seq":0}`, "meta/transcript.jsonl": "clean\n"})
+	c1 := buildJournalCommit(t, repo, c0, "e1\n", "1700000100 +0000",
+		map[string]string{"meta/event.json": `{"seq":1}`, "meta/transcript.jsonl": "TOKEN=" + fakeSecret + "\n"})
+	// c2: pure re-parent, snapshot present, record deliberately pointing elsewhere.
+	c2 := buildJournalCommit(t, repo, c1, "e2\n", "1700000200 +0000", map[string]string{
+		"meta/event.json":       `{"seq":2,"worktree_tree":"` + otherTree + `"}`,
+		"meta/transcript.jsonl": "clean\n",
+		"worktree/x.ts":         "actual snapshot\n",
+	})
+	// c3: pure re-parent with a CONSISTENT record — must NOT be reported.
+	wtActual, err := gitutil.ResolveRef(ctx, repo, c2+":worktree")
+	if err != nil || wtActual == "" {
+		t.Fatalf("could not resolve c2's worktree subtree: %v", err)
+	}
+	c3 := buildJournalCommit(t, repo, c2, "e3\n", "1700000300 +0000", map[string]string{
+		"meta/event.json":       `{"seq":3,"worktree_tree":"` + wtActual + `"}`,
+		"meta/transcript.jsonl": "clean\n",
+		"worktree/x.ts":         "actual snapshot\n",
+	})
+	ref := JournalRefPrefix + cloneID
+	if err := gitutil.UpdateRef(ctx, repo, ref, c3, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := rec.RedactJournal(ctx, cloneID, []string{fakeSecret},
+		[]string{"meta/transcript.jsonl"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := rec.commitShas(ctx, ref, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("commit count = %d, want 4", len(got))
+	}
+	// Exactly c2's slot is reported — c3's record is consistent, c1 was redacted
+	// (so its sync ran). The sha named must be the REWRITTEN one, which is what
+	// the user can still look up and what `twip audit` names; the original c2 is
+	// no longer in the journal.
+	if len(res.StaleWorktreeRecords) != 1 || res.StaleWorktreeRecords[0] != got[2] {
+		t.Errorf("StaleWorktreeRecords = %v, want exactly [rewritten c2 %s]",
+			res.StaleWorktreeRecords, got[2])
+	}
+	if res.StaleWorktreeRecords[0] == c2 {
+		t.Errorf("reported the pre-rewrite sha %s, which no longer exists in the journal", c2)
+	}
+
+	// The record itself is untouched: the pre-existing sha survives verbatim.
+	evb, err := gitutil.CatFile(ctx, repo, got[2]+":meta/event.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(evb), otherTree) {
+		t.Errorf("c2's recorded worktree_tree was rewritten: %s (want the pre-existing %s kept)", evb, otherTree)
+	}
+	// And the redaction still did its job.
+	if reachableObjectsContain(t, repo, res.NewTip, fakeSecret) {
+		t.Error("secret still reachable after redaction")
 	}
 }

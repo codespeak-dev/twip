@@ -166,6 +166,7 @@ func newRedactCmd() *cobra.Command {
 						}
 					}
 				}
+				reportStaleWorktreeRecords(cmd, res)
 			}
 
 			var droppedKeep []string
@@ -285,6 +286,29 @@ func completePendingPropagation(cmd *cobra.Command, ctx context.Context, rec *st
 		cmd.Println("  The pending marker is kept — nothing was forced.")
 	}
 	return true, nil
+}
+
+// reportStaleWorktreeRecords surfaces commits the rewrite re-parented whose event
+// record already disagreed with its own snapshot. The rewrite deliberately leaves
+// them alone — a worktree_tree is recorded provenance, and silently overwriting it
+// to match whatever the tree holds would make a real corruption finding vanish.
+// Saying so keeps the other failure mode away too: a user who sees `twip audit`
+// stay red after a redaction learns here that it was red beforehand as well.
+func reportStaleWorktreeRecords(cmd *cobra.Command, res store.RedactResult) {
+	stale := res.StaleWorktreeRecords
+	if len(stale) == 0 {
+		return
+	}
+	const show = 5
+	cmd.PrintErrf("⚠ %d re-parented commit(s) record a worktree_tree that already disagreed with their snapshot — left as-is (pre-existing, not caused by this redaction):\n", len(stale))
+	for i, c := range stale {
+		if i == show {
+			cmd.PrintErrf("    … and %d more\n", len(stale)-show)
+			break
+		}
+		cmd.PrintErrf("    %s\n", short(c))
+	}
+	cmd.PrintErrln("  `twip audit` reports these; they are not fixed by redaction.")
 }
 
 // reportPropagation prints a PropagateRedaction outcome. rewrote notes whether a

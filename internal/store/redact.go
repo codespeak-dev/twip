@@ -20,16 +20,17 @@ const redactPlaceholder = "[twip-redacted]"
 
 // RedactResult summarizes a RedactJournal run.
 type RedactResult struct {
-	DistinctSecrets  int      // number of distinct secret strings redacted
-	Paths            []string // tree paths gitleaks flagged (e.g. meta/transcript.jsonl)
-	RedactedCommits  int      // commits whose blobs actually had secret bytes removed
-	RewrittenCommits int      // total commits rebuilt (incl. re-parented ones with no change)
-	OldTip           string   // journal tip before the rewrite
-	NewTip           string   // journal tip after the rewrite ("" on dry-run)
-	EarliestAffected string   // oldest original commit that contained a secret
-	AlreadyPushed    bool     // EarliestAffected is reachable from origin's mirror (local redaction can't undo that)
-	DroppedMirrors   []string // own-journal mirror refs deleted because they retained the pre-redaction chain (would-drop on dry-run)
-	DryRun           bool
+	DistinctSecrets      int      // number of distinct secret strings redacted
+	Paths                []string // tree paths gitleaks flagged (e.g. meta/transcript.jsonl)
+	RedactedCommits      int      // commits whose blobs actually had secret bytes removed
+	RewrittenCommits     int      // total commits rebuilt (incl. re-parented ones with no change)
+	OldTip               string   // journal tip before the rewrite
+	NewTip               string   // journal tip after the rewrite ("" on dry-run)
+	EarliestAffected     string   // oldest original commit that contained a secret
+	AlreadyPushed        bool     // EarliestAffected is reachable from origin's mirror (local redaction can't undo that)
+	DroppedMirrors       []string // own-journal mirror refs deleted because they retained the pre-redaction chain (would-drop on dry-run)
+	StaleWorktreeRecords []string // re-parented commits whose event record already disagreed with its snapshot (left untouched; see RedactJournal)
+	DryRun               bool
 }
 
 // RedactJournal rewrites this clone's journal in place, replacing every occurrence
@@ -79,7 +80,9 @@ func (r *Recorder) RedactJournal(ctx context.Context, cloneID string, secrets, p
 
 	newParent := "" // tracks the rewritten parent; for the unaffected prefix it stays the original sha
 	started := false
-	for _, c := range ordered {
+	var reparented []string         // rewritten commits with no redacted bytes (tree reused verbatim)
+	var metas map[string]commitMeta // batch-loaded on the first rebuilt commit
+	for i, c := range ordered {
 		changes := map[string]string{} // path -> redacted blob sha
 		for _, p := range paths {
 			if b := plan.blobs[plan.at[c+":"+p]]; b != nil {
@@ -99,26 +102,50 @@ func (r *Recorder) RedactJournal(ctx context.Context, cloneID string, secrets, p
 			res.RedactedCommits++
 		}
 		if dryRun {
+			if len(changes) == 0 {
+				reparented = append(reparented, c) // nothing rewritten yet: the original is what exists
+			}
 			continue
 		}
-		newTree, err := r.rebuildTree(ctx, c, changes)
-		if err != nil {
-			return res, err
+		if metas == nil {
+			// First commit that actually needs rebuilding: read the identity of it
+			// and every commit after it in ONE pass, rather than a cat-file per
+			// commit. Deferred to here so the untouched prefix costs nothing.
+			if metas, err = r.commitMetas(ctx, ordered[i:]); err != nil {
+				return res, err
+			}
 		}
-		// Redacting a worktree/ blob changes the worktree subtree's sha; the
-		// event record's worktree_tree must follow it or every later audit
-		// reports the snapshot as corrupt.
-		newTree, err = r.syncRecordedWorktree(ctx, newTree)
-		if err != nil {
-			return res, err
+		meta, ok := metas[c]
+		if !ok {
+			return res, fmt.Errorf("commit %s vanished from the journal mid-redaction", c)
 		}
-		meta, err := r.readCommitMeta(ctx, c)
-		if err != nil {
-			return res, err
+
+		// A commit with no redacted bytes is a pure re-parent: its tree is unchanged,
+		// so it needs neither a rebuild nor a worktree_tree sync (that sync exists to
+		// follow a redaction-induced subtree change, and there was none). Reusing the
+		// original tree is what makes re-parenting the long tail after an old secret
+		// cheap — those commits now cost one commit-tree each instead of five calls.
+		newTree := meta.tree
+		if len(changes) > 0 {
+			if newTree, err = r.rebuildTree(ctx, c, changes); err != nil {
+				return res, err
+			}
+			// Redacting a worktree/ blob changes the worktree subtree's sha; the
+			// event record's worktree_tree must follow it or every later audit
+			// reports the snapshot as corrupt.
+			if newTree, err = r.syncRecordedWorktree(ctx, newTree); err != nil {
+				return res, err
+			}
 		}
 		newSha, err := r.commitTreePreserving(ctx, newTree, newParent, meta)
 		if err != nil {
 			return res, err
+		}
+		if len(changes) == 0 {
+			// Record the REWRITTEN sha: the original is about to leave the journal,
+			// so naming it would point the user at a commit they can no longer look
+			// up — and `twip audit` will name this one.
+			reparented = append(reparented, newSha)
 		}
 		newParent = newSha
 	}
@@ -127,6 +154,11 @@ func (r *Recorder) RedactJournal(ctx context.Context, cloneID string, secrets, p
 		res.NewTip = oldTip // gitleaks flagged something we couldn't locate in the chain; ref unchanged
 		return res, nil
 	}
+	// Re-parented commits keep their tree verbatim, so a record that already
+	// disagreed with its snapshot stays that way. Report those so the rewrite never
+	// silently changes recorded provenance NOR silently leaves a known problem
+	// unmentioned — the divergence is pre-existing and `twip audit` flags it too.
+	res.StaleWorktreeRecords = r.staleWorktreeRecords(ctx, reparented)
 	res.AlreadyPushed = r.earliestAffectedPushed(ctx, cloneID, res.EarliestAffected)
 	// Own-journal mirror refs that retain any rewritten commit would keep the
 	// pre-redaction chain (secret bytes included) reachable and gc-protected on
@@ -266,26 +298,82 @@ func (r *Recorder) syncRecordedWorktree(ctx context.Context, tree string) (strin
 	return r.rebuildTree(ctx, tree, map[string]string{"meta/event.json": sha})
 }
 
+// staleWorktreeRecords lists, in chain order, the given commits whose
+// meta/event.json names a worktree_tree that does not match the commit's actual
+// worktree/ subtree. The conditions mirror syncRecordedWorktree exactly, so this
+// reports precisely the commits that sync WOULD have patched had the redaction
+// touched their trees — which for a re-parented commit means a divergence that
+// predates the redaction entirely.
+//
+// Two batched passes: `cat-file --batch-check` for the subtrees, then
+// `cat-file --batch` for the records of only those commits that have one. Reading
+// the records is the expensive half (25 MiB across a 45k-commit journal), so the
+// cheap pass prunes first. Best-effort: this is a diagnostic, and failing to
+// produce it must never fail a redaction that already succeeded.
+func (r *Recorder) staleWorktreeRecords(ctx context.Context, commits []string) []string {
+	if len(commits) == 0 {
+		return nil
+	}
+	bc, err := gitutil.NewBatchChecker(ctx, r.RepoRoot)
+	if err != nil {
+		return nil
+	}
+	actual := make(map[string]string, len(commits))
+	withSubtree := make([]string, 0, len(commits))
+	for _, c := range commits {
+		oid, _, found, err := bc.Check(c + ":worktree")
+		if err != nil {
+			_ = bc.Close()
+			return nil
+		}
+		if !found {
+			continue // no snapshot subtree: sync would have returned early
+		}
+		actual[c] = oid
+		withSubtree = append(withSubtree, c)
+	}
+	_ = bc.Close()
+	if len(withSubtree) == 0 {
+		return nil
+	}
+
+	br, err := gitutil.NewBatchReader(ctx, r.RepoRoot)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = br.Close() }()
+	var stale []string
+	for _, c := range withSubtree {
+		evb, found, err := br.Read(c + ":meta/event.json")
+		if err != nil {
+			return stale
+		}
+		if !found {
+			continue // no event record: sync would have returned early
+		}
+		var rec Record
+		if json.Unmarshal(evb, &rec) != nil || rec.WorktreeTree == "" {
+			continue
+		}
+		if rec.WorktreeTree != actual[c] {
+			stale = append(stale, c)
+		}
+	}
+	return stale
+}
+
 // staleOwnMirrors lists this clone's own-journal mirror refs (any remote) whose
 // tip retains the earliest rewritten commit — i.e. the refs that would keep the
 // pre-redaction chain alive locally after the rewrite.
 func (r *Recorder) staleOwnMirrors(ctx context.Context, cloneID, earliestAffected string) []string {
-	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil,
-		"for-each-ref", "--format=%(refname) %(objectname)", MirrorRefPrefix)
+	retaining, err := gitutil.RefsContaining(ctx, r.RepoRoot,
+		[]string{earliestAffected}, MirrorRefPrefix)
 	if err != nil {
 		return nil
 	}
 	var stale []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		ref, tip := fields[0], fields[1]
-		if id, ok := cloneIDFromRef(ref); !ok || id != cloneID {
-			continue
-		}
-		if gitutil.IsAncestor(ctx, r.RepoRoot, earliestAffected, tip) {
+	for _, ref := range retaining {
+		if id, ok := cloneIDFromRef(ref); ok && id == cloneID {
 			stale = append(stale, ref)
 		}
 	}
@@ -310,28 +398,61 @@ func (r *Recorder) KeepRefs(ctx context.Context) ([]string, error) {
 // a flagged pinned/stashed object unreachable — the deliberate trade of that
 // object's preservation for its destruction.
 func (r *Recorder) KeepRefsRetaining(ctx context.Context, commits []string) ([]string, error) {
-	tips, err := r.keepRefTips(ctx)
+	refs, err := gitutil.RefsContaining(ctx, r.RepoRoot, commits, PinRefPrefix, StashRefPrefix)
 	if err != nil {
 		return nil, err
-	}
-	var refs []string
-	for ref, tip := range tips {
-		for _, c := range commits {
-			if c == tip || gitutil.IsAncestor(ctx, r.RepoRoot, c, tip) {
-				refs = append(refs, ref)
-				break
-			}
-		}
 	}
 	sort.Strings(refs)
 	return refs, nil
 }
 
 // DeleteRefs deletes the given refs (best-effort, idempotent) and returns the
-// ones actually deleted.
+// ones actually deleted — callers report those to the user and record them as
+// still owed to the remote, so the returned set must not include refs that were
+// never there.
+//
+// The refs that exist are resolved first (one `for-each-ref`, which takes exact
+// names as patterns), because `update-ref --stdin`'s `delete` SUCCEEDS on an
+// absent ref: batching blind would report every input as deleted. The deletions
+// then go through a single transaction — one process for any number of refs,
+// which matters when a redaction drops hundreds of keep-refs — falling back to
+// one-at-a-time if the transaction is refused, since it is atomic and a
+// concurrent change to any one ref would otherwise lose the whole batch. (twip's
+// ref names are sha- and remote-derived and git forbids spaces in refs, so the
+// line-oriented --stdin format needs no quoting.)
 func (r *Recorder) DeleteRefs(ctx context.Context, refs []string) []string {
+	if len(refs) == 0 {
+		return nil
+	}
+	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil,
+		append([]string{"for-each-ref", "--format=%(refname)"}, refs...)...)
+	if err != nil {
+		return nil
+	}
+	exists := map[string]bool{}
+	for _, ref := range strings.Fields(string(out)) {
+		exists[ref] = true
+	}
+	var present []string
+	for _, ref := range refs { // caller's order, deduped by existence lookup
+		if exists[ref] {
+			exists[ref] = false
+			present = append(present, ref)
+		}
+	}
+	if len(present) == 0 {
+		return nil
+	}
+
+	var stdin bytes.Buffer
+	for _, ref := range present {
+		fmt.Fprintf(&stdin, "delete %s\n", ref)
+	}
+	if _, err := gitutil.Run(ctx, r.RepoRoot, nil, stdin.Bytes(), "update-ref", "--stdin"); err == nil {
+		return present
+	}
 	var deleted []string
-	for _, ref := range refs {
+	for _, ref := range present {
 		if _, err := gitutil.Run(ctx, r.RepoRoot, nil, nil, "update-ref", "-d", ref); err == nil {
 			deleted = append(deleted, ref)
 		}
@@ -474,13 +595,13 @@ func (r *Recorder) rebuildTree(ctx context.Context, commit string, changes map[s
 	if _, err := gitutil.Run(ctx, r.RepoRoot, env, nil, "read-tree", commit+"^{tree}"); err != nil {
 		return "", fmt.Errorf("read-tree %s: %w", commit, err)
 	}
+	modes, err := r.treeEntryModes(ctx, commit, changes)
+	if err != nil {
+		return "", err
+	}
 	for path, sha := range changes {
-		mode, err := r.treeEntryMode(ctx, commit, path)
-		if err != nil {
-			return "", err
-		}
 		if _, err := gitutil.Run(ctx, r.RepoRoot, env, nil,
-			"update-index", "--add", "--cacheinfo", mode+","+sha+","+path); err != nil {
+			"update-index", "--add", "--cacheinfo", modes[path]+","+sha+","+path); err != nil {
 			return "", fmt.Errorf("update-index %s: %w", path, err)
 		}
 	}
@@ -491,48 +612,104 @@ func (r *Recorder) rebuildTree(ctx context.Context, commit string, changes map[s
 	return strings.TrimSpace(string(out)), nil
 }
 
-// treeEntryMode returns the git mode (e.g. "100644") of path in commit's tree, so a
-// redacted blob keeps the original file's mode (executable, symlink, …).
-func (r *Recorder) treeEntryMode(ctx context.Context, commit, path string) (string, error) {
-	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil, "ls-tree", commit, "--", path)
+// treeEntryModes returns the git mode (e.g. "100644") of each changed path in
+// commit's tree, so a redacted blob keeps the original file's mode (executable,
+// symlink, …). One ls-tree covers every path, rather than one per path.
+func (r *Recorder) treeEntryModes(ctx context.Context, commit string, changes map[string]string) (map[string]string, error) {
+	args := []string{"ls-tree", commit, "--"}
+	for path := range changes {
+		args = append(args, path)
+	}
+	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil, args...)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	fields := strings.Fields(strings.TrimSpace(string(out)))
-	if len(fields) == 0 {
-		return "", fmt.Errorf("no tree entry for %s in %s", path, commit)
+	modes := make(map[string]string, len(changes))
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		// "<mode> <type> <sha>\t<path>" — split on the tab so paths with spaces survive.
+		head, path, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		if fields := strings.Fields(head); len(fields) == 3 {
+			modes[path] = fields[0]
+		}
 	}
-	return fields[0], nil
+	for path := range changes {
+		if modes[path] == "" {
+			return nil, fmt.Errorf("no tree entry for %s in %s", path, commit)
+		}
+	}
+	return modes, nil
 }
 
 // commitMeta is a journal commit's identity, preserved across a redaction rewrite.
+// tree is the commit's own tree, so a commit that needs no content change can be
+// re-parented onto it without rebuilding it.
 type commitMeta struct {
+	tree                                         string
 	authorName, authorEmail, authorDate          string
 	committerName, committerEmail, committerDate string
 	message                                      string
 }
 
-// readCommitMeta parses author/committer/message out of a commit object.
+// commitMetas reads the identity of many commits through ONE
+// `git cat-file --batch` process instead of a cat-file per commit. The raw commit
+// object is parsed — byte-identical to what `cat-file -p` yields — rather than a
+// `git log --format` projection, because %B silently strips trailing blank lines
+// from a message and this rewrite promises to preserve messages verbatim.
+func (r *Recorder) commitMetas(ctx context.Context, commits []string) (map[string]commitMeta, error) {
+	metas := make(map[string]commitMeta, len(commits))
+	br, err := gitutil.NewBatchReader(ctx, r.RepoRoot)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = br.Close() }()
+	for _, c := range commits {
+		if _, done := metas[c]; done {
+			continue
+		}
+		raw, found, err := br.Read(c)
+		if err != nil {
+			return nil, fmt.Errorf("read commit %s: %w", c, err)
+		}
+		if !found {
+			return nil, fmt.Errorf("journal commit %s is missing", c)
+		}
+		metas[c] = parseCommitMeta(raw)
+	}
+	return metas, nil
+}
+
+// readCommitMeta parses author/committer/message out of a single commit object.
+// commitMetas is the batched form used by the rewrite; this stays for one-off use.
 func (r *Recorder) readCommitMeta(ctx context.Context, commit string) (commitMeta, error) {
 	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil, "cat-file", "-p", commit)
 	if err != nil {
 		return commitMeta{}, err
 	}
+	return parseCommitMeta(out), nil
+}
+
+// parseCommitMeta pulls tree/author/committer/message out of a raw commit object.
+func parseCommitMeta(raw []byte) commitMeta {
 	var m commitMeta
-	hdr := string(out)
+	hdr := string(raw)
 	if i := strings.Index(hdr, "\n\n"); i >= 0 {
 		m.message = hdr[i+2:]
 		hdr = hdr[:i]
 	}
 	for _, line := range strings.Split(hdr, "\n") {
 		switch {
+		case strings.HasPrefix(line, "tree "):
+			m.tree = strings.TrimSpace(strings.TrimPrefix(line, "tree "))
 		case strings.HasPrefix(line, "author "):
 			m.authorName, m.authorEmail, m.authorDate = parseIdent(strings.TrimPrefix(line, "author "))
 		case strings.HasPrefix(line, "committer "):
 			m.committerName, m.committerEmail, m.committerDate = parseIdent(strings.TrimPrefix(line, "committer "))
 		}
 	}
-	return m, nil
+	return m
 }
 
 // parseIdent splits a git ident line body ("Name <email> <unixts> <tz>") into its

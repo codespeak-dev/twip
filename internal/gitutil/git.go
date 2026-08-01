@@ -388,6 +388,68 @@ func (b *BatchChecker) Check(spec string) (oid, objType string, found bool, err 
 	return fields[0], fields[1], true, nil
 }
 
+// RefsContaining lists the refs matching the given patterns whose tip is one of
+// the given commits, or a descendant of one. It is `for-each-ref --contains`
+// repeated once per commit in a SINGLE process — git ORs the conditions — where
+// the per-pair alternative (`merge-base --is-ancestor` for every ref × commit)
+// costs a process spawn each: seconds per flagged commit on a repo holding
+// thousands of pinned keep-refs.
+//
+// An empty commit list yields NO refs, never every ref. `for-each-ref` with no
+// --contains lists everything and these results drive ref DELETION, so the guard
+// is load-bearing; empty commit strings are dropped for the same reason
+// (`--contains=` would mean HEAD).
+//
+// A commit git cannot resolve would fail the whole query ("error: no such
+// commit"), so unresolvable ones are dropped BEFORE it runs — one batch-check
+// pass — matching the per-pair behavior of treating such a commit as contained by
+// nothing. Filtering up front rather than retrying on failure is what lets a
+// genuine query error still reach the caller instead of reading as "no refs".
+func RefsContaining(ctx context.Context, repoRoot string, commits []string, patterns ...string) ([]string, error) {
+	var candidates []string
+	for _, c := range commits {
+		if c != "" {
+			candidates = append(candidates, c)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	bc, err := NewBatchChecker(ctx, repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"for-each-ref", "--format=%(refname)"}
+	n, seen := 0, map[string]bool{}
+	for _, c := range candidates {
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
+		// ^{commit} reports missing both for an absent object and for one that is
+		// not a commit — exactly the inputs --contains would reject.
+		if _, _, found, cerr := bc.Check(c + "^{commit}"); cerr != nil {
+			_ = bc.Close()
+			return nil, cerr
+		} else if !found {
+			continue
+		}
+		args = append(args, "--contains="+c)
+		n++
+	}
+	if err := bc.Close(); err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil // every commit was unresolvable: contained by nothing
+	}
+	out, err := Run(ctx, repoRoot, nil, nil, append(args, patterns...)...)
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(string(out)), nil
+}
+
 // StashEntries returns the commit shas of the current stash stack (newest first),
 // or nil if there is no stash. Each is a self-contained commit whose tree is the
 // stashed worktree state.

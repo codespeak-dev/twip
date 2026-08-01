@@ -55,10 +55,80 @@ type sessionCursor struct {
 	sidechain map[string]int
 }
 
+// eventSpecs lists every object spec the checks in Run read for one event —
+// exactly those, so the batched resolution below does no wasted work. All of them
+// are known before any resolution happens, which is what lets the whole audit
+// resolve in a single pass.
+func eventSpecs(ec store.EventCommit) []string {
+	r := ec.Record
+	specs := []string{ec.Commit + ":worktree"}
+	if r.WorktreeTree != "" {
+		specs = append(specs, r.WorktreeTree)
+	} else {
+		// The carry-forward check compares against the parent's subtree.
+		specs = append(specs, ec.Commit+"^:worktree")
+	}
+	if r.GitOp != nil {
+		specs = append(specs, r.GitOp.Stashed...)
+		if bh := r.GitOp.BeforeHead; bh != "" && bh != r.GitOp.AfterHead {
+			specs = append(specs, bh)
+		}
+	}
+	return specs
+}
+
+// resolveSpecs resolves every spec the audit needs through ONE
+// `git cat-file --batch-check` process, returning spec -> oid ("" when the spec
+// resolves to nothing: an absent path, a lost object, a root commit's parent).
+//
+// Doing this per event instead — `cat-file -e` / `rev-parse` per spec, as this
+// audit used to — costs a process spawn per spec. That is ~1.7ms each even
+// talking to the real git, so a journal with tens of thousands of events spends
+// minutes in process startup alone (65k events measured at 196s on one repo,
+// against 0.4s for the same resolution batched). Nothing here needs a spawn per
+// event: every check is a spec lookup, and duplicate specs collapse.
+func resolveSpecs(ctx context.Context, repoRoot string, events []store.EventCommit) (map[string]string, error) {
+	oid := make(map[string]string, len(events)*2)
+	bc, err := gitutil.NewBatchChecker(ctx, repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	for _, ec := range events {
+		for _, spec := range eventSpecs(ec) {
+			// An empty spec has nothing to resolve; leaving it out of the map makes
+			// the lookup below report it absent, which is the finding it deserves.
+			if spec == "" {
+				continue
+			}
+			if _, done := oid[spec]; done {
+				continue
+			}
+			got, _, found, err := bc.Check(spec)
+			if err != nil {
+				_ = bc.Close()
+				return nil, fmt.Errorf("resolve %s: %w", spec, err)
+			}
+			if !found {
+				oid[spec] = "" // recorded as absent, so the checks below see a miss
+				continue
+			}
+			oid[spec] = got
+		}
+	}
+	if err := bc.Close(); err != nil {
+		return nil, fmt.Errorf("resolve audit specs: %w", err)
+	}
+	return oid, nil
+}
+
 // Run audits every recorded event in the repo's journals.
 func Run(ctx context.Context, repoRoot string) (*Report, error) {
 	rec := store.New(repoRoot)
 	events, err := rec.LoadAllEvents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	oid, err := resolveSpecs(ctx, repoRoot, events)
 	if err != nil {
 		return nil, err
 	}
@@ -73,20 +143,20 @@ func Run(ctx context.Context, repoRoot string) (*Report, error) {
 
 		// Worktree snapshot present and matching the recorded sha (any event kind).
 		if r.WorktreeTree != "" {
-			if !gitutil.ObjectExists(ctx, repoRoot, r.WorktreeTree) {
+			if oid[r.WorktreeTree] == "" {
 				add(r.SessionID, r.Seq, SeverityError, "worktree tree object missing: "+r.WorktreeTree)
 			}
-			if got, err := gitutil.Out(ctx, repoRoot, "rev-parse", ec.Commit+":worktree"); err != nil || got != r.WorktreeTree {
+			if got := oid[ec.Commit+":worktree"]; got != r.WorktreeTree {
 				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("worktree/ subtree (%s) does not match recorded tree (%s)", got, r.WorktreeTree))
 			}
-		} else if got, err := gitutil.Out(ctx, repoRoot, "rev-parse", ec.Commit+":worktree"); err == nil {
+		} else if got := oid[ec.Commit+":worktree"]; got != "" {
 			// A snapshot-less event's worktree/ is a carry-forward of its parent's
 			// (kept identical so journal diffs stay empty for unchanged content); a
 			// carried subtree that differs would smuggle in content no event recorded.
 			// Absence is also fine: events before any snapshot, and pre-carry-forward
-			// journals, simply have no worktree/.
-			parent, perr := gitutil.Out(ctx, repoRoot, "rev-parse", ec.Commit+"^:worktree")
-			if perr != nil || parent != got {
+			// journals, simply have no worktree/. A root commit resolves no parent
+			// subtree, which lands here as a mismatch — as it did before batching.
+			if parent := oid[ec.Commit+"^:worktree"]; parent != got {
 				add(r.SessionID, r.Seq, SeverityError, fmt.Sprintf("carried worktree/ subtree (%s) does not match parent's (%s)", got, parent))
 			}
 		}
@@ -95,11 +165,11 @@ func Run(ctx context.Context, repoRoot string) (*Report, error) {
 		// op, must still be present (the keep-refs hold them).
 		if r.GitOp != nil {
 			for _, sha := range r.GitOp.Stashed {
-				if !gitutil.ObjectExists(ctx, repoRoot, sha) {
+				if oid[sha] == "" {
 					add(r.SessionID, r.Seq, SeverityError, "archived stash object missing: "+sha)
 				}
 			}
-			if bh := r.GitOp.BeforeHead; bh != "" && bh != r.GitOp.AfterHead && !gitutil.ObjectExists(ctx, repoRoot, bh) {
+			if bh := r.GitOp.BeforeHead; bh != "" && bh != r.GitOp.AfterHead && oid[bh] == "" {
 				add(r.SessionID, r.Seq, SeverityError, "pre-op HEAD orphaned (not pinned): "+bh)
 			}
 		}

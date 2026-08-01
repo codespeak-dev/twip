@@ -166,3 +166,100 @@ func TestReadmodelCarriesAgentAndAllowsLegacyEmptyAgent(t *testing.T) {
 		t.Errorf("legacy detail agent = %q, want empty", legacyDetail.Agent)
 	}
 }
+
+// TestChangedFiles_InHead covers the verified-link semantics that changedFiles
+// reports, now that the per-path lookups are resolved in one batched pass: a
+// snapshot blob matching HEAD is linked, one differing from HEAD is not, a path
+// absent from HEAD is not, and a DELETED path is "in head" precisely when HEAD no
+// longer has it either.
+func TestChangedFiles_InHead(t *testing.T) {
+	ctx := context.Background()
+	repo := initReadmodelRepo(t)
+
+	write := func(rel, content string) {
+		t.Helper()
+		p := filepath.Join(repo, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// HEAD holds: same.txt (matches the snapshot), differs.txt (older content),
+	// and gone.txt (which the snapshot will delete). absent.txt is snapshot-only.
+	write("same.txt", "identical\n")
+	write("differs.txt", "head version\n")
+	write("gone.txt", "doomed\n")
+	if _, err := gitutil.Run(ctx, repo, nil, nil, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitutil.Run(ctx, repo, nil, nil, "commit", "-q", "-m", "head state"); err != nil {
+		t.Fatal(err)
+	}
+	base, err := gitutil.Out(ctx, repo, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The snapshot tree: same.txt unchanged, differs.txt edited, absent.txt added,
+	// gone.txt removed.
+	write("differs.txt", "snapshot version\n")
+	write("absent.txt", "snapshot only\n")
+	if err := os.Remove(filepath.Join(repo, "gone.txt")); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := snapshot.Capture(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[string]FileChange{}
+	for _, fc := range changedFiles(ctx, repo, base, snap.Tree) {
+		got[fc.Path] = fc
+	}
+	for _, tc := range []struct {
+		path       string
+		wantStatus string
+		wantInHead bool
+		why        string
+	}{
+		{"differs.txt", "M", false, "snapshot content differs from HEAD"},
+		{"absent.txt", "A", false, "path does not exist at HEAD"},
+		{"gone.txt", "D", false, "deleted in the snapshot but HEAD still has it — the deletion has not landed"},
+	} {
+		fc, ok := got[tc.path]
+		if !ok {
+			t.Errorf("%s missing from changedFiles (got %v)", tc.path, got)
+			continue
+		}
+		if fc.Status != tc.wantStatus {
+			t.Errorf("%s status = %q, want %q", tc.path, fc.Status, tc.wantStatus)
+		}
+		if fc.InHead != tc.wantInHead {
+			t.Errorf("%s InHead = %v, want %v (%s)", tc.path, fc.InHead, tc.wantInHead, tc.why)
+		}
+	}
+	if _, ok := got["same.txt"]; ok {
+		t.Errorf("same.txt is unchanged between the trees and must not be reported: %v", got["same.txt"])
+	}
+
+	// Once HEAD catches up to the snapshot, every change reports linked — the
+	// edited and added blobs now match HEAD, and the deleted path is gone there too.
+	if _, err := gitutil.Run(ctx, repo, nil, nil, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitutil.Run(ctx, repo, nil, nil, "commit", "-q", "-m", "catch up"); err != nil {
+		t.Fatal(err)
+	}
+	after := changedFiles(ctx, repo, base, snap.Tree)
+	if len(after) != 3 {
+		t.Fatalf("expected the same 3 changes after catch-up, got %v", after)
+	}
+	for _, fc := range after {
+		if !fc.InHead {
+			t.Errorf("%s (%s) should be linked to HEAD once HEAD matches the snapshot", fc.Path, fc.Status)
+		}
+	}
+}
