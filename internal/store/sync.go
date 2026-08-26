@@ -145,17 +145,19 @@ func (r *Recorder) InstallSync(ctx context.Context, twipPath string, enforce boo
 //
 // The mirror self-gates: before pushing, the twip data this push would newly
 // expose (the journal delta plus keep-refs the remote lacks) is scanned for
-// secrets, and on findings the mirror is withheld — the returned
-// *MirrorBlockedError tells the caller why and how to fix it. The gate lives
-// HERE, not in a hook, because every mirror path funnels through this function
-// (bundled hook, hook-manager jobs regardless of their ordering, a manual
-// `twip sync push`), so no wiring or hook configuration can route around it.
+// secrets, and nothing is mirrored unless that scan ran and came back clean.
+// Findings return a *MirrorBlockedError; a scan that could not run at all
+// returns a *MirrorUnscannedError. Either way the caller learns why and how to
+// fix it, and the refs stay local. The gate lives HERE, not in a hook, because
+// every mirror path funnels through this function (bundled hook, hook-manager
+// jobs regardless of their ordering, a manual `twip sync push`), so no wiring
+// or hook configuration can route around it.
 func (r *Recorder) SyncPush(ctx context.Context, remote string) error {
 	if remote == "" || os.Getenv(envSyncPush) == "1" {
 		return nil
 	}
 	if err := r.gateMirrorPush(ctx, remote); err != nil {
-		return err // secrets in the delta: withhold the mirror, never the user's push
+		return err // no clean verdict: withhold the mirror, never the user's push
 	}
 	// --no-verify so this internal mirror push never fires the pre-push hook: it
 	// would otherwise re-run a hook manager's other pre-push jobs (tests, lint, …) a
@@ -172,9 +174,10 @@ func (r *Recorder) SyncPush(ctx context.Context, remote string) error {
 }
 
 // envSkipLeakScan disables the pre-mirror secrets gate for one push — the
-// deliberate "I know, mirror it anyway" bypass. The gate already fails OPEN on
-// anything infrastructural (no scanner installed, unreachable remote, scanner
-// error), so this exists only for overriding a real finding.
+// deliberate "I know, mirror it anyway" bypass. It is the single escape hatch
+// for BOTH gate outcomes: a real finding, and a scan that could not run at all
+// (no scanner, unreachable remote, scanner error), since the gate now withholds
+// the mirror in either case.
 const envSkipLeakScan = "TWIP_SKIP_LEAK_SCAN"
 
 // MirrorBlockedError reports that the mirror's secrets gate withheld the push:
@@ -196,39 +199,80 @@ func (e *MirrorBlockedError) Error() string {
 		e.Scanner, e.Count, e.Where, e.Rules, e.Paths, envSkipLeakScan)
 }
 
+// MirrorUnscannedError reports the gate's other withholding outcome: the scan
+// could not be completed, so whether the twip data this push would expose holds
+// secrets is simply unknown. Unknown is not clean — the mirror is withheld all
+// the same, and this says which step failed and how to restore scanning.
+type MirrorUnscannedError struct {
+	Reason string // why no verdict could be reached
+	Fix    string // how to get the scan running again
+}
+
+func (e *MirrorUnscannedError) Error() string {
+	return fmt.Sprintf("mirror withheld: %s, so the twip data this push would expose was NOT scanned for secrets\n"+
+		"  your own push is unaffected — twip refs were NOT mirrored to the remote (nothing unscanned left this machine)\n"+
+		"  fix: %s, then push again (deliberate bypass: %s=1)",
+		e.Reason, e.Fix, envSkipLeakScan)
+}
+
+// noScannerFix is the remedy offered when no secrets scanner can be resolved —
+// naming the mise route because a repo that pins the scanner in its toolchain
+// (and whose contributors therefore never install it globally) is the common
+// way to arrive here.
+const noScannerFix = "install betterleaks (or gitleaks) on PATH, or pin it in this repo's mise toolchain (`mise use betterleaks@latest`)"
+
 // gateMirrorPush scans exactly what this mirror push would newly expose — the
 // journal commits the remote lacks, and any pin/stash keep-refs not yet on the
 // remote (a pinned pre-rewrite commit is precisely where an amended-away secret
 // lives) — and returns a *MirrorBlockedError on findings so SyncPush withholds
 // the mirror.
 //
-// Robustness contract: the gate NEVER blocks for infrastructure reasons.
-// Missing scanners (neither betterleaks nor gitleaks on PATH), an unreachable
-// remote, or a scanner failure all fail open with a stderr note where useful —
-// a missed scan is recoverable (the remote-side full scan backstops; `twip
-// redact` fixes later), while a wrongly-withheld mirror is silent backup loss.
-// `twip doctor` reports whether a scanner is available so the fail-open state
-// is visible, and TWIP_SKIP_LEAK_SCAN=1 is the deliberate bypass for a real
-// finding. A journal already diverged from the remote (an unpropagated redact)
-// is not scanned: that push is rejected non-fast-forward regardless, so
-// nothing is about to be exposed.
+// Robustness contract: the gate FAILS CLOSED. Nothing is mirrored until a scan
+// has actually run and come back clean, so a missing scanner (neither
+// betterleaks nor gitleaks on PATH nor pinned in the repo's mise toolchain), an
+// unreachable remote, or a scanner failure each withhold the mirror with a
+// *MirrorUnscannedError naming the cause. It used to fail open, trading a
+// possible leak for uninterrupted backups; that trade is wrong here, because
+// the two outcomes are not symmetric — a withheld mirror is a local ref that
+// mirrors on the next push once the cause is fixed, while an unscanned mirror
+// publishes agent transcripts and worktree snapshots to the remote, where a
+// secret cannot be recalled. Silence made it worse: the fail-open path was
+// invisible at push time, so a developer without the scanner installed pushed
+// unscanned journals indefinitely without ever seeing a word about it.
+// TWIP_SKIP_LEAK_SCAN=1 remains the deliberate bypass, now for both outcomes.
+// A journal already diverged from the remote (an unpropagated redact) is still
+// not scanned: that push is rejected non-fast-forward regardless, so nothing is
+// about to be exposed.
 func (r *Recorder) gateMirrorPush(ctx context.Context, remote string) error {
 	if os.Getenv(envSkipLeakScan) == "1" {
 		return nil
 	}
-	sc, err := leaks.ResolveScanner("auto", "", "")
+	sc, err := leaks.ResolveScanner(ctx, r.RepoRoot, "auto", "", "")
 	if err != nil {
-		return nil // no scanner installed: fail open (doctor surfaces this state)
+		// The resolver's own error restates the "install one of these" advice the
+		// Fix line already gives, so state the condition plainly instead.
+		return &MirrorUnscannedError{
+			Reason: "neither betterleaks nor gitleaks is on PATH, and this repo's mise toolchain pins neither",
+			Fix:    noScannerFix,
+		}
 	}
 	cloneID, err := r.CloneID(ctx)
 	if err != nil {
-		return nil
+		return &MirrorUnscannedError{
+			Reason: fmt.Sprintf("this clone's journal id could not be read (%v), so the scan could not be scoped", err),
+			Fix:    "run `twip doctor` to diagnose the clone's twip state",
+		}
 	}
 	jref := journalRef(cloneID)
 	localTip, _ := gitutil.ResolveRef(ctx, r.RepoRoot, jref)
 	keepTips, err := r.keepRefTips(ctx)
 	if err != nil {
-		keepTips = nil
+		// Enumerating keep-refs is a local for-each-ref; if it fails we cannot
+		// tell which pins/stash the refspecs are about to publish.
+		return &MirrorUnscannedError{
+			Reason: fmt.Sprintf("this clone's pin/stash refs could not be listed (%v)", err),
+			Fix:    "run `twip doctor` to diagnose the clone's twip state",
+		}
 	}
 	if localTip == "" && len(keepTips) == 0 {
 		return nil // nothing to mirror, nothing to gate
@@ -238,8 +282,13 @@ func (r *Recorder) gateMirrorPush(ctx context.Context, remote string) error {
 	out, err := gitutil.Out(ctx, r.RepoRoot, "ls-remote", remote,
 		jref, PinRefPrefix+"*", StashRefPrefix+"*")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "twip: cannot reach %s to scope the mirror secrets scan; mirroring unscanned\n", remote)
-		return nil
+		// Without the remote's side we cannot tell new data from already-mirrored
+		// data. Scanning everything instead would be the wrong repair: the same
+		// unreachable remote is about to refuse the mirror push anyway.
+		return &MirrorUnscannedError{
+			Reason: fmt.Sprintf("%s could not be reached to scope the scan (%v)", remote, err),
+			Fix:    "restore access to the remote",
+		}
 	}
 	remoteTip := ""
 	remoteHas := map[string]bool{}
@@ -268,8 +317,10 @@ func (r *Recorder) gateMirrorPush(ctx context.Context, remote string) error {
 		if rng != "" {
 			findings, err := sc.Scan(ctx, r.RepoRoot, rng, cfg)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "twip: mirror secrets scan failed; mirroring unscanned: %v\n", err)
-				return nil
+				return &MirrorUnscannedError{
+					Reason: fmt.Sprintf("%s failed scanning the journal delta (%s): %v", sc.Name, rng, err),
+					Fix:    "repair the scanner installation (`twip doctor` reports which binary is in use)",
+				}
 			}
 			if len(findings) > 0 {
 				_, paths, rules := leaks.Distinct(findings)
@@ -291,8 +342,10 @@ func (r *Recorder) gateMirrorPush(ctx context.Context, remote string) error {
 		sort.Strings(newShas)
 		findings, err := sc.Scan(ctx, r.RepoRoot, "-m --no-walk=unsorted "+strings.Join(newShas, " "), cfg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "twip: keep-ref secrets scan failed; mirroring unscanned: %v\n", err)
-			return nil
+			return &MirrorUnscannedError{
+				Reason: fmt.Sprintf("%s failed scanning %d keep-ref(s) not yet on the remote: %v", sc.Name, len(newShas), err),
+				Fix:    "repair the scanner installation (`twip doctor` reports which binary is in use)",
+			}
 		}
 		if len(findings) > 0 {
 			_, paths, rules := leaks.Distinct(findings)

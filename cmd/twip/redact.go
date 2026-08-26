@@ -31,8 +31,10 @@ func newRedactCmd() *cobra.Command {
 			"journal over the remote's copy (safe — each clone is its journal's sole writer),\n" +
 			"plus deletion of dropped keep-refs there.\n\n" +
 			"The scanner defaults to betterleaks; pass --scanner gitleaks to use gitleaks instead, or\n" +
-			"--scanner auto to prefer betterleaks and fall back to gitleaks. A project .gitleaks.toml\n" +
-			"(or .betterleaks.toml) at the repo root is honored automatically.\n\n" +
+			"--scanner auto to prefer betterleaks and fall back to gitleaks. It is looked up on PATH\n" +
+			"and, failing that, in this repo's mise toolchain, so a repo that pins its scanner in\n" +
+			"mise.toml needs no separate install. A project .gitleaks.toml (or .betterleaks.toml) at\n" +
+			"the repo root is honored automatically.\n\n" +
 			"Redaction is NOT rotation: a secret an agent handled is compromised regardless, so rotate it.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
@@ -58,7 +60,7 @@ func newRedactCmd() *cobra.Command {
 			}
 			ref := store.JournalRefPrefix + cloneID
 
-			sc, err := leaks.ResolveScanner(mode, blBin, glBin)
+			sc, err := leaks.ResolveScanner(ctx, root, mode, blBin, glBin)
 			if err != nil {
 				return err
 			}
@@ -262,8 +264,8 @@ func newRedactCmd() *cobra.Command {
 	cmd.Flags().Bool("all", false, "scan the full journal history instead of only commits the sync remote doesn't have yet")
 	cmd.Flags().String("config", "", "scanner config (default: <repo>/.gitleaks.toml or .betterleaks.toml if present)")
 	cmd.Flags().String("scanner", "betterleaks", "secrets scanner: betterleaks (default), gitleaks, or auto (prefer betterleaks, fall back to gitleaks)")
-	cmd.Flags().String("betterleaks", "", "path to the betterleaks binary (default: betterleaks on PATH)")
-	cmd.Flags().String("gitleaks", "", "path to the gitleaks binary (default: gitleaks on PATH)")
+	cmd.Flags().String("betterleaks", "", "path to the betterleaks binary (default: betterleaks on PATH, else this repo's mise toolchain)")
+	cmd.Flags().String("gitleaks", "", "path to the gitleaks binary (default: gitleaks on PATH, else this repo's mise toolchain)")
 	return cmd
 }
 

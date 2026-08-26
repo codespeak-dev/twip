@@ -24,11 +24,13 @@ func newSyncPushCmd() *cobra.Command {
 		Long: "Mirrors refs/twip/{journal,pin,stash}/* to the given remote. Best-effort: " +
 			"a push failure is reported but never fails the command, so it is safe to wire " +
 			"into any pre-push hook (the bundled hook calls this for you).\n\n" +
-			"The mirror self-gates: when betterleaks or gitleaks is on PATH, the twip data this " +
-			"push would newly expose (journal commits the remote lacks, keep-refs not yet there) " +
-			"is scanned first, and on findings the mirror is withheld — fix with `twip redact`, " +
-			"bypass one push with TWIP_SKIP_LEAK_SCAN=1. With no scanner installed the mirror " +
-			"proceeds unscanned (`twip doctor` reports which state you're in).",
+			"The mirror self-gates and fails closed: the twip data this push would newly expose " +
+			"(journal commits the remote lacks, keep-refs not yet there) is scanned first, and " +
+			"nothing is mirrored unless that scan ran and came back clean. Findings mean `twip " +
+			"redact`; no scanner at all means installing betterleaks or gitleaks (twip finds it " +
+			"on PATH or in this repo's mise toolchain). Either way your own push is untouched " +
+			"and the twip refs simply stay local until the next push. TWIP_SKIP_LEAK_SCAN=1 " +
+			"mirrors anyway, once; `twip doctor` reports which scanner is in use.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -38,11 +40,15 @@ func newSyncPushCmd() *cobra.Command {
 			}
 			if err := store.New(root).SyncPush(ctx, args[0]); err != nil {
 				// Never block a push: report and exit 0. A withheld mirror is a
-				// deliberate gate outcome, not a failure — word it accordingly.
+				// deliberate gate outcome, not a failure — word it accordingly, and
+				// make it impossible to miss in a hook manager's output, since the
+				// whole point of withholding is that the user acts on it.
 				var blocked *store.MirrorBlockedError
-				if errors.As(err, &blocked) {
-					cmd.PrintErrf("twip: %v\n", err)
-				} else {
+				var unscanned *store.MirrorUnscannedError
+				switch {
+				case errors.As(err, &blocked), errors.As(err, &unscanned):
+					cmd.PrintErrln(banner(err.Error()))
+				default:
 					cmd.PrintErrf("twip: sync push failed: %v\n", err)
 				}
 			}

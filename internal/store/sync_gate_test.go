@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/leaks"
 )
 
 // writeGateStub installs a fake betterleaks at dir/betterleaks that logs argv
@@ -44,7 +45,8 @@ const gateStubReport = `[{"RuleID":"stub-rule","File":"worktree/leak.env","Commi
 // TestSyncPush_SelfGate walks the mirror gate through its states: findings in
 // the journal delta withhold the mirror, the bypass env mirrors anyway, a clean
 // scan is scoped to the delta and mirrors, findings in a new keep-ref withhold,
-// and a missing scanner fails open.
+// and — the fail-closed half — a missing scanner or an unreachable remote
+// withholds too, since neither yields a verdict.
 func TestSyncPush_SelfGate(t *testing.T) {
 	ctx := context.Background()
 	repo := initRepo(t)
@@ -77,6 +79,9 @@ func TestSyncPush_SelfGate(t *testing.T) {
 	origPath := os.Getenv("PATH")
 	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+origPath)
 	t.Setenv("TWIP_SKIP_LEAK_SCAN", "")
+	// Which scanner the gate finds must come from the stub on PATH, not from
+	// whatever the host's mise happens to pin.
+	t.Setenv(leaks.EnvNoMise, "1")
 
 	c1 := buildJournalCommit(t, repo, "", "event secret\n", "1700000000 +0000",
 		map[string]string{"worktree/leak.env": "TOKEN=" + fakeSecret + "\n"})
@@ -181,7 +186,9 @@ func TestSyncPush_SelfGate(t *testing.T) {
 		t.Errorf("already-mirrored pin re-scanned:\n%s", scannerArgs())
 	}
 
-	// No scanner on PATH: fail open — new (dirty) history mirrors unscanned.
+	// No scanner anywhere: fail CLOSED. New (dirty) history stays local — an
+	// unscanned mirror would publish it irretrievably, while a withheld one
+	// mirrors on the next push once a scanner is installed.
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
@@ -196,10 +203,96 @@ func TestSyncPush_SelfGate(t *testing.T) {
 	if err := gitutil.UpdateRef(ctx, repo, jref, c3, c2); err != nil {
 		t.Fatal(err)
 	}
+	err = rec.SyncPush(ctx, "origin")
+	var unscanned *MirrorUnscannedError
+	if !errors.As(err, &unscanned) {
+		t.Fatalf("expected MirrorUnscannedError with no scanner installed, got %v", err)
+	}
+	for _, want := range []string{"NOT scanned", "mise", "TWIP_SKIP_LEAK_SCAN"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("unscanned message missing %q:\n%s", want, err)
+		}
+	}
+	if sha, _ := gitutil.ResolveRef(ctx, bare, jref); sha != c2 {
+		t.Fatalf("scanner-less push mirrored unscanned history: remote=%s, want %s", sha, c2)
+	}
+	// The bypass still works when the scan cannot run at all — the one way to
+	// mirror without a verdict is to ask for it.
+	t.Setenv("TWIP_SKIP_LEAK_SCAN", "1")
 	if err := rec.SyncPush(ctx, "origin"); err != nil {
-		t.Fatalf("scanner-less push should fail open: %v", err)
+		t.Fatalf("bypassed scanner-less push failed: %v", err)
 	}
 	if sha, _ := gitutil.ResolveRef(ctx, bare, jref); sha != c3 {
-		t.Fatalf("fail-open push did not mirror: remote=%s", sha)
+		t.Fatalf("bypassed scanner-less push did not mirror: remote=%s", sha)
+	}
+	t.Setenv("TWIP_SKIP_LEAK_SCAN", "")
+
+	// An unreachable remote cannot be diffed, so the delta cannot be scoped and
+	// nothing is mirrored — same rule, different missing input.
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+origPath)
+	writeGateStub(t, stubDir, argsFile, "") // clean, if it ever ran
+	c4 := buildJournalCommit(t, repo, c3, "event after outage\n", "1700000300 +0000",
+		map[string]string{"worktree/after.txt": "fine\n"})
+	if err := gitutil.UpdateRef(ctx, repo, jref, c4, c3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitutil.Run(ctx, repo, nil, nil,
+		"remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git")); err != nil {
+		t.Fatal(err)
+	}
+	resetArgs()
+	err = rec.SyncPush(ctx, "origin")
+	if !errors.As(err, &unscanned) || !strings.Contains(err.Error(), "could not be reached") {
+		t.Fatalf("expected an unreachable-remote block, got %v", err)
+	}
+	if scannerArgs() != "" {
+		t.Errorf("an unscopable delta should not be scanned at all, got:\n%s", scannerArgs())
+	}
+}
+
+// TestSyncPush_ScannerFailureBlocks covers the third way the gate can reach no
+// verdict: a scanner that is installed but broken. Exit codes other than 0/1
+// are not findings and not "clean" — they are an absent answer, so the mirror
+// is withheld rather than sent unscanned.
+func TestSyncPush_ScannerFailureBlocks(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jref := JournalRefPrefix + cloneID
+
+	bare := t.TempDir()
+	if _, err := gitutil.Run(ctx, bare, nil, nil, "init", "-q", "--bare"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitutil.Run(ctx, repo, nil, nil, "remote", "add", "origin", bare); err != nil {
+		t.Fatal(err)
+	}
+
+	stubDir := t.TempDir()
+	broken := "#!/bin/sh\n[ \"$1\" = \"version\" ] && { echo stub 0.0.1; exit 0; }\necho boom >&2\nexit 2\n"
+	if err := os.WriteFile(filepath.Join(stubDir, "betterleaks"), []byte(broken), 0o755); err != nil { //nolint:gosec // test fixture
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TWIP_SKIP_LEAK_SCAN", "")
+	t.Setenv(leaks.EnvNoMise, "1")
+
+	c1 := buildJournalCommit(t, repo, "", "event\n", "1700000000 +0000",
+		map[string]string{"worktree/leak.env": "TOKEN=" + fakeSecret + "\n"})
+	if err := gitutil.UpdateRef(ctx, repo, jref, c1, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	err = rec.SyncPush(ctx, "origin")
+	var unscanned *MirrorUnscannedError
+	if !errors.As(err, &unscanned) || !strings.Contains(err.Error(), "journal delta") {
+		t.Fatalf("expected a scan-failure block, got %v", err)
+	}
+	if sha, _ := gitutil.ResolveRef(ctx, bare, jref); sha != "" {
+		t.Fatalf("broken scanner still mirrored: %s", sha)
 	}
 }

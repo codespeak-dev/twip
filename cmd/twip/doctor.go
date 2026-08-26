@@ -144,7 +144,9 @@ func gitPathScan(shimDir string) (firstGit string, firstPos, shimPos int) {
 // the journal quietly stops backing up. Doctor is where that silence becomes
 // visible. Two probes: the pending-propagation marker a local-only redaction
 // records (works offline), and a live divergence check against the sync remote
-// (skipped with --offline). Both suggest `twip redact --propagate`.
+// (skipped with --offline). Both suggest `twip redact --propagate`. It also
+// reports the mirror's secrets scanner, the other way pushes stop mirroring:
+// the gate fails closed, so no scanner means no mirror.
 func checkJournalSync(ctx context.Context, out io.Writer, offline bool) bool {
 	root, err := repoRoot(ctx)
 	if err != nil {
@@ -156,17 +158,25 @@ func checkJournalSync(ctx context.Context, out io.Writer, offline bool) bool {
 		fmt.Fprintln(out, "  • twip not enabled in this repo")
 		return true
 	}
-	// The mirror's secrets gate fails open without a scanner — make that state
-	// visible here rather than letting it pass silently. Informational, not a
-	// problem: fail-open is the designed behavior.
-	if sc, err := leaks.ResolveScanner("auto", "", ""); err == nil {
+	// The mirror's secrets gate fails closed, so a missing scanner is not a
+	// footnote — it stops the journal reaching the remote at all. Report it as a
+	// problem with the fix, and name the resolved binary otherwise so a scanner
+	// coming from the repo's mise toolchain rather than PATH is visible too.
+	// Every check below this point reports on top of that verdict, hence `ok`
+	// rather than an early return: a repo can be missing the scanner AND have a
+	// stranded journal, and one hiding the other is how these go unnoticed.
+	ok := true
+	if sc, err := leaks.ResolveScanner(ctx, root, "auto", "", ""); err == nil {
 		if v := sc.Version(ctx); v != "" {
-			fmt.Fprintf(out, "  ✓ mirror secrets gate active: %s (%s)\n", sc.Name, v)
+			fmt.Fprintf(out, "  ✓ mirror secrets gate active: %s (%s) at %s\n", sc.Name, v, sc.Bin)
 		} else {
-			fmt.Fprintf(out, "  ✓ mirror secrets gate active: %s (version unknown — check the binary if pushes misbehave)\n", sc.Name)
+			fmt.Fprintf(out, "  ✓ mirror secrets gate active: %s at %s (version unknown — check the binary if pushes misbehave)\n", sc.Name, sc.Bin)
 		}
 	} else {
-		fmt.Fprintln(out, "  ⚠ no secrets scanner (betterleaks or gitleaks) on PATH — twip data mirrors unscanned; only a remote-side scan can catch journal secrets")
+		fmt.Fprintln(out, "  ✗ no secrets scanner (betterleaks or gitleaks) on PATH or in this repo's mise toolchain — the mirror gate fails closed, so twip refs are NOT being pushed to the remote")
+		fmt.Fprintln(out, "      fix: install betterleaks (or gitleaks), or pin it in this repo's mise toolchain (`mise use betterleaks@latest`)")
+		fmt.Fprintln(out, "      to mirror unscanned anyway: TWIP_SKIP_LEAK_SCAN=1 git push")
+		ok = false
 	}
 	// A dangling journal head (the ref's commit object was lost underneath it —
 	// external prune/sandbox) breaks more than twip: the user's own `git fetch`,
@@ -187,20 +197,20 @@ func checkJournalSync(ctx context.Context, out io.Writer, offline bool) bool {
 	remote := rec.SyncRemote(ctx)
 	if remote == "" {
 		fmt.Fprintln(out, "  • no sync remote configured")
-		return true
+		return ok
 	}
 	if offline {
 		fmt.Fprintln(out, "  • divergence check skipped: --offline")
-		return true
+		return ok
 	}
 	diverged, localTip, remoteTip, err := rec.JournalDiverged(ctx, remote)
 	switch {
 	case err != nil:
 		fmt.Fprintf(out, "  ? could not compare the journal with %s: %v\n", remote, err)
-		return true // unreachable remote is not a local problem
+		return ok // unreachable remote is not a local problem
 	case localTip == "":
 		fmt.Fprintln(out, "  • no journal recorded yet")
-		return true
+		return ok
 	case diverged:
 		fmt.Fprintf(out, "  ✗ journal diverged from %s (local %s, remote %s) — mirror pushes are failing silently\n",
 			remote, short(localTip), short(remoteTip))
@@ -209,10 +219,10 @@ func checkJournalSync(ctx context.Context, out io.Writer, offline bool) bool {
 		return false
 	case remoteTip == "":
 		fmt.Fprintf(out, "  ✓ journal not pushed to %s yet (the next push mirrors it)\n", remote)
-		return true
+		return ok
 	default:
 		fmt.Fprintf(out, "  ✓ journal fast-forwards to %s\n", remote)
-		return true
+		return ok
 	}
 }
 

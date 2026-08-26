@@ -1,9 +1,9 @@
 // Package leaks wraps the secrets scanners twip drives — betterleaks and
 // gitleaks (betterleaks is a gitleaks fork; they share the `detect` subcommand,
-// flag surface, and JSON finding schema). It resolves an installed binary,
-// honors a project config, and runs a scan over an arbitrary `git log` range.
-// Shared by `twip redact` (find + rewrite) and the sync mirror's self-gate
-// (find + withhold).
+// flag surface, and JSON finding schema). It resolves an installed binary —
+// from PATH, or from the repo's own mise-pinned toolchain — honors a project
+// config, and runs a scan over an arbitrary `git log` range. Shared by `twip
+// redact` (find + rewrite) and the sync mirror's self-gate (find + withhold).
 package leaks
 
 import (
@@ -40,34 +40,35 @@ type Scanner struct {
 // betterleaks is the default; "gitleaks" forces the classic scanner; "auto"
 // prefers betterleaks and falls back to gitleaks (erroring only when neither is
 // present). Each explicit mode reports which dependency is missing — and how to
-// reach the other scanner — rather than failing opaquely.
-func ResolveScanner(mode, betterleaksBin, gitleaksBin string) (Scanner, error) {
+// reach the other scanner — rather than failing opaquely. dir is the repo whose
+// toolchain manager may supply the scanner (see miseWhich); pass the repo root.
+func ResolveScanner(ctx context.Context, dir, mode, betterleaksBin, gitleaksBin string) (Scanner, error) {
 	switch mode {
 	case "", "betterleaks":
-		bin, err := lookScanner("betterleaks", betterleaksBin, "gitleaks")
+		bin, err := lookScanner(ctx, dir, "betterleaks", betterleaksBin, "gitleaks")
 		return Scanner{"betterleaks", bin}, err
 	case "gitleaks":
-		bin, err := lookScanner("gitleaks", gitleaksBin, "betterleaks")
+		bin, err := lookScanner(ctx, dir, "gitleaks", gitleaksBin, "betterleaks")
 		return Scanner{"gitleaks", bin}, err
 	case "auto":
-		if bin, err := lookScanner("betterleaks", betterleaksBin, ""); err == nil {
+		if bin, err := lookScanner(ctx, dir, "betterleaks", betterleaksBin, ""); err == nil {
 			return Scanner{"betterleaks", bin}, nil
 		}
-		if bin, err := lookScanner("gitleaks", gitleaksBin, ""); err == nil {
+		if bin, err := lookScanner(ctx, dir, "gitleaks", gitleaksBin, ""); err == nil {
 			return Scanner{"gitleaks", bin}, nil
 		}
 		return Scanner{}, fmt.Errorf("--scanner auto: neither betterleaks nor gitleaks found on PATH " +
-			"(install one, or pass --betterleaks/--gitleaks <path>)")
+			"or in this repo's mise toolchain (install one, or pass --betterleaks/--gitleaks <path>)")
 	default:
 		return Scanner{}, fmt.Errorf("unknown --scanner %q (want: betterleaks, gitleaks, or auto)", mode)
 	}
 }
 
 // lookScanner resolves a scanner binary: the explicit path if given (verified
-// to exist and be a runnable file), else the name on PATH. When it is missing
-// the error names the tool to install and, if alt is set, the --scanner value
-// that selects the other tool.
-func lookScanner(name, explicit, alt string) (string, error) {
+// to exist and be a runnable file), else the name on PATH, else the copy dir's
+// mise toolchain pins for us. When it is missing the error names the tool to
+// install and, if alt is set, the --scanner value selecting the other tool.
+func lookScanner(ctx context.Context, dir, name, explicit, alt string) (string, error) {
 	if explicit != "" {
 		fi, err := os.Stat(explicit)
 		if err != nil || fi.IsDir() {
@@ -75,14 +76,101 @@ func lookScanner(name, explicit, alt string) (string, error) {
 		}
 		return explicit, nil
 	}
-	p, err := exec.LookPath(name)
-	if err == nil {
+	if p, err := exec.LookPath(name); err == nil {
+		return p, nil
+	}
+	if p := miseWhich(ctx, dir, name); p != "" {
 		return p, nil
 	}
 	if alt != "" {
-		return "", fmt.Errorf("%s not found on PATH (install it, pass --%s <path>, or run with --scanner %s)", name, name, alt)
+		return "", fmt.Errorf("%s not found on PATH or in this repo's mise toolchain "+
+			"(install it, pass --%s <path>, or run with --scanner %s)", name, name, alt)
 	}
-	return "", fmt.Errorf("%s not found on PATH (install it, or pass --%s <path>)", name, name)
+	return "", fmt.Errorf("%s not found on PATH or in this repo's mise toolchain "+
+		"(install it, or pass --%s <path>)", name, name)
+}
+
+// miseWhich asks mise for the scanner dir's own project pins, and returns its
+// absolute path ("" when mise cannot supply it).
+//
+// A repo that pins its toolchain with mise (spindle pins betterleaks there)
+// only puts that binary on PATH inside a shell where mise is activated. twip's
+// scans mostly run somewhere else: the mirror's secrets gate fires from a
+// pre-push hook that git — or a hook manager, or a GUI client — launched with
+// whatever environment it had, and a lefthook job invoking `twip sync push`
+// directly is not wrapped in `mise exec` the way its `mise run …` siblings are.
+// A PATH-only lookup therefore reports "no scanner installed" in exactly the
+// repos that ship one, silently downgrading the gate.
+//
+// `mise which` resolves the binary from the config governing dir without
+// needing activation and without installing anything, so this stays a pure
+// lookup. It exits non-zero when the tool is not pinned there, is pinned but
+// not yet installed, or the config is untrusted — each an honest "unavailable",
+// which the caller reports as a missing scanner.
+func miseWhich(ctx context.Context, dir, name string) string {
+	if dir == "" || os.Getenv(EnvNoMise) == "1" {
+		return ""
+	}
+	mise := miseBin()
+	if mise == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	c := exec.CommandContext(ctx, mise, "which", name)
+	c.Dir = dir
+	// TWIP_SHIM_ACTIVE so any git mise runs underneath passes through the shim
+	// unrecorded, as with Scan.
+	c.Env = append(os.Environ(), "TWIP_SHIM_ACTIVE=1")
+	out, err := c.Output()
+	if err != nil {
+		return ""
+	}
+	p := strings.TrimSpace(string(out))
+	if p == "" {
+		return ""
+	}
+	if fi, err := os.Stat(p); err != nil || fi.IsDir() || fi.Mode()&0o111 == 0 {
+		return ""
+	}
+	return p
+}
+
+// EnvNoMise opts out of the mise lookup entirely, leaving scanner resolution to
+// PATH and explicit paths. For a machine where mise is installed but should not
+// be consulted — an untrusted repo config, or simply not wanting a subprocess
+// in a hot hook path — and for tests that must not depend on the host's mise
+// state.
+const EnvNoMise = "TWIP_NO_MISE"
+
+// miseBin locates the mise binary. PATH first, then the paths its installers
+// use — the hook environments this matters most in (GUI git clients, hook
+// managers) are precisely the ones whose PATH never picked mise up either.
+func miseBin() string {
+	if p, err := exec.LookPath("mise"); err == nil {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	candidates := []string{
+		"/usr/local/bin/mise",
+		"/opt/homebrew/bin/mise", // homebrew on apple silicon
+		"/usr/bin/mise",          // distro package
+	}
+	if home != "" {
+		candidates = append([]string{
+			filepath.Join(home, ".local", "bin", "mise"),
+			filepath.Join(home, ".local", "share", "mise", "bin", "mise"),
+		}, candidates...)
+	}
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+			return c
+		}
+	}
+	return ""
 }
 
 // ResolveConfig finds a project scanner config at the repo root, honoring the

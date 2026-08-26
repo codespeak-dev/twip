@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/codespeak-dev/twip/internal/gitutil"
+	"github.com/codespeak-dev/twip/internal/leaks"
 	"github.com/codespeak-dev/twip/internal/store"
 )
 
@@ -131,14 +133,32 @@ func TestLatestModuleVersion(t *testing.T) {
 	}
 }
 
+// stubScanner puts a fake betterleaks first on PATH (and skips the mise
+// lookup), so a doctor check reports a scanner regardless of what the machine
+// running the suite has installed.
+func stubScanner(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "betterleaks")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho 'betterleaks 1.2.3'\n"), 0o755); err != nil { //nolint:gosec // test fixture
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(leaks.EnvNoMise, "1")
+	return bin
+}
+
 // TestCheckJournalSync covers the stranded-journal diagnosis: fast-forwardable
 // and unpushed journals are healthy; a diverged journal (a local redact of
 // pushed history) or a pending-propagation marker is a problem that points at
-// `twip redact --propagate`; --offline degrades to the marker check only.
+// `twip redact --propagate`; --offline degrades to the marker check only. The
+// mirror's secrets scanner is reported alongside, since the gate fails closed
+// and a missing scanner stops the journal mirroring just as surely.
 func TestCheckJournalSync(t *testing.T) {
 	repo := e2eInitRepo(t)
 	t.Chdir(repo)
 	ctx := context.Background()
+	scannerBin := stubScanner(t)
 
 	run := func(offline bool) (bool, string) {
 		var b bytes.Buffer
@@ -190,9 +210,43 @@ func TestCheckJournalSync(t *testing.T) {
 	if _, err := gitutil.Run(ctx, repo, nil, nil, "push", "-q", "origin", c0+":"+ref); err != nil {
 		t.Fatal(err)
 	}
-	if ok, out := run(false); !ok || !strings.Contains(out, "fast-forwards") {
+	ok, out := run(false)
+	if !ok || !strings.Contains(out, "fast-forwards") {
 		t.Errorf("fast-forwardable: ok=%v out=%q", ok, out)
 	}
+	// The healthy report names the scanner and where it came from, so a binary
+	// resolved from a repo's mise toolchain rather than PATH is visible.
+	for _, want := range []string{"secrets gate active", "betterleaks 1.2.3", scannerBin} {
+		if !strings.Contains(out, want) {
+			t.Errorf("scanner report missing %q:\n%s", want, out)
+		}
+	}
+
+	// No scanner at all: the mirror gate now fails closed, so this is a problem
+	// doctor must fail on, not a footnote — and it must not mask the healthy
+	// journal verdict printed alongside it.
+	t.Run("no scanner", func(t *testing.T) {
+		// git only — doctor still has to reach the repo to report on it.
+		realGit, err := exec.LookPath("git")
+		if err != nil {
+			t.Fatal(err)
+		}
+		gitOnly := t.TempDir()
+		if err := os.Symlink(realGit, filepath.Join(gitOnly, "git")); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", gitOnly)
+		t.Setenv(leaks.EnvNoMise, "1")
+		ok, out := run(false)
+		if ok {
+			t.Errorf("missing scanner should be a doctor problem:\n%s", out)
+		}
+		for _, want := range []string{"no secrets scanner", "mise", "NOT being pushed", "TWIP_SKIP_LEAK_SCAN"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("missing-scanner report lacks %q:\n%s", want, out)
+			}
+		}
+	})
 
 	// Diverged (a local rewrite of pushed history): a problem with the fix named.
 	rewritten, err := gitutil.CommitTree(ctx, repo, tree, "", "e0-redacted")

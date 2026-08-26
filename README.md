@@ -118,12 +118,17 @@ unavailable, so it can never break git.
 **Sharing across the team.** Push rides on normal git: `twip init` installs a best-effort `pre-push`
 hook (which calls `twip sync push`, pushing with `--no-verify` so it never re-runs your other
 pre-push checks) that mirrors your journal to the remote you push to. The mirror **self-gates**:
-when betterleaks or gitleaks is on PATH, the twip data a push would newly expose (journal commits
-the remote lacks, keep-refs not yet there) is scanned first, and on findings the mirror is withheld
-with a fix-it message (`twip redact`) while your own push proceeds untouched — no hook wiring or
-ordering can route around it, since the gate lives inside the mirror itself. Without a scanner the
-mirror proceeds unscanned (`twip doctor` shows which state you're in); `TWIP_SKIP_LEAK_SCAN=1`
-deliberately bypasses one push. If a hook manager already owns
+the twip data a push would newly expose (journal commits the remote lacks, keep-refs not yet there)
+is scanned first, and nothing is mirrored unless that scan ran and came back clean — no hook wiring
+or ordering can route around it, since the gate lives inside the mirror itself. The gate **fails
+closed**: findings withhold the mirror with a fix-it message (`twip redact`), and so does *not
+being able to scan at all* — no scanner installed, an unreachable remote, a broken scanner — because
+"unknown" is not "clean", and a mirror that has already published a secret cannot be recalled.
+Either way your own push proceeds untouched and the refs simply mirror on a later push once the
+cause is fixed. The scanner is found on PATH or, failing that, in the repo's **mise** toolchain, so
+a repo that pins betterleaks in `mise.toml` is covered even when the hook runs outside an activated
+shell (`twip doctor` names the binary in use; `TWIP_NO_MISE=1` skips the mise lookup).
+`TWIP_SKIP_LEAK_SCAN=1` deliberately mirrors anyway, once. If a hook manager already owns
 `pre-push` (lefthook, husky, pre-commit), twip detects it, leaves it untouched, and prints the exact
 config to add — wiring `twip sync push` (and, with `--enforce`, `twip check pre-push`) into the
 manager.
@@ -140,8 +145,9 @@ line, a prompt, or a worktree snapshot — and an all-refs secrets gate blocks y
 scans this clone's journal and rewrites it in place, replacing each flagged secret with a placeholder
 (the clean prefix is kept verbatim, so an already-pushed prefix stays a fast-forward). It scans with
 **betterleaks** by default; `--scanner gitleaks` uses gitleaks instead, and `--scanner auto` prefers
-betterleaks and falls back to gitleaks (each mode checks for its binary and, if missing, tells you how
-to get the other). A project `.gitleaks.toml`/`.betterleaks.toml` at the repo root is honored
+betterleaks and falls back to gitleaks (each mode looks on PATH, then in the repo's mise toolchain,
+and if still missing tells you how to get the other). A project `.gitleaks.toml`/`.betterleaks.toml`
+at the repo root is honored
 automatically, and `--dry-run` previews without rewriting. Redaction is *not* rotation — treat any
 exposed secret as compromised and rotate it.
 
