@@ -12,8 +12,10 @@ package claudecode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -94,7 +96,6 @@ type postToolUseRaw struct {
 	ToolInput json.RawMessage `json:"tool_input"`
 }
 
-
 // ParseHookEvent translates a Claude Code hook firing into a normalized Event,
 // reading transcript deltas (relative to `prior`) for the events that carry them.
 func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Reader, prior agent.Cursor) (*agent.Event, error) {
@@ -105,18 +106,29 @@ func (a *Agent) ParseHookEvent(_ context.Context, hookName string, stdin io.Read
 		if err != nil {
 			return nil, err
 		}
-		// Baseline the cursor at the transcript's current length so a resumed
-		// session does not re-capture history recorded under the prior session.
-		cur := prior.Clone()
-		if n, err := countLines(raw.TranscriptPath); err == nil {
-			cur.Main = n
-		}
-		return &agent.Event{
+		ev := &agent.Event{
 			SessionID: raw.SessionID,
 			Kind:      agent.KindSessionStart,
 			Model:     raw.Model,
-			Cursor:    cur,
-		}, nil
+			Cursor:    prior.Clone(),
+		}
+		if raw.TranscriptPath == "" {
+			return ev, nil
+		}
+		data, err := os.ReadFile(raw.TranscriptPath)
+		if errors.Is(err, os.ErrNotExist) {
+			return ev, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read session-start transcript: %w", err)
+		}
+		delta, total, truncated := agent.DeltaFrom(data, prior.Main)
+		if truncated {
+			return nil, fmt.Errorf("session-start transcript has %d lines, before recorded cursor %d", total, prior.Main)
+		}
+		ev.Transcript = agent.Delta{Bytes: delta, From: prior.Main, To: total, Quality: agent.QualityOK}
+		ev.Cursor.Main = total
+		return ev, nil
 
 	case hookUserPrompt:
 		raw, err := hookutil.ParseStdin[userPromptRaw](stdin)
@@ -189,7 +201,6 @@ func toolDetail(tool string, input json.RawMessage) string {
 	}
 	return ""
 }
-
 
 // parseTranscriptEvent handles Stop and SessionEnd: wait for the async flush,
 // then read the main-transcript delta since the prior cursor.
