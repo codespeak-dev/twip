@@ -16,20 +16,35 @@ import (
 
 const fakeSecret = "ghp_0A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r"
 
+// treeFile is one entry for buildJournalCommitModes: content plus the git mode it
+// is recorded with.
+type treeFile struct{ mode, content string }
+
 // buildJournalCommit assembles a commit with the given tree files, parent, message
 // and a distinctive author/date (so the test can prove identity is preserved across a
 // redaction rewrite). Returns the new commit sha.
 func buildJournalCommit(t *testing.T, repo, parent, msg, date string, files map[string]string) string {
 	t.Helper()
+	entries := make(map[string]treeFile, len(files))
+	for path, content := range files {
+		entries[path] = treeFile{mode: "100644", content: content}
+	}
+	return buildJournalCommitModes(t, repo, parent, msg, date, entries)
+}
+
+// buildJournalCommitModes is buildJournalCommit with explicit modes, for the cases
+// that care what a rewrite does to an executable or otherwise non-plain entry.
+func buildJournalCommitModes(t *testing.T, repo, parent, msg, date string, files map[string]treeFile) string {
+	t.Helper()
 	ctx := context.Background()
 	idx := filepath.Join(t.TempDir(), "idx")
 	env := []string{"GIT_INDEX_FILE=" + idx}
-	for path, content := range files {
-		sha, err := gitutil.HashObject(ctx, repo, []byte(content))
+	for path, f := range files {
+		sha, err := gitutil.HashObject(ctx, repo, []byte(f.content))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := gitutil.Run(ctx, repo, env, nil, "update-index", "--add", "--cacheinfo", "100644,"+sha+","+path); err != nil {
+		if _, err := gitutil.Run(ctx, repo, env, nil, "update-index", "--add", "--cacheinfo", f.mode+","+sha+","+path); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -991,5 +1006,132 @@ func TestRedactJournal_ReportsPreExistingStaleWorktreeRecord(t *testing.T) {
 	// And the redaction still did its job.
 	if reachableObjectsContain(t, repo, res.NewTip, fakeSecret) {
 		t.Error("secret still reachable after redaction")
+	}
+}
+
+// TestRedactJournal_PreservesFileMode: the rewrite stages every redacted path
+// through ONE update-index batch, and each entry has to carry the mode the
+// original tree recorded. An executable snapshot file coming back as a plain file
+// would make the restored worktree silently unrunnable, and a symlink entry
+// turning into a regular file would corrupt the snapshot outright.
+func TestRedactJournal_PreservesFileMode(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c0 := buildJournalCommitModes(t, repo, "", "e0 exec snapshot\n", "1700000000 +0000",
+		map[string]treeFile{
+			"worktree/run.sh": {mode: "100755", content: "#!/bin/sh\nexport TOKEN=" + fakeSecret + "\n"},
+			"meta/event.json": {mode: "100644", content: `{"schema":1,"kind":"session-start"}`},
+		})
+	ref := JournalRefPrefix + cloneID
+	if err := gitutil.UpdateRef(ctx, repo, ref, c0, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := rec.RedactJournal(ctx, cloneID, []string{fakeSecret}, []string{"worktree/run.sh"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RedactedCommits != 1 {
+		t.Fatalf("RedactedCommits = %d, want 1", res.RedactedCommits)
+	}
+	if reachableObjectsContain(t, repo, ref, fakeSecret) {
+		t.Error("secret still reachable after redaction")
+	}
+	out, err := gitutil.Out(ctx, repo, "ls-tree", res.NewTip, "--", "worktree/run.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(out, "100755 ") {
+		t.Errorf("redacted entry = %q, want mode 100755 preserved", out)
+	}
+}
+
+// TestRedactJournal_RewriteBaseNamesTheUntouchedPrefix: RewriteBase is what lets
+// the caller verify exactly what changed (RewriteBase..NewTip) instead of
+// re-scanning the whole journal, so it must name the last commit the rewrite left
+// alone — and be empty only when the rewrite reached the root.
+func TestRedactJournal_RewriteBaseNamesTheUntouchedPrefix(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c0 := buildJournalCommit(t, repo, "", "e0 clean\n", "1700000000 +0000",
+		map[string]string{"meta/transcript.jsonl": "clean start\n"})
+	c1 := buildJournalCommit(t, repo, c0, "e1 leak\n", "1700000100 +0000",
+		map[string]string{"meta/transcript.jsonl": "token " + fakeSecret + "\n"})
+	c2 := buildJournalCommit(t, repo, c1, "e2 clean again\n", "1700000200 +0000",
+		map[string]string{"meta/transcript.jsonl": "moved on\n"})
+	ref := JournalRefPrefix + cloneID
+	if err := gitutil.UpdateRef(ctx, repo, ref, c2, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := rec.RedactJournal(ctx, cloneID, []string{fakeSecret}, []string{"meta/transcript.jsonl"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.EarliestAffected != c1 {
+		t.Errorf("EarliestAffected = %s, want %s", res.EarliestAffected, c1)
+	}
+	if res.RewriteBase != c0 {
+		t.Errorf("RewriteBase = %s, want the untouched prefix commit %s", res.RewriteBase, c0)
+	}
+	// RewriteBase..NewTip must be exactly the rebuilt commits.
+	out, err := gitutil.Out(ctx, repo, "rev-list", "--count", res.RewriteBase+".."+res.NewTip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != fmt.Sprint(res.RewrittenCommits) {
+		t.Errorf("rev-list %s..%s counted %s, want RewrittenCommits = %d",
+			shortSHA(res.RewriteBase), shortSHA(res.NewTip), out, res.RewrittenCommits)
+	}
+}
+
+// TestRedactJournal_ReportsProgress: a redaction of a real journal is minutes of
+// silence, and the only thing distinguishing that from a hang is what these phases
+// report. Each must report, and each must reach its total — an indicator stuck at
+// 99% is its own kind of lie.
+func TestRedactJournal_ReportsProgress(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	rec := New(repo)
+	cloneID, err := rec.CloneID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c0 := buildJournalCommit(t, repo, "", "e0 clean\n", "1700000000 +0000",
+		map[string]string{"meta/transcript.jsonl": "clean\n"})
+	c1 := buildJournalCommit(t, repo, c0, "e1 leak\n", "1700000100 +0000",
+		map[string]string{"meta/transcript.jsonl": "token " + fakeSecret + "\n"})
+	ref := JournalRefPrefix + cloneID
+	if err := gitutil.UpdateRef(ctx, repo, ref, c1, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	last := map[string][2]int{}
+	rec.Progress = func(phase string, done, total int) { last[phase] = [2]int{done, total} }
+	if _, err := rec.RedactJournal(ctx, cloneID, []string{fakeSecret}, []string{"meta/transcript.jsonl"}, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{PhaseLocate, PhaseRead, PhaseRewrite} {
+		got, ok := last[phase]
+		if !ok {
+			t.Errorf("phase %q reported nothing", phase)
+			continue
+		}
+		if got[1] == 0 || got[0] != got[1] {
+			t.Errorf("phase %q ended at %d/%d, want done == total > 0", phase, got[0], got[1])
+		}
 	}
 }

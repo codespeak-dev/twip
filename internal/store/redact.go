@@ -27,6 +27,7 @@ type RedactResult struct {
 	OldTip               string   // journal tip before the rewrite
 	NewTip               string   // journal tip after the rewrite ("" on dry-run)
 	EarliestAffected     string   // oldest original commit that contained a secret
+	RewriteBase          string   // last untouched prefix commit ("" when the rewrite reached the root); RewriteBase..NewTip is exactly what changed
 	AlreadyPushed        bool     // EarliestAffected is reachable from origin's mirror (local redaction can't undo that)
 	DroppedMirrors       []string // own-journal mirror refs deleted because they retained the pre-redaction chain (would-drop on dry-run)
 	StaleWorktreeRecords []string // re-parented commits whose event record already disagreed with its snapshot (left untouched; see RedactJournal)
@@ -78,82 +79,46 @@ func (r *Recorder) RedactJournal(ctx context.Context, cloneID string, secrets, p
 		return res, err
 	}
 
-	newParent := "" // tracks the rewritten parent; for the unaffected prefix it stays the original sha
-	started := false
-	var reparented []string         // rewritten commits with no redacted bytes (tree reused verbatim)
-	var metas map[string]commitMeta // batch-loaded on the first rebuilt commit
-	for i, c := range ordered {
-		changes := map[string]string{} // path -> redacted blob sha
-		for _, p := range paths {
-			if b := plan.blobs[plan.at[c+":"+p]]; b != nil {
-				changes[p] = b.newSHA
-			}
-		}
-		if !started {
-			if len(changes) == 0 {
-				newParent = c // unaffected prefix commit: it becomes the base parent, kept verbatim
-				continue
-			}
-			started = true
-			res.EarliestAffected = c
-		}
+	// Where the rewrite starts: the untouched prefix keeps its commits verbatim,
+	// which is what leaves an already-pushed prefix a fast-forward.
+	rewriteFrom := plan.firstAffected(len(ordered))
+	if rewriteFrom == len(ordered) {
+		res.NewTip = oldTip // the scanner flagged something we couldn't locate in the chain
+		return res, nil
+	}
+	res.EarliestAffected = ordered[rewriteFrom]
+	if rewriteFrom > 0 {
+		res.RewriteBase = ordered[rewriteFrom-1]
+	}
+	// Counting needs no git work at all — the plan already knows which commits
+	// carry secret bytes — so a dry run stops here.
+	var dryReparented []string
+	for i := rewriteFrom; i < len(ordered); i++ {
 		res.RewrittenCommits++
-		if len(changes) > 0 {
+		redacted := false
+		for j := range paths {
+			if _, affected := plan.change(i, j); affected {
+				redacted = true
+				break
+			}
+		}
+		if redacted {
 			res.RedactedCommits++
+		} else if dryRun {
+			dryReparented = append(dryReparented, ordered[i]) // nothing rewritten: the original is what exists
 		}
-		if dryRun {
-			if len(changes) == 0 {
-				reparented = append(reparented, c) // nothing rewritten yet: the original is what exists
-			}
-			continue
-		}
-		if metas == nil {
-			// First commit that actually needs rebuilding: read the identity of it
-			// and every commit after it in ONE pass, rather than a cat-file per
-			// commit. Deferred to here so the untouched prefix costs nothing.
-			if metas, err = r.commitMetas(ctx, ordered[i:]); err != nil {
-				return res, err
-			}
-		}
-		meta, ok := metas[c]
-		if !ok {
-			return res, fmt.Errorf("commit %s vanished from the journal mid-redaction", c)
-		}
+	}
 
-		// A commit with no redacted bytes is a pure re-parent: its tree is unchanged,
-		// so it needs neither a rebuild nor a worktree_tree sync (that sync exists to
-		// follow a redaction-induced subtree change, and there was none). Reusing the
-		// original tree is what makes re-parenting the long tail after an old secret
-		// cheap — those commits now cost one commit-tree each instead of five calls.
-		newTree := meta.tree
-		if len(changes) > 0 {
-			if newTree, err = r.rebuildTree(ctx, c, changes); err != nil {
-				return res, err
-			}
-			// Redacting a worktree/ blob changes the worktree subtree's sha; the
-			// event record's worktree_tree must follow it or every later audit
-			// reports the snapshot as corrupt.
-			if newTree, err = r.syncRecordedWorktree(ctx, newTree); err != nil {
-				return res, err
-			}
-		}
-		newSha, err := r.commitTreePreserving(ctx, newTree, newParent, meta)
+	reparented := dryReparented
+	newParent := res.RewriteBase
+	if !dryRun {
+		out, err := r.rewriteChain(ctx, cloneID, ordered, paths, &plan, rewriteFrom, res.RewriteBase)
 		if err != nil {
 			return res, err
 		}
-		if len(changes) == 0 {
-			// Record the REWRITTEN sha: the original is about to leave the journal,
-			// so naming it would point the user at a commit they can no longer look
-			// up — and `twip audit` will name this one.
-			reparented = append(reparented, newSha)
-		}
-		newParent = newSha
+		newParent, reparented = out.newTip, out.reparented
 	}
 
-	if !started {
-		res.NewTip = oldTip // gitleaks flagged something we couldn't locate in the chain; ref unchanged
-		return res, nil
-	}
 	// Re-parented commits keep their tree verbatim, so a record that already
 	// disagreed with its snapshot stays that way. Report those so the rewrite never
 	// silently changes recorded provenance NOR silently leaves a known problem
@@ -183,16 +148,100 @@ type redactedBlob struct {
 	newSHA string // the written redacted blob ("" on a dry run, which writes nothing)
 }
 
-// redactionPlan maps the journal onto the distinct blobs behind it: at["<commit>:<path>"]
-// is the blob sitting at that path in that commit, and blobs[oid] is non-nil only
-// for the blobs that redacting actually changes. A commit is therefore affected
-// iff one of its paths resolves to a blob present in blobs.
+// redactionPlan maps the journal onto the distinct blobs behind it: at[i*paths+j]
+// indexes the distinct blob sitting at path j in commit i (absent = -1), and
+// redacted[k] is non-nil only for the distinct blobs that redacting actually
+// changes. A commit is therefore affected iff one of its paths resolves to a
+// blob with a redaction.
+//
+// The (commit, path) grid is a flat []int32 rather than a map keyed by
+// "<commit>:<path>". It is the one structure here that grows with the LENGTH OF
+// HISTORY times the number of flagged paths, and the map form spent ~120 bytes
+// on each cell — a 40-byte key string, a 40-byte value string and the bucket
+// around them — which on a half-million-commit journal ran to gigabytes of
+// resident memory before the rewrite had rebuilt a single commit. Four bytes a
+// cell keeps the same information in ~0.3% of the space.
 type redactionPlan struct {
-	at    map[string]string        // "<commit>:<path>" -> blob oid
-	blobs map[string]*redactedBlob // blob oid -> its redaction (absent when unaffected)
+	paths    int             // width of one commit's row, so (i, j) can be flattened
+	at       []int32         // commit-major grid of indexes into redacted; -1 where the path is absent
+	mode     []uint8         // same grid: the entry's file mode, as a modeCode
+	redacted []*redactedBlob // per distinct blob, in discovery order; nil when it holds no secret
+	// modes is false when this git could not report entry modes, which rules out
+	// the fast-import rewrite (it must name a mode for every path it writes).
+	modes bool
 }
 
-// redactionPlan builds that map in TWO git processes total, regardless of history
+// modeCode compresses a blob's file mode to one byte per (commit, path) cell —
+// the grid is commits x paths, so the string form would cost gigabytes on a long
+// journal. Only blob modes appear: a tree or gitlink at a flagged path is
+// filtered out before it reaches here.
+type modeCode uint8
+
+const (
+	modeAbsent modeCode = iota
+	modeFile
+	modeExec
+	modeSymlink
+)
+
+func encodeMode(mode string) (modeCode, bool) {
+	switch mode {
+	case "100644":
+		return modeFile, true
+	case "100755":
+		return modeExec, true
+	case "120000":
+		return modeSymlink, true
+	}
+	return modeAbsent, false
+}
+
+func (m modeCode) String() string {
+	switch m {
+	case modeFile:
+		return "100644"
+	case modeExec:
+		return "100755"
+	case modeSymlink:
+		return "120000"
+	}
+	return ""
+}
+
+// change reports whether path j of commit i needs redacting, and gives the sha
+// of the blob to put there. The two are separate answers: a dry run writes no
+// blob, so an affected path legitimately has an empty sha.
+func (p *redactionPlan) change(commit, path int) (sha string, affected bool) {
+	k := p.at[commit*p.paths+path]
+	if k < 0 || p.redacted[k] == nil {
+		return "", false
+	}
+	return p.redacted[k].newSHA, true
+}
+
+// mode returns the file mode recorded for path j of commit i.
+func (p *redactionPlan) modeAt(commit, path int) string {
+	return modeCode(p.mode[commit*p.paths+path]).String()
+}
+
+// firstAffected returns the index of the oldest commit the rewrite must touch,
+// or n when the plan located nothing. Everything before it is passed over in a
+// few int lookups, which is why it is also where progress reporting starts:
+// counting the skipped prefix as work made the bar sprint to 99% and then crawl
+// through the only commits that cost anything, reporting the prefix's speed as
+// the ETA the whole way.
+func (p *redactionPlan) firstAffected(n int) int {
+	for i := range n {
+		for j := range p.paths {
+			if _, affected := p.change(i, j); affected {
+				return i
+			}
+		}
+	}
+	return n
+}
+
+// redactionPlan builds that grid in TWO git processes total, regardless of history
 // length: one `cat-file --batch-check` resolving every (commit, path) pair to a
 // blob oid, then one `cat-file --batch` reading each DISTINCT blob once. The naive
 // shape — `cat-file -p <commit>:<path>` per pair — costs a process spawn per pair,
@@ -207,22 +256,30 @@ type redactionPlan struct {
 // nothing), so a blob shared by many commits is hashed once rather than per commit.
 func (r *Recorder) redactionPlan(ctx context.Context, commits, paths, secrets []string, dryRun bool) (redactionPlan, error) {
 	plan := redactionPlan{
-		at:    make(map[string]string, len(commits)*len(paths)),
-		blobs: map[string]*redactedBlob{},
+		paths: len(paths),
+		at:    make([]int32, len(commits)*len(paths)),
+		mode:  make([]uint8, len(commits)*len(paths)),
 	}
 
-	bc, err := gitutil.NewBatchChecker(ctx, r.RepoRoot)
+	// Resolve each pair's blob AND its file mode in one pass where git can
+	// (>= 2.41): the fast-import rewrite has to name a mode for every path it
+	// writes, and fetching them here costs nothing over fetching the oids alone.
+	// An older git falls back to oids only, which confines it to the index-based
+	// rewrite, where `ls-tree` supplies the modes per commit.
+	check, closeCheck, err := r.openPathChecker(ctx, &plan)
 	if err != nil {
 		return plan, err
 	}
-	var distinct []string // insertion-ordered, so the read pass is deterministic
-	seen := map[string]bool{}
-	for _, c := range commits {
-		for _, p := range paths {
+	var distinct []string      // insertion-ordered, so the read pass is deterministic
+	seen := map[string]int32{} // blob oid -> its index in distinct
+	for i, c := range commits {
+		r.report(PhaseLocate, i+1, len(commits))
+		for j, p := range paths {
+			plan.at[i*len(paths)+j] = -1
 			spec := c + ":" + p
-			oid, objType, found, err := bc.Check(spec)
+			mode, oid, objType, found, err := check(spec)
 			if err != nil {
-				_ = bc.Close()
+				_ = closeCheck()
 				return plan, fmt.Errorf("resolve %s: %w", spec, err)
 			}
 			// Absent from this commit's tree, or not a blob (a flagged path is
@@ -230,23 +287,38 @@ func (r *Recorder) redactionPlan(ctx context.Context, commits, paths, secrets []
 			if !found || objType != "blob" {
 				continue
 			}
-			plan.at[spec] = oid
-			if !seen[oid] {
-				seen[oid] = true
+			if plan.modes {
+				code, ok := encodeMode(mode)
+				if !ok {
+					// A mode the rewrite cannot reproduce faithfully. Rather than
+					// guess, drop to the index path, which copies it verbatim.
+					plan.modes = false
+				} else {
+					plan.mode[i*len(paths)+j] = uint8(code)
+				}
+			}
+			k, known := seen[oid]
+			if !known {
+				k = int32(len(distinct))
+				seen[oid] = k
 				distinct = append(distinct, oid)
 			}
+			plan.at[i*len(paths)+j] = k
 		}
 	}
-	if err := bc.Close(); err != nil {
+	if err := closeCheck(); err != nil {
 		return plan, fmt.Errorf("resolve journal paths: %w", err)
 	}
+	seen = nil // the oid -> index lookup is done; the read pass below indexes directly
 
+	plan.redacted = make([]*redactedBlob, len(distinct))
 	br, err := gitutil.NewBatchReader(ctx, r.RepoRoot)
 	if err != nil {
 		return plan, err
 	}
 	defer func() { _ = br.Close() }()
-	for _, oid := range distinct {
+	for i, oid := range distinct {
+		r.report(PhaseRead, i+1, len(distinct))
 		content, found, err := br.Read(oid)
 		if err != nil {
 			return plan, fmt.Errorf("read blob %s: %w", oid, err)
@@ -264,38 +336,137 @@ func (r *Recorder) redactionPlan(ctx context.Context, commits, paths, secrets []
 				return plan, err
 			}
 		}
-		plan.blobs[oid] = rb
+		plan.redacted[i] = rb
 	}
 	return plan, nil
 }
 
-// syncRecordedWorktree keeps a rewritten event tree self-consistent: if its
-// meta/event.json records a worktree_tree that no longer matches the actual
-// worktree/ subtree (because a snapshot blob was redacted), the recorded sha is
-// replaced with the new one and the tree rebuilt. The patch is a byte-level sha
-// substitution, not a JSON re-marshal, so redacted content, formatting, and any
-// fields this twip version doesn't know about all survive verbatim. Trees
-// without a record, without a recorded snapshot (carried events), or already
-// consistent pass through unchanged.
-func (r *Recorder) syncRecordedWorktree(ctx context.Context, tree string) (string, error) {
-	evb, err := gitutil.CatFile(ctx, r.RepoRoot, tree+":meta/event.json")
-	if err != nil {
-		return tree, nil // no event record (foreign/synthetic commit): nothing to fix
-	}
-	var rec Record
-	if json.Unmarshal(evb, &rec) != nil || rec.WorktreeTree == "" {
-		return tree, nil
-	}
-	actual, _ := gitutil.ResolveRef(ctx, r.RepoRoot, tree+":worktree")
-	if actual == "" || actual == rec.WorktreeTree {
-		return tree, nil
-	}
-	patched := bytes.ReplaceAll(evb, []byte(rec.WorktreeTree), []byte(actual))
-	sha, err := gitutil.HashObject(ctx, r.RepoRoot, patched)
+// recordPath and worktreePrefix name the two parts of an event tree the rewrite
+// has to keep agreeing with each other.
+const (
+	recordPath     = "meta/event.json"
+	worktreeDir    = "worktree"
+	worktreePrefix = worktreeDir + "/"
+)
+
+// rebuildCommitTree produces commit's tree with every flagged path pointed at
+// its redacted blob, keeping the event record consistent with the snapshot it
+// names.
+//
+// Both halves share ONE index load: the redacted paths are staged in a single
+// update-index batch, the tree is written, and — only when the redaction
+// actually touched worktree/ — meta/event.json is patched and staged on top of
+// the index that still holds that tree. The shape this replaced paid a fresh
+// temp index, a read-tree, an ls-tree, one update-index PER PATH and a
+// write-tree for the redaction, then all of that again for the record sync;
+// since every one of those rereads and rewrites the whole index (hundreds of KB
+// for a real worktree snapshot), it was the dominant cost of a redaction.
+func (r *Recorder) rebuildCommitTree(ctx context.Context, tb *treeBuilder, trees *treeReader, commit string, changes map[string]string) (string, error) {
+	// The record's mode comes along with the changed paths' so the patch below
+	// needs no second ls-tree. It is optional: a foreign or synthetic commit may
+	// carry no record at all.
+	modes, err := r.entryModes(ctx, commit, changes, recordPath)
 	if err != nil {
 		return "", err
 	}
-	return r.rebuildTree(ctx, tree, map[string]string{"meta/event.json": sha})
+	if err := tb.load(ctx, commit); err != nil {
+		return "", err
+	}
+	if err := tb.stage(ctx, changes, modes); err != nil {
+		return "", err
+	}
+	tree, err := tb.write(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !touchesWorktree(changes) {
+		// The worktree/ subtree came through byte-identical, so the recorded
+		// worktree_tree is exactly as (in)consistent as it was before this
+		// redaction — and a divergence this rewrite did not cause is recorded
+		// provenance to report, not to silently overwrite (staleWorktreeRecords
+		// says the same about the re-parented commits).
+		return tree, nil
+	}
+	patched, err := r.patchedRecord(ctx, trees, tree)
+	if err != nil || patched == "" {
+		return tree, err
+	}
+	if err := tb.stage(ctx, map[string]string{recordPath: patched}, modes); err != nil {
+		return "", err
+	}
+	return tb.write(ctx)
+}
+
+// touchesWorktree reports whether any redacted path lives under the snapshot
+// subtree — the only way a rebuild can move the worktree/ sha the event record
+// names.
+func touchesWorktree(changes map[string]string) bool {
+	for p := range changes {
+		if strings.HasPrefix(p, worktreePrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// patchedRecord keeps a rewritten event tree self-consistent: if its
+// meta/event.json records a worktree_tree that no longer matches the actual
+// worktree/ subtree (because a snapshot blob was redacted), it returns the sha
+// of a record naming the new subtree — or "" when nothing needs changing (no
+// record, no recorded snapshot for a carried event, or already consistent). The
+// patch is a byte-level sha substitution, not a JSON re-marshal, so redacted
+// content, formatting, and any fields this twip version doesn't know about all
+// survive verbatim. Without it every later audit reports the snapshot as corrupt.
+func (r *Recorder) patchedRecord(ctx context.Context, trees *treeReader, tree string) (string, error) {
+	evb, found, err := trees.read(tree + ":" + recordPath)
+	if err != nil || !found {
+		return "", err
+	}
+	var rec Record
+	if json.Unmarshal(evb, &rec) != nil || rec.WorktreeTree == "" {
+		return "", nil
+	}
+	actual, found, err := trees.subtree(tree + ":" + worktreeDir)
+	if err != nil || !found || actual == rec.WorktreeTree {
+		return "", err
+	}
+	return gitutil.HashObject(ctx, r.RepoRoot,
+		bytes.ReplaceAll(evb, []byte(rec.WorktreeTree), []byte(actual)))
+}
+
+// treeReader reads a rewritten tree's record and snapshot subtree through two
+// long-lived cat-file processes, so the consistency check after each rebuild
+// spawns nothing of its own.
+type treeReader struct {
+	br *gitutil.BatchReader
+	bc *gitutil.BatchChecker
+}
+
+func (r *Recorder) newTreeReader(ctx context.Context) (*treeReader, error) {
+	br, err := gitutil.NewBatchReader(ctx, r.RepoRoot)
+	if err != nil {
+		return nil, err
+	}
+	bc, err := gitutil.NewBatchChecker(ctx, r.RepoRoot)
+	if err != nil {
+		_ = br.Close()
+		return nil, err
+	}
+	return &treeReader{br: br, bc: bc}, nil
+}
+
+// read returns an object's bytes; found is false when the spec names nothing.
+func (t *treeReader) read(spec string) ([]byte, bool, error) { return t.br.Read(spec) }
+
+// subtree returns the oid a tree-path spec resolves to.
+func (t *treeReader) subtree(spec string) (string, bool, error) {
+	oid, _, found, err := t.bc.Check(spec)
+	return oid, found, err
+}
+
+func (t *treeReader) close() {
+	_ = t.br.Close()
+	_ = t.bc.Close()
 }
 
 // staleWorktreeRecords lists, in chain order, the given commits whose
@@ -577,57 +748,106 @@ func redactBytes(content []byte, secrets []string) ([]byte, bool) {
 	return out, changed
 }
 
-// rebuildTree loads a tree-ish's tree (a commit or a bare tree sha) into a
-// throwaway index, points the changed paths at their replacement blobs (already
-// hashed by the caller, so a blob shared across commits is written once), and
-// writes a new tree. Using an index lets git rebuild arbitrarily nested paths
-// (e.g. worktree/src/config.ts) for us.
-func (r *Recorder) rebuildTree(ctx context.Context, commit string, changes map[string]string) (string, error) {
-	idxf, err := os.CreateTemp("", "twip-redact-idx-*")
-	if err != nil {
-		return "", err
-	}
-	idxPath := idxf.Name()
-	idxf.Close()
-	defer os.Remove(idxPath)
-	env := []string{"GIT_INDEX_FILE=" + idxPath}
+// treeBuilder rebuilds journal trees through ONE private index, reused for every
+// commit of a rewrite. Using an index lets git rebuild arbitrarily nested paths
+// (e.g. worktree/src/config.ts) for us; reusing one file means a rewrite of N
+// commits creates one temp index rather than N (two, before the record sync was
+// folded in), and `read-tree` replaces the index wholesale, so nothing of the
+// previous commit can leak into the next.
+type treeBuilder struct {
+	root string
+	path string   // the private index file
+	env  []string // GIT_INDEX_FILE pointing at it
+}
 
-	if _, err := gitutil.Run(ctx, r.RepoRoot, env, nil, "read-tree", commit+"^{tree}"); err != nil {
-		return "", fmt.Errorf("read-tree %s: %w", commit, err)
-	}
-	modes, err := r.treeEntryModes(ctx, commit, changes)
+func (r *Recorder) newTreeBuilder() (*treeBuilder, error) {
+	f, err := os.CreateTemp("", "twip-redact-idx-*")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	for path, sha := range changes {
-		if _, err := gitutil.Run(ctx, r.RepoRoot, env, nil,
-			"update-index", "--add", "--cacheinfo", modes[path]+","+sha+","+path); err != nil {
-			return "", fmt.Errorf("update-index %s: %w", path, err)
+	path := f.Name()
+	_ = f.Close() // an empty file is a valid empty index; the first load fills it
+	return &treeBuilder{root: r.RepoRoot, path: path, env: []string{"GIT_INDEX_FILE=" + path}}, nil
+}
+
+func (b *treeBuilder) close() { _ = os.Remove(b.path) }
+
+// load reads a tree-ish's tree (a commit or a bare tree sha) into the index,
+// replacing whatever it held.
+func (b *treeBuilder) load(ctx context.Context, treeish string) error {
+	if _, err := gitutil.Run(ctx, b.root, b.env, nil, "read-tree", treeish+"^{tree}"); err != nil {
+		return fmt.Errorf("read-tree %s: %w", treeish, err)
+	}
+	return nil
+}
+
+// stage points each changed path at its replacement blob (already hashed by the
+// caller, so a blob shared across commits is written once), keeping the mode the
+// original entry had — an executable or a symlink must not become a plain file.
+//
+// All of them go in ONE update-index call. The per-path form this replaced
+// re-read and re-wrote the entire index once per path, which on a large snapshot
+// cost more than everything else the rewrite did.
+func (b *treeBuilder) stage(ctx context.Context, changes, modes map[string]string) error {
+	if len(changes) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(changes))
+	for path := range changes {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths) // deterministic input; the entries are independent
+	var stdin bytes.Buffer
+	for _, path := range paths {
+		mode := modes[path]
+		if mode == "" {
+			return fmt.Errorf("no tree entry mode for %s", path)
 		}
+		// --index-info's cacheinfo record: "<mode> <sha>\t<path>". -z terminates
+		// each with NUL rather than a newline, so a path containing one survives.
+		fmt.Fprintf(&stdin, "%s %s\t%s\x00", mode, changes[path], path)
 	}
-	out, err := gitutil.Run(ctx, r.RepoRoot, env, nil, "write-tree")
+	if _, err := gitutil.Run(ctx, b.root, b.env, stdin.Bytes(), "update-index", "-z", "--index-info"); err != nil {
+		return fmt.Errorf("update-index: %w", err)
+	}
+	return nil
+}
+
+// write writes the index out as a tree object.
+func (b *treeBuilder) write(ctx context.Context) (string, error) {
+	out, err := gitutil.Run(ctx, b.root, b.env, nil, "write-tree")
 	if err != nil {
 		return "", fmt.Errorf("write-tree: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
-// treeEntryModes returns the git mode (e.g. "100644") of each changed path in
-// commit's tree, so a redacted blob keeps the original file's mode (executable,
-// symlink, …). One ls-tree covers every path, rather than one per path.
-func (r *Recorder) treeEntryModes(ctx context.Context, commit string, changes map[string]string) (map[string]string, error) {
-	args := []string{"ls-tree", commit, "--"}
-	for path := range changes {
+// entryModes returns the git mode (e.g. "100644") of paths in treeish's tree.
+// Every path in required must be present — its absence means the redaction plan
+// and the tree disagree, which has to fail loudly rather than silently drop a
+// redaction; each optional path is simply missing from the result when the tree
+// has no such entry. One ls-tree covers them all, rather than one per path.
+//
+// -z is what makes the parse total: without it ls-tree C-quotes any path with a
+// special byte in it, and a quoted name matches nothing the caller asked for.
+func (r *Recorder) entryModes(ctx context.Context, treeish string, required map[string]string, optional ...string) (map[string]string, error) {
+	args := []string{"ls-tree", "-z", treeish, "--"}
+	for path := range required {
 		args = append(args, path)
+	}
+	for _, path := range optional {
+		if _, dup := required[path]; !dup {
+			args = append(args, path)
+		}
 	}
 	out, err := gitutil.Run(ctx, r.RepoRoot, nil, nil, args...)
 	if err != nil {
 		return nil, err
 	}
-	modes := make(map[string]string, len(changes))
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	modes := make(map[string]string, len(required)+len(optional))
+	for _, rec := range strings.Split(string(out), "\x00") {
 		// "<mode> <type> <sha>\t<path>" — split on the tab so paths with spaces survive.
-		head, path, ok := strings.Cut(line, "\t")
+		head, path, ok := strings.Cut(rec, "\t")
 		if !ok {
 			continue
 		}
@@ -635,9 +855,9 @@ func (r *Recorder) treeEntryModes(ctx context.Context, commit string, changes ma
 			modes[path] = fields[0]
 		}
 	}
-	for path := range changes {
+	for path := range required {
 		if modes[path] == "" {
-			return nil, fmt.Errorf("no tree entry for %s in %s", path, commit)
+			return nil, fmt.Errorf("no tree entry for %s in %s", path, treeish)
 		}
 	}
 	return modes, nil
@@ -852,4 +1072,24 @@ func (r *Recorder) earliestAffectedPushed(ctx context.Context, cloneID, earliest
 		return false
 	}
 	return gitutil.IsAncestor(ctx, r.RepoRoot, earliest, tip)
+}
+
+// openPathChecker starts the cat-file process the plan resolves (commit, path)
+// pairs with, preferring the mode-aware one and recording on the plan whether it
+// got it. The two have different signatures, so the caller gets a closure rather
+// than an interface — one call site, two shapes, no type to maintain.
+func (r *Recorder) openPathChecker(ctx context.Context, plan *redactionPlan) (
+	check func(spec string) (mode, oid, objType string, found bool, err error), closeFn func() error, err error) {
+	if mc, err := gitutil.NewModeChecker(ctx, r.RepoRoot); err == nil {
+		plan.modes = true
+		return mc.Check, mc.Close, nil
+	}
+	bc, err := gitutil.NewBatchChecker(ctx, r.RepoRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+	return func(spec string) (string, string, string, bool, error) {
+		oid, objType, found, err := bc.Check(spec)
+		return "", oid, objType, found, err
+	}, bc.Close, nil
 }

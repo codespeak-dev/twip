@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/codespeak-dev/twip/internal/gitutil"
@@ -23,7 +24,10 @@ func newRedactCmd() *cobra.Command {
 			"gc-protected are dropped, so the secret bytes become truly unreachable locally.\n\n" +
 			"The scan covers only the journal commits the sync remote doesn't have yet — the\n" +
 			"pre-push case, where redacting before the push means only clean history ever leaves\n" +
-			"the machine. Pass --all to scan the full journal history instead.\n\n" +
+			"the machine — and, beyond that, only what this clone has not already scanned clean\n" +
+			"with the same scanner and rules, so a repeat run costs a scan of the new commits\n" +
+			"rather than of all of history. Changing scanner, version or config discards that\n" +
+			"record; --all ignores it and scans the full journal history.\n\n" +
 			"Redaction is local-only by default. If it rewrites history the remote already has,\n" +
 			"the remote keeps the pre-redaction copy and the journal's fast-forward mirror push\n" +
 			"strands — twip records that as a pending propagation, `twip doctor` reports it, and\n" +
@@ -83,17 +87,49 @@ func newRedactCmd() *cobra.Command {
 			}
 			localTip, _ := gitutil.ResolveRef(ctx, root, ref)
 
-			scanRange, scoped := ref, false
-			if !allHist && remoteTip != "" && remoteTip != localTip &&
-				gitutil.IsAncestor(ctx, root, remoteTip, localTip) {
-				scanRange, scoped = remoteTip+".."+ref, true
+			// A scan's verdict is only reusable while the rules behind it are
+			// unchanged, so everything cached below hangs off this fingerprint.
+			fingerprint := sc.Fingerprint(ctx, cfg)
+			var clean *store.CleanScan
+			if !allHist && fingerprint != "" {
+				if clean = rec.LoadCleanScan(ctx); clean != nil && clean.Fingerprint != fingerprint {
+					clean = nil // different scanner or rules: prove it clean again
+				}
 			}
-			// Everything local is already on the remote: with default scoping there
-			// is nothing new to scan at all.
-			nothingNew := !allHist && localTip != "" && remoteTip == localTip
+
+			// scanBase is the newest journal commit already covered — by the sync
+			// remote (the pre-push scoping) or by this clone's own last clean scan,
+			// whichever is further along. The second is what keeps a repeated
+			// redaction cheap on a journal the remote has never seen, where the
+			// first has nothing to narrow with.
+			scanBase := ""
+			consider := func(sha string) {
+				if sha == "" || localTip == "" || !gitutil.IsAncestor(ctx, root, sha, localTip) {
+					return
+				}
+				if scanBase == "" || gitutil.IsAncestor(ctx, root, scanBase, sha) {
+					scanBase = sha
+				}
+			}
+			if !allHist {
+				consider(remoteTip)
+				if clean != nil {
+					consider(clean.JournalTip)
+				}
+			}
+			scanRange, scoped, nothingNew := ref, scanBase != "", false
+			switch {
+			case scanBase != "" && scanBase == localTip:
+				nothingNew = true // the covered prefix IS the whole journal
+			case scanBase != "":
+				scanRange = scanBase + ".." + ref
+			}
 
 			scopeNote := ""
-			if scoped || nothingNew {
+			switch {
+			case clean != nil && scanBase == clean.JournalTip && scanBase != remoteTip:
+				scopeNote = "; since this clone's last clean scan — pass --all for full history"
+			case scoped:
 				scopeNote = "; new commits only — pass --all for full history"
 			}
 			if cfg != "" {
@@ -102,22 +138,46 @@ func newRedactCmd() *cobra.Command {
 				cmd.Printf("Scanning %s with %s (default rules%s)\n", scanRange, sc.Name, scopeNote)
 			}
 
+			// Everything from here can take minutes on a large journal, with no
+			// output of its own; the reporter is what shows it is moving.
+			bar := newProgress(cmd.ErrOrStderr())
+			rec.Progress = bar.step
+			defer bar.close()
+
 			var findings []leaks.Finding
 			if !nothingNew {
-				if findings, err = sc.Scan(ctx, root, scanRange, cfg); err != nil {
+				if findings, err = scanWithProgress(ctx, bar, sc, root, scanRange, cfg,
+					countCommits(ctx, root, scanRange)); err != nil {
 					return err
 				}
 			}
 			// Keep-refs (pins + archived stash) live outside the journal chain; a
 			// secret there is cleared by dropping the ref, not by rewriting. Scan
-			// them only when any exist, bounded to orphaned commits.
+			// them only when any exist, bounded to orphaned commits — and only when
+			// the ref state they depend on has moved since they were last clean.
 			var keepFindings []leaks.Finding
-			if refs, _ := rec.KeepRefs(ctx); len(refs) > 0 {
-				if keepFindings, err = sc.Scan(ctx, root, keepRefLogOpts, cfg); err != nil {
-					return err
+			keepDigest, _ := rec.ScanRefsDigest(ctx)
+			keepClean := clean != nil && keepDigest != "" && clean.KeepRefs == keepDigest
+			if !keepClean {
+				if refs, _ := rec.KeepRefs(ctx); len(refs) > 0 {
+					if keepFindings, err = scanWithProgress(ctx, bar, sc, root, keepRefLogOpts, cfg, 0); err != nil {
+						return err
+					}
 				}
 			}
+			// What this run has proven, saved once it is clear nothing is left
+			// over. The keep-ref digest is only vouched for when the keep-refs came
+			// back clean AND the refs it covers did not move underneath the scan —
+			// a pin created while it ran was never looked at.
+			proven := &store.CleanScan{Fingerprint: fingerprint, JournalTip: localTip, KeepRefs: keepDigest}
+			if after, _ := rec.ScanRefsDigest(ctx); len(keepFindings) > 0 || after != keepDigest {
+				proven.KeepRefs = ""
+			}
 			if len(findings) == 0 && len(keepFindings) == 0 {
+				// The scanned range and the keep-refs are clean, and so was
+				// everything before scanBase; record the whole journal as proven so
+				// the next run starts where this one ended.
+				rec.SaveCleanScan(ctx, proven)
 				// Nothing new to redact — but --propagate may still owe the remote a
 				// previously deferred propagation.
 				if propagate && !dryRun {
@@ -135,6 +195,11 @@ func newRedactCmd() *cobra.Command {
 			}
 
 			var res store.RedactResult
+			// Whether the journal side is proven clean at proven.JournalTip, saved
+			// once the keep-refs have settled. It starts true when the scan found
+			// nothing in the journal (only the keep-refs were dirty), and the
+			// rewrite below has to re-earn it otherwise.
+			journalProven := len(findings) == 0
 			if len(findings) > 0 {
 				secrets, paths, rules := leaks.Distinct(findings)
 				cmd.Printf("%s flagged %d finding(s) in %s — rules: %v; paths: %v\n",
@@ -142,6 +207,7 @@ func newRedactCmd() *cobra.Command {
 				if res, err = rec.RedactJournal(ctx, cloneID, secrets, paths, dryRun); err != nil {
 					return err
 				}
+				bar.done()
 				if dryRun {
 					cmd.Printf("[dry-run] would rewrite %d commit(s) (%d with redactions), %s..%s\n",
 						res.RewrittenCommits, res.RedactedCommits, short(res.EarliestAffected), short(res.OldTip))
@@ -154,18 +220,31 @@ func newRedactCmd() *cobra.Command {
 					for _, m := range res.DroppedMirrors {
 						cmd.Printf("Dropped stale mirror %s (it retained the pre-redaction chain).\n", m)
 					}
-					// Verify with the same scoping: the rewritten range when the prefix
-					// survived, the whole chain when the rewrite reached pushed history.
+					// Verify exactly what changed: RewriteBase..NewTip is the set of
+					// rebuilt commits, and everything before it came through this
+					// rewrite untouched (and was scanned above). That is both cheaper
+					// than re-scanning the whole scoped range and stricter — the old
+					// remote-tip scoping silently skipped the rewritten commits
+					// whenever the rewrite reached history the remote already had.
 					verifyRange := ref
-					if scoped && gitutil.IsAncestor(ctx, root, remoteTip, res.NewTip) {
-						verifyRange = remoteTip + ".." + ref
+					if res.RewriteBase != "" {
+						verifyRange = res.RewriteBase + ".." + ref
 					}
-					if after, err := sc.Scan(ctx, root, verifyRange, cfg); err == nil {
-						if len(after) == 0 {
-							cmd.Println("✓ journal re-scan clean.")
-						} else {
-							cmd.Printf("⚠ %d finding(s) remain after redaction (a rule not reducible to a string match?).\n", len(after))
-						}
+					after, err := scanWithProgress(ctx, bar, sc, root, verifyRange, cfg, res.RewrittenCommits)
+					bar.done()
+					switch {
+					case err != nil:
+						rec.ClearCleanScan(ctx)
+						cmd.PrintErrf("⚠ post-redaction re-scan failed: %v\n", err)
+					case len(after) == 0:
+						cmd.Println("✓ journal re-scan clean.")
+						// The rewritten commits verify clean and the prefix was
+						// already proven, so the new tip is the proven point. Saved
+						// below, once the keep-ref side has settled too.
+						proven.JournalTip, journalProven = res.NewTip, true
+					default:
+						rec.ClearCleanScan(ctx)
+						cmd.Printf("⚠ %d finding(s) remain after redaction (a rule not reducible to a string match?).\n", len(after))
 					}
 				}
 				reportStaleWorktreeRecords(cmd, res)
@@ -191,6 +270,14 @@ func newRedactCmd() *cobra.Command {
 					}
 					cmd.Println("Note: `twip audit` will report those objects as missing once gc prunes them — that is the record of this deliberate destruction.")
 				}
+			}
+
+			// The keep-ref side has settled, so what this run proved is final. A
+			// keep-ref drop only happens when the keep-refs were NOT clean, and
+			// proven.KeepRefs is already empty in that case, so nothing here can
+			// vouch for a ref state the scan did not actually see.
+			if journalProven {
+				rec.SaveCleanScan(ctx, proven)
 			}
 
 			if dryRun {
@@ -261,12 +348,40 @@ func newRedactCmd() *cobra.Command {
 	}
 	cmd.Flags().Bool("dry-run", false, "show what would be redacted without rewriting the journal")
 	cmd.Flags().Bool("propagate", false, "also replace the remote's pre-redaction journal (lease-guarded force-push) and delete dropped keep-refs there; default is local-only")
-	cmd.Flags().Bool("all", false, "scan the full journal history instead of only commits the sync remote doesn't have yet")
+	cmd.Flags().Bool("all", false, "scan the full journal history and all keep-refs, ignoring both the sync-remote scoping and this clone's cached clean-scan record")
 	cmd.Flags().String("config", "", "scanner config (default: <repo>/.gitleaks.toml or .betterleaks.toml if present)")
 	cmd.Flags().String("scanner", "betterleaks", "secrets scanner: betterleaks (default), gitleaks, or auto (prefer betterleaks, fall back to gitleaks)")
 	cmd.Flags().String("betterleaks", "", "path to the betterleaks binary (default: betterleaks on PATH, else this repo's mise toolchain)")
 	cmd.Flags().String("gitleaks", "", "path to the gitleaks binary (default: gitleaks on PATH, else this repo's mise toolchain)")
 	return cmd
+}
+
+// scanWithProgress runs a scan behind a spinner. The scanner reports nothing
+// until it is finished, so on a large range this is the only sign the command is
+// alive; commits, when the caller knows the range's size, says how much work that
+// silence covers.
+func scanWithProgress(ctx context.Context, bar *progress, sc leaks.Scanner, root, logOpts, cfg string, commits int) ([]leaks.Finding, error) {
+	label := "scanning with " + sc.Name
+	if commits > 0 {
+		label += " (" + commas(commits) + " commits)"
+	}
+	defer bar.spin(label)()
+	return sc.Scan(ctx, root, logOpts, cfg)
+}
+
+// countCommits sizes a scan range for the progress label. Best-effort: it is one
+// rev-list walk against a scan that is far longer, and a failure just costs the
+// label its count.
+func countCommits(ctx context.Context, root, revRange string) int {
+	out, err := gitutil.Out(ctx, root, "rev-list", "--count", revRange)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // completePendingPropagation finishes a propagation an earlier local-only

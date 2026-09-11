@@ -165,6 +165,11 @@ type SessionState struct {
 // Recorder appends events to a repo's journal.
 type Recorder struct {
 	RepoRoot string
+
+	// Progress, when set, receives advancement reports from the long phases of
+	// a journal redaction (see ProgressFunc). Nil — the default, and what every
+	// hook-path caller leaves it as — reports nothing.
+	Progress ProgressFunc
 }
 
 func New(repoRoot string) *Recorder { return &Recorder{RepoRoot: repoRoot} }

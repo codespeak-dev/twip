@@ -460,3 +460,62 @@ func StashEntries(ctx context.Context, repoRoot string) []string {
 	}
 	return strings.Fields(string(out))
 }
+
+// fields sends one spec and returns the whitespace-separated response fields.
+// header asserts cat-file's default three-field header; this serves the custom
+// --batch-check formats, whose field count is the caller's business.
+func (b *batchProc) fields(spec string, want int) ([]string, bool, error) {
+	if _, err := io.WriteString(b.stdin, spec+"\n"); err != nil {
+		return nil, false, fmt.Errorf("cat-file %s write %q: %w", b.mode, spec, err)
+	}
+	line, err := b.stdout.ReadString('\n')
+	if err != nil {
+		return nil, false, fmt.Errorf("cat-file %s header for %q: %w", b.mode, spec, err)
+	}
+	f := strings.Fields(line)
+	if len(f) >= 2 && f[len(f)-1] == "missing" {
+		return nil, false, nil
+	}
+	if len(f) != want {
+		return nil, false, fmt.Errorf("cat-file %s: unexpected header %q", b.mode, strings.TrimSpace(line))
+	}
+	return f, true, nil
+}
+
+// modeCheckFormat asks cat-file for the tree entry behind a <rev>:<path> spec,
+// mode included. The mode is what a rewrite needs in order to re-record a path
+// without changing whether it is executable, a symlink, or a plain file.
+const modeCheckFormat = "--batch-check=%(objectmode) %(objectname) %(objecttype)"
+
+// ModeChecker is a BatchChecker that also reports each entry's file mode, so a
+// rewrite can resolve a path's blob AND its mode in the same pass — no `ls-tree`
+// per commit. %(objectmode) needs git >= 2.41; NewModeChecker reports an older
+// git as unsupported rather than failing, leaving the caller a slower fallback.
+type ModeChecker struct{ *batchProc }
+
+// ErrNoObjectMode means this git's cat-file cannot report entry modes.
+var ErrNoObjectMode = fmt.Errorf("cat-file does not support %%(objectmode) (git >= 2.41 required)")
+
+// NewModeChecker starts the cat-file process, or returns ErrNoObjectMode.
+func NewModeChecker(ctx context.Context, repoRoot string) (*ModeChecker, error) {
+	// One cheap probe: an unknown format atom makes cat-file exit immediately,
+	// which is far easier to attribute here than mid-stream.
+	if _, err := Run(ctx, repoRoot, nil, []byte(EmptyTree+"\n"), "cat-file", modeCheckFormat); err != nil {
+		return nil, ErrNoObjectMode
+	}
+	p, err := startBatch(ctx, repoRoot, modeCheckFormat)
+	if err != nil {
+		return nil, err
+	}
+	return &ModeChecker{p}, nil
+}
+
+// Check resolves a spec to its tree entry. mode is "" for a spec that names an
+// object directly rather than a path in a tree (git has no entry to report then).
+func (m *ModeChecker) Check(spec string) (mode, oid, objType string, found bool, err error) {
+	f, found, err := m.fields(spec, 3)
+	if err != nil || !found {
+		return "", "", "", found, err
+	}
+	return f[0], f[1], f[2], true, nil
+}

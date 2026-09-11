@@ -9,6 +9,8 @@ package leaks
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -245,6 +247,32 @@ func (s Scanner) Version(ctx context.Context) string {
 	}
 	line, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
 	return strings.TrimSpace(line)
+}
+
+// Fingerprint identifies the exact rule set a scan runs with: the scanner, its
+// reported version, the binary's own size and mtime, and the bytes of the
+// project config. It is what makes a cached "this range is clean" verdict safe
+// to reuse — new rules can flag what old rules passed, so any change here has to
+// discard the verdict. The binary's stat is in there because `gitleaks version`
+// reports a build-time placeholder on some distro builds, which would otherwise
+// let an upgrade go unnoticed.
+//
+// Returns "" when the rule set cannot be pinned down (an unreadable config),
+// which callers treat as "cache nothing".
+func (s Scanner) Fingerprint(ctx context.Context, cfg string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00", s.Name, s.Version(ctx))
+	if fi, err := os.Stat(s.Bin); err == nil {
+		fmt.Fprintf(h, "%d\x00%d\x00", fi.Size(), fi.ModTime().UnixNano())
+	}
+	if cfg != "" {
+		b, err := os.ReadFile(cfg) //nolint:gosec // the config path the scan itself is given
+		if err != nil {
+			return ""
+		}
+		h.Write(b)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Distinct collapses findings into the distinct secret strings, the distinct
