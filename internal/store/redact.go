@@ -944,12 +944,40 @@ func parseIdent(s string) (name, email, date string) {
 	return s[:lt], s[lt+2 : gt], s[gt+2:]
 }
 
+// rawDateEnv renders an ident's "<unixts> <tz>" date for GIT_AUTHOR_DATE /
+// GIT_COMMITTER_DATE. Git only reads a BARE number as a unix timestamp when it is
+// big enough to look like one: "0 +0000" and every other pre-1973 value is refused
+// as `fatal: invalid date format`, which aborts a rewrite partway through the
+// journal. The "@" prefix forces the raw reading at any value, epoch zero included,
+// and the commit that lands is byte-identical either way.
+//
+// A journal commit dated 0 is not hypothetical: the shim records a gitop while the
+// intercepted command's GIT_AUTHOR_DATE is still exported, so a caller that pinned
+// a date — a reproducibility check, say — stamps it onto twip's own commit.
+//
+// Anything not of that shape (empty, or already prefixed) is handed back untouched,
+// so this can only ever turn a date git refuses into the one it accepts.
+func rawDateEnv(date string) string {
+	unixts, _, ok := strings.Cut(date, " ")
+	if !ok || unixts == "" || strings.HasPrefix(date, "@") {
+		return date
+	}
+	for _, digit := range strings.TrimPrefix(unixts, "-") {
+		if digit < '0' || digit > '9' {
+			return date
+		}
+	}
+	return "@" + date
+}
+
 // commitTreePreserving creates a commit for tree with the given parent (empty => root)
 // and the original commit's identity/message, so a rewrite changes only content.
 func (r *Recorder) commitTreePreserving(ctx context.Context, tree, parent string, m commitMeta) (string, error) {
 	env := []string{
-		"GIT_AUTHOR_NAME=" + m.authorName, "GIT_AUTHOR_EMAIL=" + m.authorEmail, "GIT_AUTHOR_DATE=" + m.authorDate,
-		"GIT_COMMITTER_NAME=" + m.committerName, "GIT_COMMITTER_EMAIL=" + m.committerEmail, "GIT_COMMITTER_DATE=" + m.committerDate,
+		"GIT_AUTHOR_NAME=" + m.authorName, "GIT_AUTHOR_EMAIL=" + m.authorEmail,
+		"GIT_AUTHOR_DATE=" + rawDateEnv(m.authorDate),
+		"GIT_COMMITTER_NAME=" + m.committerName, "GIT_COMMITTER_EMAIL=" + m.committerEmail,
+		"GIT_COMMITTER_DATE=" + rawDateEnv(m.committerDate),
 	}
 	args := []string{"commit-tree", tree}
 	if parent != "" {

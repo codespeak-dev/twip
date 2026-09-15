@@ -1135,3 +1135,87 @@ func TestRedactJournal_ReportsProgress(t *testing.T) {
 		}
 	}
 }
+
+// TestRawDateEnv: git refuses a bare pre-1973 timestamp, so the raw ident date a
+// rewrite reads back has to be handed over "@"-prefixed. Anything that is not a
+// raw date is left exactly as it was.
+func TestRawDateEnv(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"0 +0000", "@0 +0000"},
+		{"1 +0100", "@1 +0100"},
+		{"1700000000 +0000", "@1700000000 +0000"},
+		{"-5 +0000", "@-5 +0000"},
+		{"@0 +0000", "@0 +0000"},
+		{"", ""},
+		{"Thu Jan 1 1970", "Thu Jan 1 1970"},
+		{"notanumber +0000", "notanumber +0000"},
+	} {
+		if got := rawDateEnv(tc.in); got != tc.want {
+			t.Errorf("rawDateEnv(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestRedactJournal_EpochZeroCommitDate: the shim records a gitop with the
+// intercepted command's GIT_AUTHOR_DATE still exported, so a caller that pinned
+// epoch zero leaves a journal commit dated "0 +0000". Rewriting one through the
+// index path used to abort the whole redaction with `fatal: invalid date format:
+// 0 +0000`; fast-import took it natively. Both paths are exercised because only
+// one of them ever had the bug, and they must agree.
+func TestRedactJournal_EpochZeroCommitDate(t *testing.T) {
+	ctx := context.Background()
+
+	run := func(t *testing.T, viaIndex bool) {
+		t.Helper()
+		repo := initRepo(t)
+		rec := New(repo)
+		cloneID, err := rec.CloneID(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// "@" only so that git will BUILD the fixture; what it stores is "0 +0000".
+		c0 := buildJournalCommit(t, repo, "", "event 0 epoch\n", "@0 +0000",
+			map[string]string{"meta/transcript.jsonl": "TOKEN=" + fakeSecret + "\n"})
+		c1 := buildJournalCommit(t, repo, c0, "event 1 later\n", "1700000100 +0000",
+			map[string]string{"meta/transcript.jsonl": "TOKEN=" + fakeSecret + "\n"})
+		ref := JournalRefPrefix + cloneID
+		if err := gitutil.UpdateRef(ctx, repo, ref, c1, ""); err != nil {
+			t.Fatal(err)
+		}
+		if meta, err := rec.readCommitMeta(ctx, c0); err != nil {
+			t.Fatal(err)
+		} else if meta.authorDate != "0 +0000" {
+			t.Fatalf("fixture date = %q, want %q", meta.authorDate, "0 +0000")
+		}
+
+		t.Setenv(EnvNoFastImport, map[bool]string{true: "1", false: ""}[viaIndex])
+		res, err := rec.RedactJournal(ctx, cloneID,
+			[]string{fakeSecret}, []string{"meta/transcript.jsonl"}, false)
+		if err != nil {
+			t.Fatalf("redaction aborted on an epoch-zero commit: %v", err)
+		}
+		if res.RedactedCommits != 2 {
+			t.Errorf("RedactedCommits = %d, want 2", res.RedactedCommits)
+		}
+		if reachableObjectsContain(t, repo, res.NewTip, fakeSecret) {
+			t.Error("secret still reachable after redaction")
+		}
+
+		commits, err := rec.commitShas(ctx, ref, true, 0) // oldest first
+		if err != nil {
+			t.Fatal(err)
+		}
+		meta, err := rec.readCommitMeta(ctx, commits[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if meta.authorDate != "0 +0000" || meta.committerDate != "0 +0000" {
+			t.Errorf("epoch-zero date not preserved: author=%q committer=%q",
+				meta.authorDate, meta.committerDate)
+		}
+	}
+
+	t.Run("fast-import", func(t *testing.T) { run(t, false) })
+	t.Run("index", func(t *testing.T) { run(t, true) })
+}
