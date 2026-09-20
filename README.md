@@ -77,6 +77,11 @@ executable" at `~/.twip/bin/git` (an absolute path) — the shim works without a
 
 ## How it works
 
+Claude Code session-start captures transcript lines after the session's recorded cursor,
+including any lines already present when a session is first observed. Resuming captures
+only unrecorded lines. A missing transcript preserves the cursor; a read failure or a
+transcript shorter than that cursor reports an error without advancing it.
+
 **One journal per clone.** Each clone has a single append-only commit chain on
 `refs/twip/journal/<clone-id>`, and every recorded event is one commit on it. Attribution (`kind`,
 `session_id`, `worktree_id`, `head`, `branch`) lives in the event record as *fields*, not in the
