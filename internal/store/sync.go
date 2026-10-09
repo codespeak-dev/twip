@@ -319,7 +319,7 @@ func (r *Recorder) gateMirrorPush(ctx context.Context, remote string) error {
 			if err != nil {
 				return &MirrorUnscannedError{
 					Reason: fmt.Sprintf("%s failed scanning the journal delta (%s): %v", sc.Name, rng, err),
-					Fix:    "repair the scanner installation (`twip doctor` reports which binary is in use)",
+					Fix:    "fix the scanner binary or the scanner config it reads, whichever the error above names (`twip doctor` reports which binary is in use; the config is the repo root's .betterleaks.toml or .gitleaks.toml, if present)",
 				}
 			}
 			if len(findings) > 0 {
@@ -344,7 +344,7 @@ func (r *Recorder) gateMirrorPush(ctx context.Context, remote string) error {
 		if err != nil {
 			return &MirrorUnscannedError{
 				Reason: fmt.Sprintf("%s failed scanning %d keep-ref(s) not yet on the remote: %v", sc.Name, len(newShas), err),
-				Fix:    "repair the scanner installation (`twip doctor` reports which binary is in use)",
+				Fix:    "fix the scanner binary or the scanner config it reads, whichever the error above names (`twip doctor` reports which binary is in use; the config is the repo root's .betterleaks.toml or .gitleaks.toml, if present)",
 			}
 		}
 		if len(findings) > 0 {

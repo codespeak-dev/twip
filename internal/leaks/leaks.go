@@ -204,6 +204,11 @@ func ResolveConfig(root, scannerName string) string {
 // the two apart: 0 is clean, this is findings, anything else is a failure.
 const leaksFoundExitCode = 99
 
+// verdictContract names how Scan turns the scanner's exit status and report
+// into a verdict. Fingerprint hashes it, so bump it whenever that reading
+// changes: a "clean" recorded under the old reading is then scanned again.
+const verdictContract = "2"
+
 // Scan runs the scanner against a `git log` selection (a ref, a range, or any
 // log options) and returns its findings. Only exit 0 (clean) and
 // leaksFoundExitCode (findings) are verdicts; every other exit is an error, and
@@ -239,18 +244,18 @@ func (s Scanner) Scan(ctx context.Context, root, logOpts, cfg string) ([]Finding
 	}
 	data, err := os.ReadFile(reportPath)
 	if err != nil {
-		return nil, fmt.Errorf("%s exited without writing its report: %w", s.Name, err)
+		return nil, fmt.Errorf("%s exited without writing its report: %w: %s", s.Name, err, strings.TrimSpace(stderr.String()))
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
-		return nil, fmt.Errorf("%s wrote an empty report", s.Name)
+		return nil, fmt.Errorf("%s wrote an empty report: %s", s.Name, strings.TrimSpace(stderr.String()))
 	}
 	var findings []Finding
 	if err := json.Unmarshal(data, &findings); err != nil {
 		return nil, fmt.Errorf("parse %s report: %w", s.Name, err)
 	}
 	if leaksFound != (len(findings) > 0) {
-		return nil, fmt.Errorf("%s exit status (leaks found: %t) disagrees with its report (%d findings)",
-			s.Name, leaksFound, len(findings))
+		return nil, fmt.Errorf("%s exit status (leaks found: %t) disagrees with its report (%d findings): %s",
+			s.Name, leaksFound, len(findings), strings.TrimSpace(stderr.String()))
 	}
 	return findings, nil
 }
@@ -270,8 +275,8 @@ func (s Scanner) Version(ctx context.Context) string {
 }
 
 // Fingerprint identifies the exact rule set a scan runs with: the scanner, its
-// reported version, the binary's own size and mtime, and the bytes of the
-// project config. It is what makes a cached "this range is clean" verdict safe
+// reported version, the binary's own size and mtime, the bytes of the project
+// config, and the verdictContract Scan reads the result under. It is what makes a cached "this range is clean" verdict safe
 // to reuse — new rules can flag what old rules passed, so any change here has to
 // discard the verdict. The binary's stat is in there because `gitleaks version`
 // reports a build-time placeholder on some distro builds, which would otherwise
@@ -281,7 +286,7 @@ func (s Scanner) Version(ctx context.Context) string {
 // which callers treat as "cache nothing".
 func (s Scanner) Fingerprint(ctx context.Context, cfg string) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00", s.Name, s.Version(ctx))
+	fmt.Fprintf(h, "%s\x00%s\x00%s\x00", verdictContract, s.Name, s.Version(ctx))
 	if fi, err := os.Stat(s.Bin); err == nil {
 		fmt.Fprintf(h, "%d\x00%d\x00", fi.Size(), fi.ModTime().UnixNano())
 	}

@@ -2,6 +2,8 @@ package leaks
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -254,6 +256,66 @@ func TestScanAndVersion(t *testing.T) {
 		if fs, err := sc.Scan(ctx, root, "x", ""); err == nil {
 			t.Errorf("%s: Scan = %+v, nil; want an error", tc.name, fs)
 		}
+	}
+
+	// The scanner's stderr reaches the error even when its exit code looked fine.
+	for _, tc := range []struct {
+		name, report string
+		code         int
+	}{
+		{"exit 0 without a report", "", 0},
+		{"exit 0 with an empty report", " ", 0},
+		{"exit 0 with findings", stubReport, 0},
+	} {
+		script := fmt.Sprintf(`#!/bin/sh
+rp=""; prev=""
+for a in "$@"; do [ "$prev" = "--report-path" ] && rp="$a"; prev="$a"; done
+[ -n %q ] && printf '%%s' %q > "$rp"
+echo "FTL unable to load config" >&2
+exit %d
+`, tc.report, tc.report, tc.code)
+		if err := os.WriteFile(sc.Bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture
+			t.Fatal(err)
+		}
+		if _, err := sc.Scan(ctx, root, "x", ""); err == nil || !strings.Contains(err.Error(), "FTL unable to load config") {
+			t.Errorf("%s: Scan error = %v; want the scanner's stderr in it", tc.name, err)
+		}
+	}
+}
+
+// TestFingerprint_DropsPreContractRecords: a clean-scan record saved before
+// Scan read exit codes strictly carries a fingerprint that hashed no
+// verdictContract. It must not match what Fingerprint computes now.
+func TestFingerprint_DropsPreContractRecords(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	writeStub(t, dir, "betterleaks", filepath.Join(dir, "args"), "", 0, "betterleaks 9.9.9")
+	sc := Scanner{Name: "betterleaks", Bin: filepath.Join(dir, "betterleaks")}
+	cfg := filepath.Join(dir, ".gitleaks.toml")
+	if err := os.WriteFile(cfg, []byte("[extend]\nuseDefault = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00", sc.Name, sc.Version(ctx))
+	fi, err := os.Stat(sc.Bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(h, "%d\x00%d\x00", fi.Size(), fi.ModTime().UnixNano())
+	b, err := os.ReadFile(cfg) //nolint:gosec // test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Write(b)
+	preContract := hex.EncodeToString(h.Sum(nil))
+
+	got := sc.Fingerprint(ctx, cfg)
+	if got == "" || got == preContract {
+		t.Errorf("Fingerprint = %q, same as a pre-contract record's %q", got, preContract)
+	}
+	if again := sc.Fingerprint(ctx, cfg); again != got {
+		t.Errorf("Fingerprint is not stable: %q then %q", got, again)
 	}
 }
 
