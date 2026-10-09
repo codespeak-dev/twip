@@ -12,11 +12,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -194,22 +196,31 @@ func ResolveConfig(root, scannerName string) string {
 	return ""
 }
 
+// leaksFoundExitCode is the exit status Scan asks the scanner to use when it
+// finds leaks (`--exit-code`). Both tools default it to 1, which is also the
+// status they exit with on a fatal error — an unloadable config, a failed git
+// log, a report they could not write — so with the default a crash reads as
+// "leaks found" and its absent report as "no findings". A dedicated value keeps
+// the two apart: 0 is clean, this is findings, anything else is a failure.
+const leaksFoundExitCode = 99
+
 // Scan runs the scanner against a `git log` selection (a ref, a range, or any
-// log options) and returns its findings. Both tools exit 1 when leaks are found
-// — the expected success case here, not an error. TWIP_SHIM_ACTIVE is set so
-// the scanner's own `git` calls (if the twip shim is on PATH) pass straight
-// through instead of being recorded.
+// log options) and returns its findings. Only exit 0 (clean) and
+// leaksFoundExitCode (findings) are verdicts; every other exit is an error, and
+// so is a report that is missing, empty, unparseable, or that contradicts the
+// exit status. TWIP_SHIM_ACTIVE is set so the scanner's own `git` calls (if the
+// twip shim is on PATH) pass straight through instead of being recorded.
 func (s Scanner) Scan(ctx context.Context, root, logOpts, cfg string) ([]Finding, error) {
-	report, err := os.CreateTemp("", "twip-leaks-*.json")
+	dir, err := os.MkdirTemp("", "twip-leaks-*")
 	if err != nil {
 		return nil, err
 	}
-	reportPath := report.Name()
-	report.Close()
-	defer os.Remove(reportPath)
+	defer os.RemoveAll(dir)
+	reportPath := filepath.Join(dir, "report.json")
 
 	args := []string{"detect", "--source", root,
 		"--report-format", "json", "--report-path", reportPath,
+		"--exit-code", strconv.Itoa(leaksFoundExitCode),
 		"--log-opts", logOpts}
 	if cfg != "" {
 		args = append(args, "--config", cfg)
@@ -218,19 +229,28 @@ func (s Scanner) Scan(ctx context.Context, root, logOpts, cfg string) ([]Finding
 	c.Env = append(os.Environ(), "TWIP_SHIM_ACTIVE=1")
 	var stderr bytes.Buffer
 	c.Stderr = &stderr
+	leaksFound := false
 	if err := c.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) || ee.ExitCode() != leaksFoundExitCode {
 			return nil, fmt.Errorf("%s: %w: %s", s.Name, err, strings.TrimSpace(stderr.String()))
 		}
-		// exit code 1 => leaks found; fall through and read the report.
+		leaksFound = true
 	}
 	data, err := os.ReadFile(reportPath)
-	if err != nil || len(bytes.TrimSpace(data)) == 0 {
-		return nil, nil // no report / empty => no findings
+	if err != nil {
+		return nil, fmt.Errorf("%s exited without writing its report: %w", s.Name, err)
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, fmt.Errorf("%s wrote an empty report", s.Name)
 	}
 	var findings []Finding
 	if err := json.Unmarshal(data, &findings); err != nil {
 		return nil, fmt.Errorf("parse %s report: %w", s.Name, err)
+	}
+	if leaksFound != (len(findings) > 0) {
+		return nil, fmt.Errorf("%s exit status (leaks found: %t) disagrees with its report (%d findings)",
+			s.Name, leaksFound, len(findings))
 	}
 	return findings, nil
 }

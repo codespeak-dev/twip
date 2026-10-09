@@ -15,24 +15,27 @@ import (
 )
 
 // writeGateStub installs a fake betterleaks at dir/betterleaks that logs argv
-// to argsFile and reports one finding (exit 1) when report is non-empty, else
-// exits clean.
+// to argsFile and reports one finding (exiting with the --exit-code it was
+// given) when report is non-empty, else writes an empty report and exits clean.
 func writeGateStub(t *testing.T, dir, argsFile, report string) {
 	t.Helper()
 	script := fmt.Sprintf(`#!/bin/sh
 [ "$1" = "version" ] && { echo stub 0.0.1; exit 0; }
 echo "$@" >> %q
 rp=""
+ec=1
 prev=""
 for a in "$@"; do
   [ "$prev" = "--report-path" ] && rp="$a"
+  [ "$prev" = "--exit-code" ] && ec="$a"
   prev="$a"
 done
 report=%q
 if [ -n "$report" ]; then
   printf '%%s' "$report" > "$rp"
-  exit 1
+  exit "$ec"
 fi
+echo '[]' > "$rp"
 exit 0
 `, argsFile, report)
 	if err := os.WriteFile(filepath.Join(dir, "betterleaks"), []byte(script), 0o755); err != nil { //nolint:gosec // test fixture
@@ -251,10 +254,26 @@ func TestSyncPush_SelfGate(t *testing.T) {
 }
 
 // TestSyncPush_ScannerFailureBlocks covers the third way the gate can reach no
-// verdict: a scanner that is installed but broken. Exit codes other than 0/1
-// are not findings and not "clean" — they are an absent answer, so the mirror
-// is withheld rather than sent unscanned.
+// verdict: a scanner that is installed but broken. A crash is not findings and
+// not "clean" — it is an absent answer, so the mirror is withheld rather than
+// sent unscanned. Exit 1 with no report is the case that used to slip through:
+// it is both the scanners' default leaks-found status and the status of their
+// fatal errors (an unloadable config), so it read as a scan with no findings.
 func TestSyncPush_ScannerFailureBlocks(t *testing.T) {
+	for _, tc := range []struct {
+		name, script string
+	}{
+		{"panic exit 2", "echo boom >&2\nexit 2\n"},
+		{"fatal exit 1 without a report",
+			"echo \"FTL unable to load config, err: [[allowlists]] target rule ID 'generic-password' does not exist\" >&2\nexit 1\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testScannerFailureBlocks(t, tc.script)
+		})
+	}
+}
+
+func testScannerFailureBlocks(t *testing.T, body string) {
 	ctx := context.Background()
 	repo := initRepo(t)
 	rec := New(repo)
@@ -273,7 +292,7 @@ func TestSyncPush_ScannerFailureBlocks(t *testing.T) {
 	}
 
 	stubDir := t.TempDir()
-	broken := "#!/bin/sh\n[ \"$1\" = \"version\" ] && { echo stub 0.0.1; exit 0; }\necho boom >&2\nexit 2\n"
+	broken := "#!/bin/sh\n[ \"$1\" = \"version\" ] && { echo stub 0.0.1; exit 0; }\n" + body
 	if err := os.WriteFile(filepath.Join(stubDir, "betterleaks"), []byte(broken), 0o755); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}

@@ -11,26 +11,34 @@ import (
 
 // writeStub installs a fake scanner script at dir/name. It logs its argv to
 // argsFile, writes report (if non-empty) to the --report-path and exits with
-// code (scanner convention: 1 = leaks found, 0 = clean). `version` prints ver.
+// code; exitLeaks makes it exit with the --exit-code it was given, as the real
+// scanners do when they find leaks. `version` prints ver.
 func writeStub(t *testing.T, dir, name, argsFile, report string, code int, ver string) {
 	t.Helper()
 	script := fmt.Sprintf(`#!/bin/sh
 [ "$1" = "version" ] && { echo %q; exit 0; }
 echo "$@" >> %q
 rp=""
+ec=1
 prev=""
 for a in "$@"; do
   [ "$prev" = "--report-path" ] && rp="$a"
+  [ "$prev" = "--exit-code" ] && ec="$a"
   prev="$a"
 done
 report=%q
 [ -n "$report" ] && [ -n "$rp" ] && printf '%%s' "$report" > "$rp"
-exit %d
+code=%d
+[ "$code" = -1 ] && code="$ec"
+exit "$code"
 `, ver, argsFile, report, code)
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 }
+
+// exitLeaks tells writeStub to exit with the leaks-found code Scan passed.
+const exitLeaks = -1
 
 const stubReport = `[{"RuleID":"stub-rule","File":"worktree/x.env","Commit":"deadbeef","Secret":"hunter2"}]`
 
@@ -201,8 +209,8 @@ func TestScanAndVersion(t *testing.T) {
 	argsFile := filepath.Join(t.TempDir(), "args")
 	root := t.TempDir()
 
-	// Findings: exit 1 + report.
-	writeStub(t, dir, "betterleaks", argsFile, stubReport, 1, "betterleaks 9.9.9")
+	// Findings: the requested leaks-found exit + report.
+	writeStub(t, dir, "betterleaks", argsFile, stubReport, exitLeaks, "betterleaks 9.9.9")
 	sc := Scanner{Name: "betterleaks", Bin: filepath.Join(dir, "betterleaks")}
 	fs, err := sc.Scan(ctx, root, "some..range", "")
 	if err != nil || len(fs) != 1 || fs[0].RuleID != "stub-rule" || fs[0].Secret != "hunter2" {
@@ -212,26 +220,40 @@ func TestScanAndVersion(t *testing.T) {
 		t.Errorf("version = %q", v)
 	}
 	args, _ := os.ReadFile(argsFile)
-	for _, want := range []string{"--log-opts some..range", "--source " + root} {
+	for _, want := range []string{"--log-opts some..range", "--source " + root,
+		fmt.Sprintf("--exit-code %d", leaksFoundExitCode)} {
 		if !strings.Contains(string(args), want) {
 			t.Errorf("scanner args missing %q:\n%s", want, args)
 		}
 	}
 
-	// Clean: exit 0, empty report.
-	writeStub(t, dir, "betterleaks", argsFile, "", 0, "")
-	if fs, err := sc.Scan(ctx, root, "x", ""); err != nil || len(fs) != 0 {
-		t.Errorf("clean scan = %+v, %v", fs, err)
+	// Clean: exit 0 with an empty findings list, written as [] or as null.
+	for _, report := range []string{"[]", "null"} {
+		writeStub(t, dir, "betterleaks", argsFile, report, 0, "")
+		if fs, err := sc.Scan(ctx, root, "x", ""); err != nil || len(fs) != 0 {
+			t.Errorf("clean scan with report %q = %+v, %v", report, fs, err)
+		}
 	}
 
-	// Broken scanner: exit 2 is an error, not findings.
-	writeStub(t, dir, "betterleaks", argsFile, "", 2, "")
-	if _, err := sc.Scan(ctx, root, "x", ""); err == nil {
-		t.Error("exit 2 should be a scan error")
-	}
-	if v := sc.Version(ctx); v != "" {
-		// version stub still answers; acceptable either way — just no panic.
-		_ = v
+	// No verdict: each of these must be an error, never an empty finding list.
+	for _, tc := range []struct {
+		name   string
+		report string
+		code   int
+	}{
+		{"fatal error: exit 1, no report", "", 1},
+		{"fatal error: exit 1 with a report", stubReport, 1},
+		{"crash: exit 2", "", 2},
+		{"exit 0 without a report", "", 0},
+		{"exit 0 with a garbled report", "{not json", 0},
+		{"exit 0 with findings", stubReport, 0},
+		{"leaks found without a report", "", exitLeaks},
+		{"leaks found with an empty report", "[]", exitLeaks},
+	} {
+		writeStub(t, dir, "betterleaks", argsFile, tc.report, tc.code, "")
+		if fs, err := sc.Scan(ctx, root, "x", ""); err == nil {
+			t.Errorf("%s: Scan = %+v, nil; want an error", tc.name, fs)
+		}
 	}
 }
 

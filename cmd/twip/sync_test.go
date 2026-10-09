@@ -87,7 +87,8 @@ func TestSyncPushCmd_WithheldMirrorIsLoud(t *testing.T) {
 	// clean, the very next push mirrors what was held back.
 	scanner := t.TempDir()
 	if err := os.WriteFile(filepath.Join(scanner, "betterleaks"),
-		[]byte("#!/bin/sh\n[ \"$1\" = version ] && { echo stub; exit 0; }\nexit 0\n"), 0o755); err != nil { //nolint:gosec // test fixture
+		[]byte("#!/bin/sh\n[ \"$1\" = version ] && { echo stub; exit 0; }\n"+
+			"prev=\nfor a in \"$@\"; do [ \"$prev\" = --report-path ] && echo '[]' > \"$a\"; prev=\"$a\"; done\nexit 0\n"), 0o755); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", scanner+string(os.PathListSeparator)+gitOnly)
