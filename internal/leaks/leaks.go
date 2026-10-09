@@ -12,11 +12,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -194,22 +196,36 @@ func ResolveConfig(root, scannerName string) string {
 	return ""
 }
 
+// leaksFoundExitCode is the exit status Scan asks the scanner to use when it
+// finds leaks (`--exit-code`). Both tools default it to 1, which is also the
+// status they exit with on a fatal error — an unloadable config, a failed git
+// log, a report they could not write — so with the default a crash reads as
+// "leaks found" and its absent report as "no findings". A dedicated value keeps
+// the two apart: 0 is clean, this is findings, anything else is a failure.
+const leaksFoundExitCode = 99
+
+// verdictContract names how Scan turns the scanner's exit status and report
+// into a verdict. Fingerprint hashes it, so bump it whenever that reading
+// changes: a "clean" recorded under the old reading is then scanned again.
+const verdictContract = "2"
+
 // Scan runs the scanner against a `git log` selection (a ref, a range, or any
-// log options) and returns its findings. Both tools exit 1 when leaks are found
-// — the expected success case here, not an error. TWIP_SHIM_ACTIVE is set so
-// the scanner's own `git` calls (if the twip shim is on PATH) pass straight
-// through instead of being recorded.
+// log options) and returns its findings. Only exit 0 (clean) and
+// leaksFoundExitCode (findings) are verdicts; every other exit is an error, and
+// so is a report that is missing, empty, unparseable, or that contradicts the
+// exit status. TWIP_SHIM_ACTIVE is set so the scanner's own `git` calls (if the
+// twip shim is on PATH) pass straight through instead of being recorded.
 func (s Scanner) Scan(ctx context.Context, root, logOpts, cfg string) ([]Finding, error) {
-	report, err := os.CreateTemp("", "twip-leaks-*.json")
+	dir, err := os.MkdirTemp("", "twip-leaks-*")
 	if err != nil {
 		return nil, err
 	}
-	reportPath := report.Name()
-	report.Close()
-	defer os.Remove(reportPath)
+	defer os.RemoveAll(dir)
+	reportPath := filepath.Join(dir, "report.json")
 
-	args := []string{"detect", "--source", root,
+	args := []string{"detect", "--source", root, "--no-banner", "--no-color",
 		"--report-format", "json", "--report-path", reportPath,
+		"--exit-code", strconv.Itoa(leaksFoundExitCode),
 		"--log-opts", logOpts}
 	if cfg != "" {
 		args = append(args, "--config", cfg)
@@ -218,19 +234,28 @@ func (s Scanner) Scan(ctx context.Context, root, logOpts, cfg string) ([]Finding
 	c.Env = append(os.Environ(), "TWIP_SHIM_ACTIVE=1")
 	var stderr bytes.Buffer
 	c.Stderr = &stderr
+	leaksFound := false
 	if err := c.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) || ee.ExitCode() != leaksFoundExitCode {
 			return nil, fmt.Errorf("%s: %w: %s", s.Name, err, strings.TrimSpace(stderr.String()))
 		}
-		// exit code 1 => leaks found; fall through and read the report.
+		leaksFound = true
 	}
 	data, err := os.ReadFile(reportPath)
-	if err != nil || len(bytes.TrimSpace(data)) == 0 {
-		return nil, nil // no report / empty => no findings
+	if err != nil {
+		return nil, fmt.Errorf("%s exited without writing its report: %w: %s", s.Name, err, strings.TrimSpace(stderr.String()))
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, fmt.Errorf("%s wrote an empty report: %s", s.Name, strings.TrimSpace(stderr.String()))
 	}
 	var findings []Finding
 	if err := json.Unmarshal(data, &findings); err != nil {
 		return nil, fmt.Errorf("parse %s report: %w", s.Name, err)
+	}
+	if leaksFound != (len(findings) > 0) {
+		return nil, fmt.Errorf("%s exit status (leaks found: %t) disagrees with its report (%d findings): %s",
+			s.Name, leaksFound, len(findings), strings.TrimSpace(stderr.String()))
 	}
 	return findings, nil
 }
@@ -250,18 +275,18 @@ func (s Scanner) Version(ctx context.Context) string {
 }
 
 // Fingerprint identifies the exact rule set a scan runs with: the scanner, its
-// reported version, the binary's own size and mtime, and the bytes of the
-// project config. It is what makes a cached "this range is clean" verdict safe
-// to reuse — new rules can flag what old rules passed, so any change here has to
-// discard the verdict. The binary's stat is in there because `gitleaks version`
-// reports a build-time placeholder on some distro builds, which would otherwise
-// let an upgrade go unnoticed.
+// reported version, the binary's own size and mtime, the bytes of the project
+// config, and the verdictContract Scan reads the result under. It is what makes
+// a cached "this range is clean" verdict safe to reuse — new rules can flag what
+// old rules passed, so any change here has to discard the verdict. The binary's
+// stat is in there because `gitleaks version` reports a build-time placeholder
+// on some distro builds, which would otherwise let an upgrade go unnoticed.
 //
 // Returns "" when the rule set cannot be pinned down (an unreadable config),
 // which callers treat as "cache nothing".
 func (s Scanner) Fingerprint(ctx context.Context, cfg string) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00", s.Name, s.Version(ctx))
+	fmt.Fprintf(h, "%s\x00%s\x00%s\x00", verdictContract, s.Name, s.Version(ctx))
 	if fi, err := os.Stat(s.Bin); err == nil {
 		fmt.Fprintf(h, "%d\x00%d\x00", fi.Size(), fi.ModTime().UnixNano())
 	}
