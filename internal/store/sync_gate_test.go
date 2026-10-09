@@ -299,6 +299,10 @@ func testScannerFailureBlocks(t *testing.T, body string) {
 	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("TWIP_SKIP_LEAK_SCAN", "")
 	t.Setenv(leaks.EnvNoMise, "1")
+	cfg := filepath.Join(repo, "gitleaks.toml")
+	if err := os.WriteFile(cfg, []byte("title = \"stub\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	c1 := buildJournalCommit(t, repo, "", "event\n", "1700000000 +0000",
 		map[string]string{"worktree/leak.env": "TOKEN=" + fakeSecret + "\n"})
@@ -311,7 +315,19 @@ func testScannerFailureBlocks(t *testing.T, body string) {
 	if !errors.As(err, &unscanned) || !strings.Contains(err.Error(), "journal delta") {
 		t.Fatalf("expected a scan-failure block, got %v", err)
 	}
+	if !strings.Contains(unscanned.Fix, "the config it read: "+cfg) {
+		t.Errorf("fix hint does not name the config the scanner read (%s): %q", cfg, unscanned.Fix)
+	}
 	if sha, _ := gitutil.ResolveRef(ctx, bare, jref); sha != "" {
 		t.Fatalf("broken scanner still mirrored: %s", sha)
+	}
+}
+
+func TestScanFailedFix(t *testing.T) {
+	if got := scanFailedFix("/repo/betterleaks.toml"); !strings.HasSuffix(got, "the config it read: /repo/betterleaks.toml") {
+		t.Errorf("with a config: %q", got)
+	}
+	if got := scanFailedFix(""); !strings.HasSuffix(got, "no project config, so the scanner's built-in rules") {
+		t.Errorf("without a config: %q", got)
 	}
 }

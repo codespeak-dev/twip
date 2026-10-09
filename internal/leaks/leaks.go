@@ -223,7 +223,7 @@ func (s Scanner) Scan(ctx context.Context, root, logOpts, cfg string) ([]Finding
 	defer os.RemoveAll(dir)
 	reportPath := filepath.Join(dir, "report.json")
 
-	args := []string{"detect", "--source", root,
+	args := []string{"detect", "--source", root, "--no-banner", "--no-color",
 		"--report-format", "json", "--report-path", reportPath,
 		"--exit-code", strconv.Itoa(leaksFoundExitCode),
 		"--log-opts", logOpts}
@@ -276,11 +276,11 @@ func (s Scanner) Version(ctx context.Context) string {
 
 // Fingerprint identifies the exact rule set a scan runs with: the scanner, its
 // reported version, the binary's own size and mtime, the bytes of the project
-// config, and the verdictContract Scan reads the result under. It is what makes a cached "this range is clean" verdict safe
-// to reuse — new rules can flag what old rules passed, so any change here has to
-// discard the verdict. The binary's stat is in there because `gitleaks version`
-// reports a build-time placeholder on some distro builds, which would otherwise
-// let an upgrade go unnoticed.
+// config, and the verdictContract Scan reads the result under. It is what makes
+// a cached "this range is clean" verdict safe to reuse — new rules can flag what
+// old rules passed, so any change here has to discard the verdict. The binary's
+// stat is in there because `gitleaks version` reports a build-time placeholder
+// on some distro builds, which would otherwise let an upgrade go unnoticed.
 //
 // Returns "" when the rule set cannot be pinned down (an unreadable config),
 // which callers treat as "cache nothing".

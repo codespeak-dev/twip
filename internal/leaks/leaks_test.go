@@ -223,6 +223,7 @@ func TestScanAndVersion(t *testing.T) {
 	}
 	args, _ := os.ReadFile(argsFile)
 	for _, want := range []string{"--log-opts some..range", "--source " + root,
+		"--no-banner", "--no-color",
 		fmt.Sprintf("--exit-code %d", leaksFoundExitCode)} {
 		if !strings.Contains(string(args), want) {
 			t.Errorf("scanner args missing %q:\n%s", want, args)

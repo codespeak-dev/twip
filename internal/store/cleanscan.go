@@ -26,7 +26,8 @@ import (
 //
 // Fingerprint is what keeps this honest: it pins the scanner binary, the rule
 // set, and the way twip reads the scanner's result, and any change to one of
-// them discards the whole record rather than trusting an old tool's "clean". `--all` ignores it outright.
+// them discards the whole record rather than trusting an old tool's "clean".
+// `--all` ignores it outright.
 //
 // It can only ever narrow THIS command's scan. The mirror push gate
 // (gateMirrorPush) scopes itself against the remote and never reads this file,

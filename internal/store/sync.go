@@ -221,6 +221,16 @@ func (e *MirrorUnscannedError) Error() string {
 // way to arrive here.
 const noScannerFix = "install betterleaks (or gitleaks) on PATH, or pin it in this repo's mise toolchain (`mise use betterleaks@latest`)"
 
+// scanFailedFix is the remedy offered when the scanner ran but failed, naming
+// the config file it was given.
+func scanFailedFix(cfg string) string {
+	read := "no project config, so the scanner's built-in rules"
+	if cfg != "" {
+		read = cfg
+	}
+	return "fix the scanner binary (`twip doctor` shows which is in use) or the config it read: " + read
+}
+
 // gateMirrorPush scans exactly what this mirror push would newly expose — the
 // journal commits the remote lacks, and any pin/stash keep-refs not yet on the
 // remote (a pinned pre-rewrite commit is precisely where an amended-away secret
@@ -319,7 +329,7 @@ func (r *Recorder) gateMirrorPush(ctx context.Context, remote string) error {
 			if err != nil {
 				return &MirrorUnscannedError{
 					Reason: fmt.Sprintf("%s failed scanning the journal delta (%s): %v", sc.Name, rng, err),
-					Fix:    "fix the scanner binary or the scanner config it reads, whichever the error above names (`twip doctor` reports which binary is in use; the config is the repo root's .betterleaks.toml or .gitleaks.toml, if present)",
+					Fix:    scanFailedFix(cfg),
 				}
 			}
 			if len(findings) > 0 {
@@ -344,7 +354,7 @@ func (r *Recorder) gateMirrorPush(ctx context.Context, remote string) error {
 		if err != nil {
 			return &MirrorUnscannedError{
 				Reason: fmt.Sprintf("%s failed scanning %d keep-ref(s) not yet on the remote: %v", sc.Name, len(newShas), err),
-				Fix:    "fix the scanner binary or the scanner config it reads, whichever the error above names (`twip doctor` reports which binary is in use; the config is the repo root's .betterleaks.toml or .gitleaks.toml, if present)",
+				Fix:    scanFailedFix(cfg),
 			}
 		}
 		if len(findings) > 0 {
