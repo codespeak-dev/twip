@@ -6,10 +6,35 @@ nothing is ever deleted. Browse it at `twip serve`.
 
 ## Installation
 
+The repo is private: you need read access to `codespeak-dev/twip`, and a one-time setup so `go`
+can fetch it. Go fetches private modules straight from GitHub with `git`, with prompts disabled,
+so git needs a GitHub login it can use non-interactively; and Go must be told to skip the public
+module proxy and checksum database, which can't see private repos:
+
+```sh
+gh auth setup-git    # let git use your `gh auth login` for github.com
+# add twip's org to GOPRIVATE, keeping any patterns you already have (`go env -w` overwrites):
+case ",$(go env GOPRIVATE)," in *",github.com/codespeak-dev/*,"*) ;;
+  *) go env -w GOPRIVATE="$(go env GOPRIVATE),github.com/codespeak-dev/*" ;; esac
+```
+
+Prefer SSH to the GitHub CLI? Use `git config --global url."git@github.com:".insteadOf
+"https://github.com/"` instead of `gh auth setup-git`. If you export `GOPRIVATE` from your shell
+profile, add `github.com/codespeak-dev/*` there instead — a shell value overrides `go env -w`.
+Then:
+
 ```sh
 go install github.com/codespeak-dev/twip/cmd/twip@latest   # get the binary
 twip install                                               # once per machine: stable binary + git shim + PATH
 ```
+
+Or let the install script do all of the above (it appends to `GOPRIVATE` and runs
+`gh auth setup-git` if needed): `gh api repos/codespeak-dev/twip/contents/scripts/install.sh -H
+'Accept: application/vnd.github.raw' | sh`, or `./scripts/install.sh` from a checkout.
+
+If `go install` or `twip update` fails to fetch twip, run `twip doctor`: it checks `GOPRIVATE` and
+the git login and prints the fix for whatever is missing. `twip doctor --fix` applies the
+`GOPRIVATE` part itself (appending, never overwriting your existing patterns).
 
 `twip install` points a stable `~/.twip/bin/twip` at the binary (a symlink when twip is a `go install`
 target, a copy when the source is transient), installs the git shim there, and sources `~/.twip/env`
@@ -43,6 +68,8 @@ needed. Re-run `twip install` only if you change `GOBIN`/`GOPATH`, or installed 
 Or just run `twip update`: it does the `go install` and re-runs `twip install` for you, so the update
 propagates everywhere even when the stable binary is a copy rather than a symlink (`--version` to pin
 a version, `--dry-run` to preview). `twip doctor` reports when a newer version is available.
+Updates fetch from the private repo too, so they need the same one-time setup as installing (if
+you installed while the repo was public, run `gh auth setup-git && twip doctor --fix`).
 
 ### Manual PATH setup (if a new shell can't find the shim)
 
@@ -70,7 +97,8 @@ of the above except the rc edit (and print the line to add).
 
 `twip doctor` checks this for you — it flags when another directory (Homebrew/conda/nvm or an IDE)
 shadows `~/.twip/bin` on `PATH`, the silent failure that stops git ops from being recorded, and also
-reports this repo's recording status and whether a newer twip is available.
+reports this repo's recording status, whether this machine can fetch twip for updates (`GOPRIVATE`
+and git login, with `--fix` for the former), and whether a newer twip is available.
 
 **GUI git (JetBrains, GitHub Desktop, …)** bypass `PATH` entirely. Point their "Path to Git
 executable" at `~/.twip/bin/git` (an absolute path) — the shim works without any `PATH` wiring.
@@ -168,6 +196,7 @@ cmd/twip/check.go        `twip check pre-push` (the opt-in push gate)
 cmd/twip/sync.go         `twip sync push` (self-gated mirror of refs/twip/* to a remote; one home for sync)
 cmd/twip/redact.go       `twip redact` (scan journal + pin/stash keep-refs with betterleaks/gitleaks; rewrite/drop flagged secrets locally; --propagate replaces the remote copy)
 cmd/twip/doctor.go       `twip doctor` (PATH-shadow + recording-status + journal-sync + secrets-scanner + update diagnostics)
+cmd/twip/access.go       install/update access diagnosis (GOPRIVATE + git auth) for doctor/update, `doctor --fix`
 cmd/twip/update.go       `twip update` (go install latest, then re-run twip install)
 cmd/twip/report.go       `twip report` (shareable Markdown bug report from recent activity)
 internal/snapshot/       temp-index git write-tree worktree capture

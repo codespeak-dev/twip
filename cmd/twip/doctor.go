@@ -1,12 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -19,7 +20,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// modulePath is twip's Go module, used to query the proxy for the latest release.
+// modulePath is twip's Go module, used to look up the latest release.
 const modulePath = "github.com/codespeak-dev/twip"
 
 func newDoctorCmd() *cobra.Command {
@@ -31,12 +32,15 @@ func newDoctorCmd() *cobra.Command {
 			"of ~/.twip/bin, so git ops stop being recorded with no error. Also checks that this " +
 			"clone's journal can still fast-forward onto the sync remote (a local `twip redact` of " +
 			"pushed history strands the mirror silently — the fix is `twip redact --propagate`), " +
-			"reports the repo's recording status, and whether a newer twip is available to " +
-			"`go install`. Exits non-zero if it finds a problem.",
+			"reports the repo's recording status, whether this machine can fetch twip with " +
+			"`go install` (for a private repo: GOPRIVATE and a non-interactive git login to " +
+			"GitHub), and whether a newer twip is available. --fix applies the go env part of " +
+			"that setup itself. Exits non-zero if it finds a problem.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			dir, _ := cmd.Flags().GetString("dir")
 			offline, _ := cmd.Flags().GetBool("offline")
+			fix, _ := cmd.Flags().GetBool("fix")
 			if dir == "" {
 				d, err := defaultShimDir()
 				if err != nil {
@@ -60,8 +64,29 @@ func newDoctorCmd() *cobra.Command {
 				problems++
 			}
 
+			fmt.Fprintln(out, "\ninstall & update access")
+			accessOK := true
+			if offline {
+				fmt.Fprintln(out, "  • skipped: --offline")
+			} else {
+				rep := diagnoseModuleAccess(cmd.Context())
+				if fix {
+					changed, err := applyAccessFixes(cmd.Context(), out, rep)
+					if err != nil {
+						fmt.Fprintf(out, "  ⚠ --fix failed: %v\n", err)
+					}
+					if changed {
+						rep = diagnoseModuleAccess(cmd.Context()) // show what's left
+					}
+				}
+				if printAccessReport(out, rep) {
+					problems++
+					accessOK = false
+				}
+			}
+
 			fmt.Fprintln(out, "\nversion")
-			checkVersion(cmd.Context(), out, offline)
+			checkVersion(cmd.Context(), out, offline, accessOK)
 
 			fmt.Fprintln(out)
 			if problems > 0 {
@@ -72,7 +97,9 @@ func newDoctorCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().String("dir", "", "twip shim directory (default ~/.twip/bin)")
-	cmd.Flags().Bool("offline", false, "skip the network check for newer twip versions")
+	cmd.Flags().Bool("offline", false, "skip the network checks (install access, newer twip versions)")
+	cmd.Flags().Bool("fix", false, "apply the fixes twip can make itself: extend GOPRIVATE (or GONOPROXY/GONOSUMDB) "+
+		"via go env -w, keeping existing patterns")
 	return cmd
 }
 
@@ -303,12 +330,18 @@ func reportRepo(ctx context.Context, out io.Writer) {
 }
 
 // checkVersion compares the running build against the latest published module version
-// (via the Go proxy) and suggests `go install` when behind. Always informational —
-// an outdated or unknowable version is never a doctor failure.
-func checkVersion(ctx context.Context, out io.Writer, offline bool) {
+// (via `go list -m`) and suggests `go install` when behind. Always informational —
+// an outdated or unknowable version is never a doctor failure. With access problems
+// (accessOK false) the lookup may be answered by the public proxy's stale cache of a
+// now-private repo, so it isn't shown as if it were current.
+func checkVersion(ctx context.Context, out io.Writer, offline, accessOK bool) {
 	cur := currentVersion()
 	if offline {
 		fmt.Fprintf(out, "  • twip %s (update check skipped: --offline)\n", cur)
+		return
+	}
+	if !accessOK {
+		fmt.Fprintf(out, "  ? twip %s — update check skipped: it can't be trusted until install access (above) is fixed\n", cur)
 		return
 	}
 	latest, err := latestModuleVersion(ctx)
@@ -341,57 +374,51 @@ func currentVersion() string {
 	return bi.Main.Version
 }
 
-// latestModuleVersion asks the Go module proxy for twip's latest version. Best-effort:
-// a short timeout and any failure (offline, GOPROXY=off, non-200) returns an error the
-// caller reports without failing.
+// latestModuleVersion asks the Go toolchain for twip's latest version via
+// `go list -m <module>@latest`. Going through `go` (rather than querying a proxy over
+// HTTP ourselves) means the lookup honours exactly what `go install` will: GOPROXY,
+// GOPRIVATE/GONOPROXY, `go env -w` settings, and git credentials — so it keeps
+// working (and stays truthful) when the repo is private and fetched direct from
+// GitHub, instead of reading a stale public-proxy cache. Best-effort: a missing
+// toolchain, a timeout, or any failure returns an error the caller reports.
 func latestModuleVersion(ctx context.Context) (string, error) {
-	base := goProxyBase()
-	if base == "" {
-		return "", fmt.Errorf("GOPROXY has no usable proxy (off/direct)")
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		return "", fmt.Errorf("the `go` toolchain is not on PATH")
 	}
-	url := strings.TrimRight(base, "/") + "/" + modulePath + "/@latest"
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Run outside any module/workspace: inside a twip checkout, twip is the main
+	// module and `go list -m twip@latest` would refuse to query it.
+	tmp, err := os.MkdirTemp("", "twip-version-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	c := exec.CommandContext(ctx, goBin, "list", "-m", "-json", modulePath+"@latest")
+	c.Dir = tmp
+	c.Env = append(os.Environ(), "GOWORK=off")
+	var stderr bytes.Buffer
+	c.Stderr = &stderr
+	out, err := c.Output()
 	if err != nil {
-		return "", err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("proxy %s returned %s", base, resp.Status)
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("`go list -m %s@latest` timed out", modulePath)
+		}
+		if msg := condenseGitErr(stderr.String()); msg != "" {
+			return "", fmt.Errorf("`go list -m %s@latest`: %s", modulePath, msg)
+		}
+		return "", fmt.Errorf("`go list -m %s@latest`: %w", modulePath, err)
 	}
 	var info struct{ Version string }
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&info); err != nil {
-		return "", err
+	if err := json.Unmarshal(out, &info); err != nil {
+		return "", fmt.Errorf("parsing `go list` output: %w", err)
 	}
 	if info.Version == "" {
-		return "", fmt.Errorf("no version in proxy response")
+		return "", fmt.Errorf("no version in `go list` output")
 	}
 	return info.Version, nil
-}
-
-// goProxyBase returns the first usable proxy URL from GOPROXY (default
-// https://proxy.golang.org), or "" when proxying is disabled (off) or only "direct"
-// is configured — in which case we can't cheaply query a latest version.
-func goProxyBase() string {
-	v := strings.TrimSpace(os.Getenv("GOPROXY"))
-	if v == "" {
-		return "https://proxy.golang.org"
-	}
-	for _, p := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == '|' }) {
-		switch p = strings.TrimSpace(p); {
-		case p == "off":
-			return ""
-		case strings.HasPrefix(p, "https://"), strings.HasPrefix(p, "http://"):
-			return p
-		}
-		// "direct" or anything non-URL: try the next entry.
-	}
-	return ""
 }
 
 // semverNewer reports whether version a is strictly newer than b, comparing the

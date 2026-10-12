@@ -83,7 +83,7 @@ func newInitCmd() *cobra.Command {
 	}
 	cmd.Flags().String("agent", "claude-code", "agent whose hooks to install (default: all registered agents)")
 	cmd.Flags().Bool("force", false, "reinstall hooks, replacing any twip-owned entries")
-	cmd.Flags().Bool("enforce", false, "also gate `git push`: block pushes from this repo unless recording is active")
+	cmd.Flags().Bool("enforce", false, "also gate git push: block pushes from this repo unless recording is active")
 	return cmd
 }
 
