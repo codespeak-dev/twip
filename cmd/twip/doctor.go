@@ -98,7 +98,7 @@ func newDoctorCmd() *cobra.Command {
 	cmd.Flags().String("dir", "", "twip shim directory (default ~/.twip/bin)")
 	cmd.Flags().Bool("offline", false, "skip the network checks (install access, newer twip versions)")
 	cmd.Flags().Bool("fix", false, "apply the fixes twip can make itself: extend GOPRIVATE (or GONOPROXY/GONOSUMDB) "+
-		"via `go env -w`, keeping existing patterns")
+		"via go env -w, keeping existing patterns")
 	return cmd
 }
 
