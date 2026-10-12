@@ -196,6 +196,15 @@ func ResolveConfig(root, scannerName string) string {
 	return ""
 }
 
+// ConfigLabel names the config a scan reads, for messages: the path, or the
+// scanner's built-in rules when the repo has no project config.
+func ConfigLabel(cfg string) string {
+	if cfg == "" {
+		return "no project config, so the scanner's built-in rules"
+	}
+	return cfg
+}
+
 // leaksFoundExitCode is the exit status Scan asks the scanner to use when it
 // finds leaks (`--exit-code`). Both tools default it to 1, which is also the
 // status they exit with on a fatal error — an unloadable config, a failed git
@@ -258,6 +267,19 @@ func (s Scanner) Scan(ctx context.Context, root, logOpts, cfg string) ([]Finding
 			s.Name, leaksFound, len(findings), strings.TrimSpace(stderr.String()))
 	}
 	return findings, nil
+}
+
+// checkLogOpts selects no commits in any repo, an unborn one included, so a
+// Check scan loads the config and writes its report without reading content.
+const checkLogOpts = "--max-count=0 --all"
+
+// Check runs one scan that selects no commits, with the config the mirror gate
+// would pass, and returns Scan's error when that scan reaches no verdict. It
+// catches a scanner that resolves but cannot run — an unloadable config, a
+// broken build — without scanning anything or writing to the repo.
+func (s Scanner) Check(ctx context.Context, root, cfg string) error {
+	_, err := s.Scan(ctx, root, checkLogOpts, cfg)
+	return err
 }
 
 // Version probes the scanner's version (both tools support `version`).

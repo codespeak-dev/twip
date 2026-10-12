@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -133,19 +135,46 @@ func TestLatestModuleVersion(t *testing.T) {
 	}
 }
 
-// stubScanner puts a fake betterleaks first on PATH (and skips the mise
-// lookup), so a doctor check reports a scanner regardless of what the machine
-// running the suite has installed.
-func stubScanner(t *testing.T) string {
+// workingScanner reports a version and answers every scan with a clean report.
+const workingScanner = `#!/bin/sh
+[ "$1" = "version" ] && { echo 'betterleaks 1.2.3'; exit 0; }
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--report-path" ] && printf '[]' > "$a"
+  prev="$a"
+done
+exit 0
+`
+
+// brokenScannerFTL is what an old betterleaks build prints for a config it
+// cannot load, before exiting 1 without a report.
+const brokenScannerFTL = "FTL unable to load config, err: [[allowlists]] target rule ID 'generic-password' does not exist"
+
+// stubScanner puts a fake betterleaks running script first on PATH (and skips
+// the mise lookup), so a doctor check reports a scanner regardless of what the
+// machine running the suite has installed.
+func stubScanner(t *testing.T, script string) string {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "betterleaks")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho 'betterleaks 1.2.3'\n"), 0o755); err != nil { //nolint:gosec // test fixture
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(leaks.EnvNoMise, "1")
 	return bin
+}
+
+func TestScannerErrorLines(t *testing.T) {
+	got := scannerErrorLines(errors.New("betterleaks: exit status 1: \x1b[31mFTL\x1b[0m bad config\n\n  second  "))
+	if want := []string{"betterleaks: exit status 1: FTL bad config", "second"}; !slices.Equal(got, want) {
+		t.Errorf("lines = %q, want %q", got, want)
+	}
+	long := strings.Repeat("panic frame\n", maxScannerErrorLines+3)
+	got = scannerErrorLines(errors.New(long))
+	if len(got) != maxScannerErrorLines+1 || got[maxScannerErrorLines] != "… (3 more lines)" {
+		t.Errorf("long error not capped: %q", got)
+	}
 }
 
 // TestCheckJournalSync covers the stranded-journal diagnosis: fast-forwardable
@@ -158,7 +187,7 @@ func TestCheckJournalSync(t *testing.T) {
 	repo := e2eInitRepo(t)
 	t.Chdir(repo)
 	ctx := context.Background()
-	scannerBin := stubScanner(t)
+	scannerBin := stubScanner(t, workingScanner)
 
 	run := func(offline bool) (bool, string) {
 		var b bytes.Buffer
@@ -245,6 +274,31 @@ func TestCheckJournalSync(t *testing.T) {
 			if !strings.Contains(out, want) {
 				t.Errorf("missing-scanner report lacks %q:\n%s", want, out)
 			}
+		}
+	})
+
+	// A scanner that resolves but cannot load the repo's config fails every
+	// mirror push; doctor must say so, with the scanner's own error and the
+	// config it read, rather than report the gate active.
+	t.Run("broken scanner", func(t *testing.T) {
+		bin := stubScanner(t, "#!/bin/sh\n[ \"$1\" = \"version\" ] && { echo dev; exit 0; }\n"+
+			"printf '\\033[31mFTL\\033[0m %s\\n' \""+strings.TrimPrefix(brokenScannerFTL, "FTL ")+"\" >&2\nexit 1\n")
+		cfg := filepath.Join(repo, ".gitleaks.toml")
+		if err := os.WriteFile(cfg, []byte("title = \"stub\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Remove(cfg) })
+		ok, out := run(false)
+		if ok {
+			t.Errorf("broken scanner should be a doctor problem:\n%s", out)
+		}
+		for _, want := range []string{"gate broken", bin, brokenScannerFTL, "the config it read: " + cfg, "fast-forwards"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("broken-scanner report lacks %q:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "gate active") || strings.Contains(out, "\x1b") {
+			t.Errorf("broken-scanner report claims the gate is active or keeps colour codes:\n%s", out)
 		}
 	})
 

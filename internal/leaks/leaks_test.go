@@ -284,6 +284,33 @@ exit %d
 	}
 }
 
+// TestCheck: the check scan selects no commits, passes the config the gate
+// would, and reads the scanner's answer under Scan's verdict rules.
+func TestCheck(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	argsFile := filepath.Join(t.TempDir(), "args")
+	root := t.TempDir()
+	cfg := filepath.Join(root, ".gitleaks.toml")
+	sc := Scanner{Name: "betterleaks", Bin: filepath.Join(dir, "betterleaks")}
+
+	writeStub(t, dir, "betterleaks", argsFile, "[]", 0, "")
+	if err := sc.Check(ctx, root, cfg); err != nil {
+		t.Errorf("working scanner: Check = %v", err)
+	}
+	args, _ := os.ReadFile(argsFile)
+	for _, want := range []string{"--log-opts " + checkLogOpts, "--config " + cfg, "--source " + root} {
+		if !strings.Contains(string(args), want) {
+			t.Errorf("scanner args missing %q:\n%s", want, args)
+		}
+	}
+
+	writeStub(t, dir, "betterleaks", argsFile, "", 1, "")
+	if err := sc.Check(ctx, root, cfg); err == nil {
+		t.Error("scanner exiting 1 without a report: Check = nil, want an error")
+	}
+}
+
 // TestFingerprint_DropsPreContractRecords: a clean-scan record saved before
 // Scan read exit codes strictly carries a fingerprint that hashed no
 // verdictContract. It must not match what Fingerprint computes now.
