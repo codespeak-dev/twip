@@ -43,9 +43,17 @@ func runUpdate(cmd *cobra.Command, version, dir string, dryRun bool) error {
 	// Resolve the target: an explicit --version, else the latest published version.
 	target := version
 	if target == "" {
+		// Check access before trusting the lookup. Without GOPRIVATE, a private repo's
+		// lookup goes to the public proxy, which keeps serving the last version it
+		// cached while public — a stale "latest" that reads as "nothing to do", not
+		// as an error, so a failure-only diagnosis would never run.
+		if rep := diagnoseModuleAccess(ctx); len(rep.problems) > 0 {
+			printAccessProblems(cmd, rep)
+			return fmt.Errorf("can't reliably find or fetch the latest twip until the problems above are fixed " +
+				"(`twip doctor --fix` applies the GOPRIVATE part)")
+		}
 		latest, err := latestModuleVersion(ctx)
 		if err != nil {
-			explainAccessFailure(cmd)
 			return fmt.Errorf("could not determine the latest version: %w (pass --version to pin one, e.g. --version vX.Y.Z)", err)
 		}
 		target = latest
@@ -168,10 +176,12 @@ func runStreaming(ctx context.Context, cmd *cobra.Command, bin string, args ...s
 // than only go's raw error. It prints nothing when access looks fine — the failure
 // was something else, and go's own output already says what.
 func explainAccessFailure(cmd *cobra.Command) {
-	rep := diagnoseModuleAccess(cmd.Context())
-	if len(rep.problems) == 0 {
-		return
+	if rep := diagnoseModuleAccess(cmd.Context()); len(rep.problems) > 0 {
+		printAccessProblems(cmd, rep)
 	}
+}
+
+func printAccessProblems(cmd *cobra.Command, rep accessReport) {
 	errOut := cmd.ErrOrStderr()
 	fmt.Fprintln(errOut, "\ntwip can't fetch its module on this machine:")
 	printAccessReport(errOut, rep)

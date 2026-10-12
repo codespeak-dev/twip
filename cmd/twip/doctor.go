@@ -64,6 +64,7 @@ func newDoctorCmd() *cobra.Command {
 			}
 
 			fmt.Fprintln(out, "\ninstall & update access")
+			accessOK := true
 			if offline {
 				fmt.Fprintln(out, "  • skipped: --offline")
 			} else {
@@ -79,11 +80,12 @@ func newDoctorCmd() *cobra.Command {
 				}
 				if printAccessReport(out, rep) {
 					problems++
+					accessOK = false
 				}
 			}
 
 			fmt.Fprintln(out, "\nversion")
-			checkVersion(cmd.Context(), out, offline)
+			checkVersion(cmd.Context(), out, offline, accessOK)
 
 			fmt.Fprintln(out)
 			if problems > 0 {
@@ -273,11 +275,17 @@ func reportRepo(ctx context.Context, out io.Writer) {
 
 // checkVersion compares the running build against the latest published module version
 // (via `go list -m`) and suggests `go install` when behind. Always informational —
-// an outdated or unknowable version is never a doctor failure.
-func checkVersion(ctx context.Context, out io.Writer, offline bool) {
+// an outdated or unknowable version is never a doctor failure. With access problems
+// (accessOK false) the lookup may be answered by the public proxy's stale cache of a
+// now-private repo, so it isn't shown as if it were current.
+func checkVersion(ctx context.Context, out io.Writer, offline, accessOK bool) {
 	cur := currentVersion()
 	if offline {
 		fmt.Fprintf(out, "  • twip %s (update check skipped: --offline)\n", cur)
+		return
+	}
+	if !accessOK {
+		fmt.Fprintf(out, "  ? twip %s — update check skipped: it can't be trusted until install access (above) is fixed\n", cur)
 		return
 	}
 	latest, err := latestModuleVersion(ctx)
