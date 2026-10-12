@@ -45,6 +45,7 @@ func runUpdate(cmd *cobra.Command, version, dir string, dryRun bool) error {
 	if target == "" {
 		latest, err := latestModuleVersion(ctx)
 		if err != nil {
+			explainAccessFailure(cmd)
 			return fmt.Errorf("could not determine the latest version: %w (pass --version to pin one, e.g. --version vX.Y.Z)", err)
 		}
 		target = latest
@@ -52,6 +53,13 @@ func runUpdate(cmd *cobra.Command, version, dir string, dryRun bool) error {
 		// (re-pin, reinstall, or downgrade). A devel build has no comparable version.
 		if cur != "(devel)" && cur == target {
 			fmt.Fprintf(out, "twip %s is already the latest published version — nothing to do.\n", cur)
+			return nil
+		}
+		// Never silently downgrade on a latest-update (e.g. a lookup that saw an older
+		// cached release); --version still allows an intentional downgrade.
+		if semverNewer(cur, target) {
+			fmt.Fprintf(out, "twip %s is newer than the latest published version %s — nothing to do "+
+				"(pass --version %s to downgrade).\n", cur, target, target)
 			return nil
 		}
 	}
@@ -73,6 +81,7 @@ func runUpdate(cmd *cobra.Command, version, dir string, dryRun bool) error {
 	fmt.Fprintf(out, "Updating twip %s -> %s\n", cur, target)
 	fmt.Fprintf(out, "  go install %s\n", pkg)
 	if err := runStreaming(ctx, cmd, goBin, "install", pkg); err != nil {
+		explainAccessFailure(cmd)
 		return fmt.Errorf("`go install %s` failed: %w", pkg, err)
 	}
 
@@ -152,4 +161,18 @@ func runStreaming(ctx context.Context, cmd *cobra.Command, bin string, args ...s
 	c.Stdout = cmd.OutOrStdout()
 	c.Stderr = cmd.ErrOrStderr()
 	return c.Run()
+}
+
+// explainAccessFailure runs the install-access diagnosis after a failed lookup or
+// `go install`, so the user gets the fix (GOPRIVATE, `gh auth setup-git`, …) rather
+// than only go's raw error. It prints nothing when access looks fine — the failure
+// was something else, and go's own output already says what.
+func explainAccessFailure(cmd *cobra.Command) {
+	rep := diagnoseModuleAccess(cmd.Context())
+	if len(rep.problems) == 0 {
+		return
+	}
+	errOut := cmd.ErrOrStderr()
+	fmt.Fprintln(errOut, "\ntwip can't fetch its module on this machine:")
+	printAccessReport(errOut, rep)
 }

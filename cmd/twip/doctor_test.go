@@ -3,9 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -96,34 +93,33 @@ func TestSemverNewer(t *testing.T) {
 	}
 }
 
-func TestGoProxyBase(t *testing.T) {
-	cases := []struct{ env, want string }{
-		{"", "https://proxy.golang.org"},
-		{"https://corp.example/mod", "https://corp.example/mod"},
-		{"https://a,direct", "https://a"},
-		{"https://a|https://b", "https://a"},
-		{"off", ""},
-		{"direct", ""},
-	}
-	for _, c := range cases {
-		t.Setenv("GOPROXY", c.env)
-		if got := goProxyBase(); got != c.want {
-			t.Errorf("goProxyBase(GOPROXY=%q) = %q, want %q", c.env, got, c.want)
-		}
-	}
-}
-
+// TestLatestModuleVersion drives the real `go list -m` against a file:// module
+// proxy, so it checks the lookup honours GOPROXY the way `go install` would.
 func TestLatestModuleVersion(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/@latest") {
-			_, _ = io.WriteString(w, `{"Version":"v1.4.0","Time":"2026-06-01T00:00:00Z"}`)
-			return
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not on PATH")
+	}
+	proxy := t.TempDir()
+	vdir := filepath.Join(proxy, filepath.FromSlash(modulePath), "@v")
+	if err := os.MkdirAll(vdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"list":        "v1.3.0\nv1.4.0\n",
+		"v1.3.0.info": `{"Version":"v1.3.0","Time":"2026-05-01T00:00:00Z"}`,
+		"v1.4.0.info": `{"Version":"v1.4.0","Time":"2026-06-01T00:00:00Z"}`,
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(vdir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
 		}
-		http.NotFound(w, r)
-	}))
-	defer srv.Close()
+	}
 
-	t.Setenv("GOPROXY", srv.URL)
+	t.Setenv("GOPROXY", "file://"+filepath.ToSlash(proxy))
+	t.Setenv("GOPRIVATE", "")
+	t.Setenv("GONOPROXY", "")
+	t.Setenv("GOFLAGS", "")
+	t.Setenv("GOMODCACHE", t.TempDir())
 	v, err := latestModuleVersion(context.Background())
 	if err != nil {
 		t.Fatal(err)
