@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -185,26 +186,11 @@ func checkJournalSync(ctx context.Context, out io.Writer, offline bool) bool {
 		fmt.Fprintln(out, "  • twip not enabled in this repo")
 		return true
 	}
-	// The mirror's secrets gate fails closed, so a missing scanner is not a
-	// footnote — it stops the journal reaching the remote at all. Report it as a
-	// problem with the fix, and name the resolved binary otherwise so a scanner
-	// coming from the repo's mise toolchain rather than PATH is visible too.
-	// Every check below this point reports on top of that verdict, hence `ok`
-	// rather than an early return: a repo can be missing the scanner AND have a
-	// stranded journal, and one hiding the other is how these go unnoticed.
-	ok := true
-	if sc, err := leaks.ResolveScanner(ctx, root, "auto", "", ""); err == nil {
-		if v := sc.Version(ctx); v != "" {
-			fmt.Fprintf(out, "  ✓ mirror secrets gate active: %s (%s) at %s\n", sc.Name, v, sc.Bin)
-		} else {
-			fmt.Fprintf(out, "  ✓ mirror secrets gate active: %s at %s (version unknown — check the binary if pushes misbehave)\n", sc.Name, sc.Bin)
-		}
-	} else {
-		fmt.Fprintln(out, "  ✗ no secrets scanner (betterleaks or gitleaks) on PATH or in this repo's mise toolchain — the mirror gate fails closed, so twip refs are NOT being pushed to the remote")
-		fmt.Fprintln(out, "      fix: install betterleaks (or gitleaks), or pin it in this repo's mise toolchain (`mise use betterleaks@latest`)")
-		fmt.Fprintln(out, "      to mirror unscanned anyway: TWIP_SKIP_LEAK_SCAN=1 git push")
-		ok = false
-	}
+	// Every check below this point reports on top of the secrets gate's
+	// verdict, hence `ok` rather than an early return: a repo can be missing the
+	// scanner AND have a stranded journal, and one hiding the other is how these
+	// go unnoticed.
+	ok := checkSecretsGate(ctx, out, root)
 	// A dangling journal head (the ref's commit object was lost underneath it —
 	// external prune/sandbox) breaks more than twip: the user's own `git fetch`,
 	// `pull`, and `gc` fail their connectivity check with "bad object
@@ -251,6 +237,76 @@ func checkJournalSync(ctx context.Context, out io.Writer, offline bool) bool {
 		fmt.Fprintf(out, "  ✓ journal fast-forwards to %s\n", remote)
 		return ok
 	}
+}
+
+// checkSecretsGate reports the mirror's secrets scanner. The gate fails
+// closed, so a missing scanner is not a footnote — it stops the journal
+// reaching the remote at all. Report it as a problem with the fix, and name the
+// resolved binary otherwise so a scanner coming from the repo's mise toolchain
+// rather than PATH is visible too. A scanner that resolves can still be unable
+// to scan — an old build that rejects the repo's config exits 1 on every push —
+// so it is run once before the gate is called active.
+func checkSecretsGate(ctx context.Context, out io.Writer, root string) bool {
+	sc, err := leaks.ResolveScanner(ctx, root, "auto", "", "")
+	if err != nil {
+		fmt.Fprintln(out, "  ✗ no secrets scanner (betterleaks or gitleaks) on PATH or in this repo's mise toolchain — the mirror gate fails closed, so twip refs are NOT being pushed to the remote")
+		fmt.Fprintln(out, "      fix: install betterleaks (or gitleaks), or pin it in this repo's mise toolchain (`mise use betterleaks@latest`)")
+		fmt.Fprintln(out, skipScanHint)
+		return false
+	}
+	v := sc.Version(ctx)
+	label := sc.Name
+	if v != "" {
+		label = fmt.Sprintf("%s (%s)", sc.Name, v)
+	}
+	cfg := leaks.ResolveConfig(root, sc.Name)
+	checkCtx, cancel := context.WithTimeout(ctx, scannerCheckTimeout)
+	defer cancel()
+	if err := sc.Check(checkCtx, root, cfg); err != nil {
+		fmt.Fprintf(out, "  ✗ mirror secrets gate broken: %s at %s cannot complete a scan — every mirror push is withheld, so twip refs are NOT being pushed to the remote\n", label, sc.Bin)
+		for _, line := range scannerErrorLines(err) {
+			fmt.Fprintf(out, "      %s\n", line)
+		}
+		fmt.Fprintf(out, "      fix: repair the scanner binary (%s) or the config it read: %s\n", sc.Bin, leaks.ConfigLabel(cfg))
+		fmt.Fprintln(out, skipScanHint)
+		return false
+	}
+	if v == "" {
+		fmt.Fprintf(out, "  ✓ mirror secrets gate active: %s at %s (version unknown — check the binary if pushes misbehave)\n", sc.Name, sc.Bin)
+	} else {
+		fmt.Fprintf(out, "  ✓ mirror secrets gate active: %s at %s\n", label, sc.Bin)
+	}
+	return true
+}
+
+// skipScanHint names the deliberate bypass for a gate that cannot scan.
+const skipScanHint = "      to mirror unscanned anyway: TWIP_SKIP_LEAK_SCAN=1 git push"
+
+// scannerCheckTimeout bounds doctor's check scan, which selects no commits and
+// normally finishes in well under a second.
+const scannerCheckTimeout = 15 * time.Second
+
+// maxScannerErrorLines caps how much of a failed check scan doctor prints; a
+// panicking scanner's stack trace would otherwise bury the rest of the report.
+const maxScannerErrorLines = 8
+
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// scannerErrorLines splits a failed scan's error (which carries the scanner's
+// stderr) into printable lines, without the colour codes some builds emit even
+// under --no-color.
+func scannerErrorLines(err error) []string {
+	var lines []string
+	for _, l := range strings.Split(ansiEscape.ReplaceAllString(err.Error(), ""), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) > maxScannerErrorLines {
+		more := len(lines) - maxScannerErrorLines
+		lines = append(lines[:maxScannerErrorLines], fmt.Sprintf("… (%d more lines)", more))
+	}
+	return lines
 }
 
 // reportRepo notes whether the current repo (if any) is twip-enabled — informational,

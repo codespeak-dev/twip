@@ -224,11 +224,7 @@ const noScannerFix = "install betterleaks (or gitleaks) on PATH, or pin it in th
 // scanFailedFix is the remedy offered when the scanner ran but failed, naming
 // the config file it was given.
 func scanFailedFix(cfg string) string {
-	read := "no project config, so the scanner's built-in rules"
-	if cfg != "" {
-		read = cfg
-	}
-	return "fix the scanner binary (`twip doctor` shows which is in use) or the config it read: " + read
+	return "fix the scanner binary (`twip doctor` shows which is in use) or the config it read: " + leaks.ConfigLabel(cfg)
 }
 
 // gateMirrorPush scans exactly what this mirror push would newly expose — the

@@ -155,7 +155,8 @@ being able to scan at all* — no scanner installed, an unreachable remote, a br
 Either way your own push proceeds untouched and the refs simply mirror on a later push once the
 cause is fixed. The scanner is found on PATH or, failing that, in the repo's **mise** toolchain, so
 a repo that pins betterleaks in `mise.toml` is covered even when the hook runs outside an activated
-shell (`twip doctor` names the binary in use; `TWIP_NO_MISE=1` skips the mise lookup).
+shell (`twip doctor` names the binary in use and runs it once against the repo's config, so a scanner
+that cannot load that config shows as a problem; `TWIP_NO_MISE=1` skips the mise lookup).
 `TWIP_SKIP_LEAK_SCAN=1` deliberately mirrors anyway, once. If a hook manager already owns
 `pre-push` (lefthook, husky, pre-commit), twip detects it, leaves it untouched, and prints the exact
 config to add — wiring `twip sync push` (and, with `--enforce`, `twip check pre-push`) into the
@@ -194,7 +195,7 @@ cmd/twip/install.go      `twip install/uninstall` (stable binary copy + shim + s
 cmd/twip/check.go        `twip check pre-push` (the opt-in push gate)
 cmd/twip/sync.go         `twip sync push` (self-gated mirror of refs/twip/* to a remote; one home for sync)
 cmd/twip/redact.go       `twip redact` (scan journal + pin/stash keep-refs with betterleaks/gitleaks; rewrite/drop flagged secrets locally; --propagate replaces the remote copy)
-cmd/twip/doctor.go       `twip doctor` (PATH-shadow + recording-status + update diagnostics)
+cmd/twip/doctor.go       `twip doctor` (PATH-shadow + recording-status + journal-sync + secrets-scanner + update diagnostics)
 cmd/twip/access.go       install/update access diagnosis (GOPRIVATE + git auth) for doctor/update, `doctor --fix`
 cmd/twip/update.go       `twip update` (go install latest, then re-run twip install)
 cmd/twip/report.go       `twip report` (shareable Markdown bug report from recent activity)
