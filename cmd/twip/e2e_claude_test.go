@@ -21,7 +21,7 @@ func TestE2E_RealisticHookSequence(t *testing.T) {
 	repo := e2eInitRepo(t)
 
 	// Claude's transcript starts with one pre-existing line (e.g. a summary);
-	// session-start should baseline past it so we never re-capture it.
+	// session-start must capture it because this session has no recorded cursor.
 	tr := filepath.Join(t.TempDir(), "session.jsonl")
 	e2eAppend(t, tr, `{"type":"summary","timestamp":"2026-06-10T00:00:00Z"}`)
 	sid := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -63,6 +63,9 @@ func TestE2E_RealisticHookSequence(t *testing.T) {
 
 	e2eAppend(t, tr, `{"type":"assistant","timestamp":"2026-06-10T00:03:00Z"}`)
 	hook("stop", info(""))
+	e2eAppend(t, tr, `{"type":"assistant","timestamp":"2026-06-10T00:03:30Z"}`)
+	hook("session-start", info(""))
+	hook("session-start", info(""))
 
 	// --- session ends ---
 	e2eAppend(t, tr, `{"type":"summary","timestamp":"2026-06-10T00:04:00Z"}`)
@@ -74,8 +77,8 @@ func TestE2E_RealisticHookSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 7 {
-		t.Fatalf("recorded %d events, want 7", len(events))
+	if len(events) != 9 {
+		t.Fatalf("recorded %d events, want 9", len(events))
 	}
 	for i, ec := range events {
 		if ec.Record.Agent != "claude-code" {
@@ -96,7 +99,7 @@ func TestE2E_RealisticHookSequence(t *testing.T) {
 	}
 
 	// Lossless: concatenating the main transcript deltas (in seq order) reproduces
-	// the transcript exactly from the session-start baseline to EOF — nothing
+	// the transcript exactly from its first line to EOF — nothing
 	// dropped, nothing duplicated across turns.
 	var reassembled []byte
 	for _, ec := range events {
@@ -107,9 +110,8 @@ func TestE2E_RealisticHookSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTail := afterFirstLine(full) // everything after the pre-existing summary line
-	if string(reassembled) != string(wantTail) {
-		t.Errorf("reassembled transcript deltas != captured tail\n got: %q\nwant: %q", reassembled, wantTail)
+	if string(reassembled) != string(full) {
+		t.Errorf("reassembled transcript deltas != full file\n got: %q\nwant: %q", reassembled, full)
 	}
 
 	// The post-task event captured the subagent sidechain bytes.

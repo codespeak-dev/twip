@@ -97,21 +97,69 @@ func TestSidechainPath(t *testing.T) {
 	}
 }
 
-func TestParseHookEvent_SessionStartBaselinesCursor(t *testing.T) {
-	dir := t.TempDir()
-	tp := filepath.Join(dir, "s.jsonl")
-	mustWrite(t, tp, "old1\nold2\nold3\n")
+func TestParseHookEvent_SessionStartCapturesUnrecordedLines(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		from int
+		want string
+	}{
+		{"fresh", 0, "old1\nold2\nold3\n"},
+		{"resumed", 2, "old3\n"},
+		{"already captured", 3, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tp := filepath.Join(t.TempDir(), "s.jsonl")
+			mustWrite(t, tp, "old1\nold2\nold3\n")
+			prior := agent.Cursor{Main: tc.from, Sidechain: map[string]int{"child": 2}}
+			ev := mustParse(t, &Agent{}, hookSessionStart, `{"session_id":"S","transcript_path":"`+tp+`","model":"claude-opus-4-8"}`, prior)
+			if ev.Kind != agent.KindSessionStart || ev.SessionID != "S" || ev.Model != "claude-opus-4-8" {
+				t.Fatalf("event = %+v", ev)
+			}
+			if string(ev.Transcript.Bytes) != tc.want || ev.Transcript.From != tc.from || ev.Transcript.To != 3 || ev.Transcript.Quality != agent.QualityOK {
+				t.Errorf("transcript = %+v, want (%d,3] %q", ev.Transcript, tc.from, tc.want)
+			}
+			if ev.Cursor.Main != 3 || ev.Cursor.Sidechain["child"] != 2 {
+				t.Errorf("cursor = %+v", ev.Cursor)
+			}
+			ev.Cursor.Sidechain["child"] = 4
+			if prior.Main != tc.from || prior.Sidechain["child"] != 2 {
+				t.Errorf("prior cursor mutated: %+v", prior)
+			}
+		})
+	}
+}
 
-	a := &Agent{}
-	ev := mustParse(t, a, hookSessionStart, `{"session_id":"S","transcript_path":"`+tp+`","model":"claude-opus-4-8"}`, agent.Cursor{})
-	if ev.Kind != agent.KindSessionStart {
-		t.Fatalf("kind = %v", ev.Kind)
+func TestParseHookEvent_SessionStartUnavailableTranscriptPreservesCursor(t *testing.T) {
+	for _, path := range []string{"", filepath.Join(t.TempDir(), "missing.jsonl")} {
+		ev := mustParse(t, &Agent{}, hookSessionStart, `{"session_id":"S","transcript_path":"`+path+`"}`, agent.Cursor{Main: 3})
+		if ev.Cursor.Main != 3 || len(ev.Transcript.Bytes) != 0 {
+			t.Errorf("unavailable transcript: %+v", ev)
+		}
 	}
-	if ev.Cursor.Main != 3 {
-		t.Errorf("baseline cursor = %d, want 3 (skip resumed history)", ev.Cursor.Main)
-	}
-	if len(ev.Transcript.Bytes) != 0 {
-		t.Errorf("session-start should carry no transcript bytes")
+}
+
+func TestParseHookEvent_SessionStartReadFailureDoesNotAdvanceCursor(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"read error", dir},
+		{"truncated", filepath.Join(dir, "short.jsonl")},
+		{"empty", filepath.Join(dir, "empty.jsonl")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "truncated" {
+				mustWrite(t, tc.path, "one\n")
+			} else if tc.name == "empty" {
+				mustWrite(t, tc.path, "")
+			}
+			prior := agent.Cursor{Main: 3}
+			ev, err := (&Agent{}).ParseHookEvent(context.Background(), hookSessionStart, strings.NewReader(`{"session_id":"S","transcript_path":"`+tc.path+`"}`), prior)
+			if err == nil || ev != nil || prior.Main != 3 {
+				t.Fatalf("event=%+v err=%v prior=%+v", ev, err, prior)
+			}
+		})
 	}
 }
 

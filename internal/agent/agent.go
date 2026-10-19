@@ -98,7 +98,7 @@ type Event struct {
 	Prompt     string // PromptSubmit only
 	Model      string
 	ForkedFrom string      // parent session ID when this session was forked (Codex only)
-	Transcript Delta       // populated on Stop/SessionEnd; also on SessionStart for fork preamble
+	Transcript Delta       // populated on Stop/SessionEnd; also on SessionStart for unrecorded startup lines
 	Sidechains []Sidechain // populated on SubagentStop
 	Tool       *ToolUse    // populated on KindToolUse
 	Cursor     Cursor      // advanced cursor after this event
