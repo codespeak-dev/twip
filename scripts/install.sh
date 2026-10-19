@@ -99,7 +99,7 @@ if [ -n "$src" ]; then
 	( cd "$src" && go install ./cmd/twip )
 else
 	ensure_git_auth || exit 1
-	echo "Installing twip from $MODULE/cmd/twip@$VERSION…"
+	echo "Installing twip from $MODULE/cmd/twip@${VERSION}…"
 	go install "$MODULE/cmd/twip@$VERSION"
 fi
 
