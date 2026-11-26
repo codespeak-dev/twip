@@ -53,6 +53,7 @@ func newRootCmd() *cobra.Command {
 		newShowCmd(),
 		newServeCmd(),
 		newVersionCmd(),
+		newExportCmd(),
 	)
 	return root
 }
